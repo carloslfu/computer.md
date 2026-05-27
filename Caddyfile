@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Caddyfile for docker-compose self-host.
+# Caddy terminates TLS (self-signed for local) and proxies to the daemon.
+
+{
+  # local TLS only — no Let's Encrypt outbound in shape 1.
+  local_certs
+}
+
+# Substitute your own hostname (e.g. computer.local) for browser certs to work cleanly.
+:443 {
+  tls internal
+  reverse_proxy daemon:8420
+}

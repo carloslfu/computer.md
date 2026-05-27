@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# One-command self-host for the computer.md daemon (shape 1: pure
+# self-host, no platform integration).
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose down
+#
+# What runs:
+#   - vibecraft-daemon       (the agent loop + Vite SPA served at :8443)
+#   - caddy                  (reverse proxy + automatic local TLS)
+#
+# What's mounted:
+#   - ./data/      → /var/lib/vibecraft (SQLite + vault + screenshots)
+#   - ./etc/       → /etc/vibecraft     (credentials, machine.id, etc.)
+#   - ./home/      → /home/vibecraft    (the agent's home: COMPUTER.md, ~/db/, ~/systems/)
+#
+# What you DON'T get out of this compose file:
+#   - X11 + Chrome (browser tool needs an interactive display)
+#   - Codex CLI / Claude Code CLI workers (install separately on the host)
+#   - Auto-update (the systemd timer is bypassed; pull a new image
+#     manually via `docker compose pull && docker compose up -d`)
+#
+# This is the minimum to run the agent loop on your own machine. For
+# the full self-host setup (X11 + Chrome + workers), use
+# daemon/bootstrap/install-standalone.sh on a Linux host.
+
+services:
+  daemon:
+    image: ghcr.io/carloslfu/computer.md:latest
+    container_name: vibecraft-daemon
+    restart: unless-stopped
+    environment:
+      VIBECRAFT_PORT: "8420"
+      # Pure self-host: don't try to call any platform.
+      VIBECRAFT_PLATFORM_URL: ""
+      # OPENAI_API_KEY is required (operator-owned key).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env or env}
+      VIBECRAFT_MANAGER_MODEL: ${VIBECRAFT_MANAGER_MODEL:-gpt-5.4-mini}
+      VIBECRAFT_TELEMETRY: "off"
+    volumes:
+      - ./data:/var/lib/vibecraft
+      - ./etc:/etc/vibecraft
+      - ./home:/home/vibecraft
+    expose:
+      - "8420"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: vibecraft-caddy
+    restart: unless-stopped
+    ports:
+      - "8443:443"
+    depends_on:
+      - daemon
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

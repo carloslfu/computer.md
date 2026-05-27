@@ -1,0 +1,430 @@
+# VibeCraft CLI
+
+> The agent-native command-line surface for VibeCraft (https://vibecraft.so). Every command returns JSON envelopes on stdout; errors go to stderr with stable code strings; streaming commands emit JSON Lines. Exit codes signal task outcome. Read this once; refer to it forever.
+
+VibeCraft is an agentic computer for business. The customer owns a Linux box with a real desktop, terminal, browser, and filesystem. A manager AI on that box runs other agents on the customer's behalf. You (the external agent reading this) are talking to that manager through this CLI.
+
+Three layers: **computer** (the box) → **manager** (the on-box AI you direct) → **workers** (Claude Code / Codex, spawned by the manager). You talk to the manager. The manager drives the computer.
+
+---
+
+## 1. The contract
+
+Every CLI invocation produces ONE of these:
+
+- **Success (unary)** — one JSON envelope on stdout, then exit 0:
+  ```json
+  {"v":1,"ok":true,"data":{"...command-specific...":"..."}}
+  ```
+- **Failure** — one JSON envelope on stderr, then exit 1 (or 2/3/4 for task outcomes):
+  ```json
+  {"v":1,"ok":false,"error":{"code":"auth_invalid","message":"...","hint":"..."}}
+  ```
+- **Streaming** — JSON Lines on stdout, one event per line:
+  ```
+  {"v":1,"event":"status","ts":"2026-05-21T10:30:00Z","status":"running","task":"abc-123"}
+  {"v":1,"event":"message","ts":"2026-05-21T10:30:01Z","role":"assistant","content":"…"}
+  {"v":1,"event":"final","ts":"2026-05-21T10:30:42Z","status":"completed"}
+  ```
+
+**JSON is the default. Do NOT pass `--text` programmatically.** `--text` exists for humans skimming a terminal; agents always read the JSON.
+
+**Exit codes:**
+- `0` — success / task completed
+- `1` — CLI error (bad flags, network, auth, validation, daemon 5xx). Error envelope on stderr.
+- `2` — task ended in `failed`. TaskData envelope on stdout describing the failure.
+- `3` — task ended in `waiting_for_input`. TaskData envelope on stdout; call `task respond` to continue.
+- `4` — task ended in `cancelled`.
+
+The envelope's `ok` field reflects whether the CLI talked to the daemon successfully. The exit code reflects task outcome. These are different signals; rely on both.
+
+---
+
+## 2. Authentication
+
+One account login. After that the CLI reaches every machine on the account — no per-machine login.
+
+### Account login (the normal path)
+
+```bash
+vibecraft auth login
+# Opens a browser. The human approves CLI access to their VibeCraft
+# account once. The CLI stores an account key (vc_account_*).
+```
+
+From then on the CLI can list every machine and drive any of them. The
+first time a command touches a machine, the CLI transparently brokers a
+per-machine daemon key and caches it — you never see this happen.
+
+```bash
+vibecraft machine list                       # every machine on the account
+vibecraft --machine vc-abc task submit "…"    # just works
+vibecraft --machine all status                # fan out across the fleet
+```
+
+### Headless (CI, servers, no browser)
+
+Set environment variables — no login, no config file:
+
+```bash
+export VIBECRAFT_MACHINE_URL=https://vc-abc.vc.vibecraft.so
+export VIBECRAFT_API_KEY=vc_machine_…
+vibecraft status
+```
+
+Or set `VIBECRAFT_ACCOUNT_KEY=vc_account_…` to use an account key headlessly
+(then `--machine <id>` selects the target).
+
+Or paste a single machine's key:
+
+```bash
+vibecraft auth login --machine-url https://vc-abc.vc.vibecraft.so --api-key vc_machine_…
+echo "$KEY" | vibecraft auth login --machine-url https://… --api-key -   # stdin
+```
+
+### Handoff: copy credentials to another agent
+
+```bash
+vibecraft auth print   # emits the resolved machine_url + api_key
+```
+
+Pipe through scp / 1Password / a shared secret manager, then on the other
+box `vibecraft auth login --api-key - --machine-url "$URL"`.
+
+### Error handling
+
+- `auth_required` — no account key or env vars. Ask the human to run `vibecraft auth login`.
+- `auth_invalid` — the key was revoked or rotated. Ask the human to re-run `vibecraft auth login`.
+- `auth_forbidden` — authenticated, but no control access to that machine.
+
+---
+
+## 3. Recipes
+
+Copy-pasteable, the heart of this doc. Use these as templates.
+
+### Submit-and-wait
+
+The exemplar. Submit a task, block until terminal state, dispatch on exit code.
+
+```bash
+out=$(vibecraft task submit "summarize my latest invoice")
+case $? in
+  0) echo "$out" | jq -r '.data.result' ;;
+  1) echo "CLI/auth/network error — see stderr" >&2 ; exit 1 ;;
+  2) echo "$out" | jq -r '.data.error' >&2 ; exit 1 ;;
+  3) # Task wants input. Read the prompt, decide, respond.
+     id=$(echo "$out" | jq -r '.data.id')
+     prompt=$(vibecraft task messages "$id" | jq -r '.data.messages[-1].content')
+     reply=$(decide_from "$prompt")  # your logic
+     vibecraft task respond "$id" "$reply" ;;
+  4) echo "task was cancelled" >&2 ; exit 1 ;;
+  *) echo "unexpected exit code; see 'vibecraft docs' section 5" >&2 ; exit 1 ;;
+esac
+```
+
+### Submit, then wait later
+
+```bash
+id=$(vibecraft task submit "long-running batch" --no-wait | jq -r '.data.id')
+# … minutes later, possibly from a different process …
+vibecraft task wait "$id"            # blocks until terminal; same exit codes
+vibecraft task get  "$id" | jq .     # current state, no waiting
+```
+
+### Stream
+
+```bash
+vibecraft task stream "$id" | while IFS= read -r line; do
+  event=$(echo "$line" | jq -r '.event')
+  case "$event" in
+    message)    echo "$line" | jq -r '.content' ;;
+    tool_call)  echo "$line" | jq -r '.name + " " + (.args|tostring)' ;;
+    status)     echo "$line" | jq -r '.status' ;;
+    final)      break ;;
+  esac
+done
+```
+
+`heartbeat` events arrive ~every 15s when nothing else is happening; ignore them.
+
+### Multi-turn conversation
+
+```bash
+# Round 1: submit. Suppose it ends in waiting_for_input.
+out=$(vibecraft task submit "deploy the staging branch")
+
+# Round 2: read the prompt, respond.
+id=$(echo "$out" | jq -r '.data.id')
+vibecraft task respond "$id" "yes, ship it"   # waits for next terminal state
+
+# Round 3: read full transcript afterward.
+vibecraft task messages "$id" | jq '.data.messages'
+```
+
+### Fan out across machines
+
+`--machine` runs one command across many machines at once:
+
+```bash
+vibecraft --machine all task submit "snapshot the inbox"   # every machine
+vibecraft --machine vc-a,vc-b status                       # a specific set
+vibecraft --machine 'vc-*' status                          # glob
+```
+
+Output is JSON Lines — one envelope per machine, each tagged with a
+top-level `machine` field. Results stream in as machines finish (pass
+`--ordered` to sort by id instead). The process exit code is the worst
+per-machine code. For conditional / branching logic across machines,
+compose verbs in your own shell — the CLI has no workflow engine.
+
+---
+
+## 4. Verb reference
+
+Every verb, grouped by purpose. JSON shapes shown are the `data` field of
+the success envelope.
+
+### Task lifecycle
+
+| Verb | Purpose |
+|------|---------|
+| `task submit [msg]` | Create a task. `--wait` (default) blocks until terminal; `--no-wait` returns the ID immediately. Use `-` to read msg from stdin. |
+| `task wait <id>` | Block until task is terminal. Same exit-code semantics as `submit --wait`. |
+| `task respond <id> [msg]` | Reply to a task in `waiting_for_input`. `-` reads from stdin. |
+| `task credentials <id>` | Answer a task's credential-request card. Pipe a JSON object `{"NAME":"value"}` on stdin; `--cancel` dismisses. |
+| `task get <id>` | Get current state. Doesn't block. |
+| `task list` | Recent tasks. Filter with `--status`, `--since=<rfc3339>`, `--limit=N`. |
+| `task messages <id>` | Full conversation transcript as a JSON array. |
+| `task stream <id>` | Subscribe to SSE events for one task; JSON Lines on stdout. |
+| `task cancel <id>` | Request cancellation. |
+
+`TaskData` shape:
+```json
+{
+  "id": "abc-123",
+  "status": "completed",
+  "instruction": "the prompt the agent submitted",
+  "result": "the manager's final answer (only when status is completed)",
+  "error": "the failure message (only when status is failed)",
+  "conversation_id": "...",
+  "created_at": "2026-05-21T10:00:00Z",
+  "updated_at": "2026-05-21T10:01:42Z"
+}
+```
+
+Status values: `queued`, `running`, `waiting_for_input`, `completed`, `failed`, `cancelled`.
+
+### State
+
+| Verb | Purpose |
+|------|---------|
+| `status` | Daemon health, uptime, current task. |
+| `events --tail` | Subscribe to ALL events for this machine. |
+
+### Identity
+
+| Verb | Purpose |
+|------|---------|
+| `auth login` | Account login — one browser approval authorizes the CLI for every machine you control. Or paste in a single machine's key with `--api-key`/`--from-file` (headless / BYOM). |
+| `auth logout` | Forget local credentials. |
+| `auth whoami` | Show the machines the CLI knows about locally + any cached key hints. |
+| `auth print` | Emit the resolved machine's FULL api_key for handoff. (Only verb that does this.) |
+
+### Machines
+
+| Verb | Purpose |
+|------|---------|
+| `machine list` | Every machine on your account (live query to the platform). |
+| `machine create [name]` | Provision a new managed (cloud) machine. Uses a plan slot you already pay for; no charge. At the plan cap → `limit_reached` (a human upgrades the plan). |
+| `machine connect <name>` | Register a BYOM machine (your own hardware) — returns a registration token + install command. Free. |
+| `machine terminate <id> --confirm` | Permanently terminate a machine. Irreversible — refuses without `--confirm`. |
+| `machine select <id>` | Set the default machine for commands run without `--machine`. |
+| `machine remove <id>` | Remove from local config (does NOT delete the machine itself). |
+
+### Team & access
+
+| Verb | Purpose |
+|------|---------|
+| `team list` | The account's team members + which machines each controls. |
+| `team add <email>` | Add a team member by email (sends an invite if they have no account). |
+| `team remove <member-id>` | Remove a team member; revokes their access, keys, sessions. |
+| `access list --machine <id>` | Who has control of a machine. |
+| `access grant --machine <id> --email <e>` | Grant a team member control of a machine. |
+| `access revoke --machine <id> --email <e>` | Revoke it. |
+
+Critical actions require `--confirm`: only `machine terminate` (irreversible).
+Everything else is reversible and runs without a gate. The CLI never moves
+money — `machine create` consumes a pre-paid plan slot; over the cap it
+returns `limit_reached` for a human to resolve. Billing, plan changes, and
+account sign-up stay dashboard-only by design.
+
+### Files
+
+| Verb | Purpose |
+|------|---------|
+| `files ls [path]` | List a directory under `/home/vibecraft`. |
+| `files cat <path>` | Print a remote file to stdout (text) or wrap in a JSON envelope (json mode). |
+| `files pull <remote> <local>` | Download a file. `<local>` may be a directory (basename is appended). |
+| `files push <local \| -> <remote>` | Upload a local file (or stdin) to `/home/vibecraft/inbox/<conversation>/`. |
+
+All remote paths are jailed under `/home/vibecraft`. Symlinks that escape the
+jail are rejected.
+
+### Notifications
+
+| Verb | Purpose |
+|------|---------|
+| `notifications list [--unread] [--since=<iso>] [--limit=N]` | Recent notifications the manager pushed for this machine. |
+| `notifications ack <id>` / `notifications ack --all` | Mark read. |
+
+Notifications live on the platform, not on the machine. The CLI reaches
+them with your account key (from `auth login`). They span every machine
+on the account; pass `--machine <id>` to narrow to one.
+
+### Vault (encrypted secrets)
+
+| Verb | Purpose |
+|------|---------|
+| `vault list` | Stored secrets (metadata only — never values). |
+| `vault set <name> --value <v>` | Store a secret. `--value -` reads from stdin; `--from-file <path>` reads from a file. `--label "..."` optional. |
+| `vault delete <name>` | Remove a secret. |
+
+Note: `vault get` does not exist by design. The daemon never returns plaintext
+over the network. If you need to inspect a secret, do so from the dashboard
+(which decrypts locally on the machine).
+
+### Memory (long-term facts the manager refers to)
+
+| Verb | Purpose |
+|------|---------|
+| `memory list [--category X] [--search Y]` | List items. |
+| `memory set <key> [value]` | Store. `-` for stdin, `--from-file <path>` for a file. `--category` defaults to "general". |
+| `memory delete <id>` | Remove by id (returned by `set` / `list`). |
+
+Memory is NOT for secrets. Use `vault` for secrets. Memory is for facts the
+manager should recall ("this customer prefers CSV exports", "invoice format
+is X"), kept in plain SQLite on the machine.
+
+### Inspect & control the machine
+
+Everything the dashboard can do against the machine, the CLI can do too:
+
+| Verb | Purpose |
+|------|---------|
+| `system` | Machine system info — version, CPU, memory, kernel, uptime, installed worker agents. |
+| `systems list` | The persistent/scheduled workflows the manager has authored ("system, not task"). Distinct from `system`. |
+| `config` | Daemon configuration — machine id, host, ports, data dirs, routes. |
+| `computer-md` | Print the shared COMPUTER.md config file. `--set` replaces it from stdin. |
+| `audit` | The audit log. Filters: `--limit N`, `--task <id>`, `--category X`. |
+| `usage` | AI usage / spend. `--start`, `--end` (YYYY-MM-DD), `--top N`. |
+| `rules list` | Guardrail rules (allow / confirm / block). |
+| `rules add --name --pattern --action` | Add a guardrail rule. `--action` is allow\|confirm\|block. |
+| `rules delete <id>` | Remove a guardrail rule. |
+| `conversations list` | Every conversation on the machine. |
+| `conversations get <id>` | One conversation whole — messages + tasks. |
+| `apps list` | Web apps the manager has deployed (name, port, URL, SSO). |
+| `apps sso <name> --on\|--off` | Toggle SSO protection on a deployed app. |
+| `apps restart <name>` | Restart a deployed app and verify old/new PID plus port listening state. |
+| `apps remove <name>` | Unregister a deployed app's route. |
+
+### Meta
+
+| Verb | Purpose |
+|------|---------|
+| `docs` | Print this document. `--json` emits it wrapped in an envelope. |
+| `version` | CLI version. |
+| `update` | Pull the latest CLI binary from the platform manifest, verify SHA-256, atomic swap. Unix only. |
+| `install-skill [--target=claude-code\|codex]` | Drop a skill manifest that teaches your coding agent about this CLI. |
+| `uninstall` | Reverse the install: delete the local config (`~/.config/vibecraft/`) and the `vibecraft` binary. Local teardown only — does NOT revoke the key server-side; do that from the dashboard (Settings → CLI). |
+| `screenshot [-o path]` | PNG snapshot of the machine's desktop. |
+
+### Global flags (any verb)
+
+| Flag | Effect |
+|------|--------|
+| `--json` | JSON output (default; provided explicitly is a no-op). |
+| `--text` | Human-readable output for terminal use. |
+| `--api-key <key>` | Override stored API key for this invocation. |
+| `--machine-url <url>` | Override stored machine URL. |
+| `--machine <id>` | Switch active machine for this invocation only. |
+
+---
+
+## 5. Error codes
+
+Every error envelope's `error.code` is one of:
+
+| Code | Meaning | What to do |
+|------|---------|------------|
+| `auth_required` | No account key or env-var credentials. | Ask the human to run `vibecraft auth login`. |
+| `auth_invalid` | Key was rejected (revoked or rotated). | Ask the human to re-run `vibecraft auth login`. |
+| `auth_forbidden` | Authenticated, but no control access to that machine. | Surface to human — this is a policy decision. |
+| `machine_unreachable` | Network problem talking to the daemon. | Retry with exponential backoff (3 attempts max). |
+| `machine_not_active` | Machine exists but stopped or provisioning. | Wait or surface to human. |
+| `machine_not_found` | Machine ID wrong or deleted. | Surface to human. |
+| `task_not_found` | Task ID wrong or expired. | Check the ID; if right, surface to human. |
+| `task_not_terminal` | Tried to operate on a task that's still running. | Wait for terminal state. |
+| `conversation_not_found` | Conversation ID wrong. | Check the ID. |
+| `path_invalid` | File path outside `/home/vibecraft/` or has `..` traversal. | Use an absolute path under `/home/vibecraft/`. |
+| `path_not_found` | Remote path doesn't exist. | Check spelling. |
+| `path_is_directory` | Expected a file, got a directory. | Pick a child path. |
+| `path_is_file` | Expected a directory, got a file. | Pick the parent. |
+| `file_too_large` | Exceeds 64MB cap. | Split, or move via scp inside the machine. |
+| `validation_error` | Bad flags / missing args / mutually-exclusive flags. | Fix the call. |
+| `idempotency_conflict` | Reused idempotency-key with a different body. | Drop the key or change the body. |
+| `rate_limited` | 429 from daemon. | Honor `Retry-After`. |
+| `timeout` | Operation exceeded deadline. | Safe to retry idempotent verbs. |
+| `cancelled` | Operation cancelled (SIGINT, context expired). | Decide whether to retry. |
+| `server_error` | 5xx from daemon. | Retry with backoff, then surface to human. |
+| `internal_error` | CLI itself misbehaved. | Report a bug. |
+| `schema_unsupported` | CLI/daemon wire version mismatch. | `vibecraft update`. |
+
+---
+
+## 6. Stdin contract
+
+Several verbs accept `-` as a positional argument or flag value, meaning "read this value from stdin":
+
+| Verb | Form |
+|------|------|
+| `task submit -` | Prompt from stdin (handles long prompts without long argv). |
+| `task respond <id> -` | Response from stdin. |
+| `auth login --api-key -` | Key from stdin (keeps it out of `ps` / shell history). |
+
+All other verbs reject `-` with `validation_error`. Stdin is read until EOF; UTF-8 text expected.
+
+---
+
+## 7. Versioning
+
+Every envelope and event line carries `"v":1`. This is the wire-schema version. The CLI refuses to operate against a daemon that doesn't list schema version 1 in its `/api/version` response.
+
+Run `vibecraft version` to print the local CLI version. Run `vibecraft update` (Unix only as of this writing) to pull the latest binary and verify its SHA-256 and Ed25519 release signature before swapping it in.
+
+The CLI also self-updates in the background: about once a day it checks the release manifest and, if a newer version exists, downloads it, verifies its SHA-256 and Ed25519 release signature against a pinned key, and atomically swaps it so the next invocation runs it. A successful swap prints one line to stderr — stdout stays a clean JSON contract. It is best-effort: a failed or unverifiable check never affects your command, and an unsigned binary is refused. Set `VIBECRAFT_NO_AUTO_UPDATE=1` to disable it.
+
+---
+
+## 8. What you cannot do via this CLI
+
+- **Multi-agent orchestration.** The CLI sends one verb per invocation. Compose with shell; `--machine` fans out but does not branch.
+- **In-process agent runtime.** The CLI is a SURFACE into a VibeCraft machine; you (the external agent) are the runtime.
+- **Cross-account access.** The CLI only ever sees machines your account controls. It cannot reach another account's machines.
+- **Editing the manager's prompt.** That's a platform-side feature accessed via the dashboard.
+
+---
+
+## 9. When to escalate to a human
+
+If you encounter any of `auth_required`, `auth_invalid`, `auth_forbidden`, `machine_not_active`, `machine_not_found`, or a repeated `server_error` after retry, surface to the human with this template:
+
+> "I tried `vibecraft <cmd>` on `<machine>` and got `<error_code>`. Suggested next step: `<hint>`. Should I `<hint>` or do you want to handle it?"
+
+Include: the machine ID, the exact command, the error code, the hint (if any), and a link to https://www.vibecraft.so/dashboard.
+
+---
+
+## 10. Discovery
+
+This file is served at `https://www.vibecraft.so/llms.txt` and embedded into the CLI binary. `vibecraft docs` prints it; `vibecraft docs --json` wraps it in an envelope so it can be piped into a context-loading tool. The local copy and the served copy come from the same on-disk source — they cannot drift.

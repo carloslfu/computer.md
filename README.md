@@ -1,2 +1,135 @@
 # computer.md
-The open agentic computer.
+
+**The open agentic computer.**
+
+`computer.md` is two things in one repo:
+
+1. **A spec** — `SPEC.md` defines the customer-authored `COMPUTER.md`
+   file: who the computer is for, what its standing rules are, what
+   tools it has access to.
+2. **A reference runtime** — the `daemon/`, `cli/`, and `daemon/web/`
+   that ship the agent loop, the command surface, and the per-machine
+   UI. Apache-2.0. Runs on Linux. The same binary VibeCraft ships in
+   its hosted product.
+
+A `COMPUTER.md` file is the first **open, customer-owned,
+machine-level, portable state primitive** for the agentic-computer
+era. The format is plain markdown — anyone can read it, edit it, or
+build a runtime that understands it.
+
+## Quick start
+
+```bash
+# Install the CLI (works on macOS, Linux, Windows)
+curl -fsSL https://www.vibecraft.so/install/cli.sh | sh
+
+# Generate a COMPUTER.md (replace 'developer' with your role)
+computer-md init --role developer
+
+# Validate a COMPUTER.md
+computer-md validate
+```
+
+The spec, the parser, and the example role files live in [`spec/`](spec/SPEC.md).
+The Go daemon lives in [`daemon/`](daemon/). The CLI lives in [`cli/`](cli/).
+
+## The four deployment shapes
+
+The same daemon binary serves four deployment shapes:
+
+1. **Pure self-host (shape 1).** Clone, build, run on your own box.
+   No platform, no telemetry, no auto-update. Auth is first-run
+   token + cookie session.
+2. **Connected (shape 2, BYOM).** You own the hardware; the daemon
+   registers with the platform (`VIBECRAFT_PLATFORM_URL`,
+   default `https://www.vibecraft.so`) for notifications, usage
+   reporting, and auto-updates. Operator-owned OpenAI key.
+3. **Managed (shape 3).** VibeCraft provisions the box (AWS or
+   Hetzner). Same daemon binary; VibeCraft's platform handles
+   billing and the manager key.
+4. **Embedded / commercial fork (shape 4).** Third party ships the
+   daemon inside their own product. Overrides `daemon/brand.md`,
+   points `VIBECRAFT_PLATFORM_URL` at their own backend, retains
+   attribution per the NOTICE file. The license invites this; the
+   trademark on "VibeCraft" prevents using the name.
+
+All four run from the same code. See [SPEC.md](spec/SPEC.md) and
+[`daemon/SECURITY.md`](daemon/SECURITY.md) for details.
+
+## Repository layout
+
+```
+computer.md/
+├── spec/                Format spec + parser + role-flavored examples + computer-md CLI
+│   ├── SPEC.md
+│   ├── parser/          Go reference parser (section extractor)
+│   ├── examples/        Role-flavored COMPUTER.md starters
+│   └── cmd/computer-md/ The `computer-md init|validate|format|sections` CLI
+├── daemon/              The Go agent runtime
+│   ├── web/             Vite + React per-machine UI (embedded via go:embed)
+│   ├── core/            COMPUTER.md, task queue, system state
+│   ├── manager/         OpenAI Responses API client
+│   ├── computer/        Mouse/keyboard/screenshot/shell tools
+│   ├── vault/           AES-256-GCM secrets vault
+│   ├── audit/           Append-only audit log
+│   ├── sandbox/         Low-level bwrap capability (invoked ad-hoc, not by default)
+│   └── bootstrap/       Daemon installers (install.sh)
+├── cli/                 The `vibecraft` CLI (task, chat, screenshot, auth)
+├── install/cli.sh       CLI installer (the script vibecraft.so/install/cli.sh serves)
+└── HomebrewFormula/     Homebrew tap template for `brew install carloslfu/tap/vibecraft`
+```
+
+## License
+
+[Apache-2.0](LICENSE). Patent grant, trademark clause, explicit
+modification disclosure. CLA on every PR via CLA Assistant — see
+[CONTRIBUTING.md](CONTRIBUTING.md). The CLA preserves the option
+to relicense forward (Grafana 2014→2021 pivot pattern) if a
+hyperscaler-fork threat ever materializes; the active codebase is
+permissive today.
+
+## Telemetry
+
+**Off by default.** The daemon sends nothing to anyone unless you
+opt in via `VIBECRAFT_TELEMETRY=on`. When on, the only payload is
+a weekly `{version, os, arch}` POST to
+`${VIBECRAFT_TELEMETRY_URL:-${VIBECRAFT_PLATFORM_URL}/api/telemetry/v1/ping}`.
+The code is OSS; the payload is auditable line by line.
+
+**Install telemetry** is separate: when you download the CLI
+via `https://www.vibecraft.so/install/cli.sh`, the platform logs an
+anonymous event into its DB (User-Agent + asset name + timestamp;
+no IPs, no fingerprints). Bypass it by downloading directly from
+GitHub Releases. See [SECURITY.md](SECURITY.md) for the threat model.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
+Sign the Apache ICLA via the CLA Assistant bot on your first PR.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). Reports go to security@vibecraft.so.
+
+## Stewardship
+
+`computer.md` is stewarded by **VibeCraft** (the commercial product
+at [vibecraft.so](https://www.vibecraft.so)). VibeCraft is the
+company behind the standard; the standard's name is broader than
+any one implementation. Think HashiCorp ↔ Terraform, Docker Inc. ↔
+Dockerfile.
+
+When the project hits 1,000+ stars, an outside contributor wanting
+commit access, or 12 months from public launch — whichever fires
+first — the repo migrates from `carloslfu/computer.md` to
+`vibecraft-so/computer.md` via `gh repo transfer`. GitHub auto-redirects
+keep all old URLs working.
+
+## Related
+
+- **db.md** — the LLM-curated markdown knowledge base standard,
+  the natural storage layer for a computer.md computer. Stewarded
+  by VibeCraft alongside computer.md. See
+  [github.com/carloslfu/db.md](https://github.com/carloslfu/db.md).
+- **AGENTS.md** — the agent-instruction convention computer.md
+  composes with. See [agentsmd/agents.md](https://github.com/agentsmd/agents.md).

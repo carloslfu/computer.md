@@ -1,0 +1,415 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  # id-token: write enables cosign keyless signing via GitHub OIDC.
+  id-token: write
+
+# Binaries are uploaded straight to the GitHub Release from each build
+# job. We deliberately do NOT use actions/upload-artifact: artifact
+# storage is an ACCOUNT-level quota (shared across every repo), and
+# when it's exhausted the upload step fails and the whole release
+# silently produces nothing (this bit v0.23.0 and v0.24.0 — both had
+# to be built and published by hand). The release itself is the
+# transport; the only cross-job data is the kilobyte .sha256 files,
+# which the manifest job pulls back off the release.
+jobs:
+  # ──────────────────────────────────────────────
+  # Create the release up front so every build job has a stable
+  # target to upload assets to (no race: this is the only creator).
+  # ──────────────────────────────────────────────
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create DRAFT release if absent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create as a DRAFT. A published release with no assets yet
+          # is briefly returned by GitHub's releases/latest, which makes
+          # /api/releases/manifest 404 and (worse) lets the platform's
+          # 300s fetch-cache pin that empty snapshot — stalling the
+          # whole fleet's auto-update. Drafts are excluded from
+          # releases/latest, so the manifest endpoint never sees the
+          # release until the final job flips it to published with every
+          # asset already attached.
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes \
+              --draft
+          fi
+
+  # ──────────────────────────────────────────────
+  # Build daemon for release (linux/amd64, CGO required)
+  # ──────────────────────────────────────────────
+  daemon:
+    name: Build Daemon
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+          cache-dependency-path: daemon/go.sum
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: daemon/web/package-lock.json
+
+      - name: Install SQLCipher build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlcipher-dev gcc
+
+      - name: Build SPA bundle (daemon/web)
+        working-directory: daemon/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build daemon (linux/amd64)
+        working-directory: daemon
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build \
+            -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o vibecraft-daemon-linux-amd64 \
+            .
+
+      - name: Generate checksum
+        working-directory: daemon
+        run: sha256sum vibecraft-daemon-linux-amd64 > vibecraft-daemon-linux-amd64.sha256
+
+      # ── Signed releases (per-workload-sandboxing Phase 6) ──
+      # Ed25519 detached signature over the daemon binary. Chosen over
+      # cosign keyless: no extra binary to bootstrap-trust on every
+      # machine, no Rekor/Fulcio network dependency in the updater —
+      # openssl is already on every box and the "verify before swap"
+      # guarantee is identical. The private key lives ONLY in the
+      # RELEASE_SIGNING_KEY repo secret; the public key is pinned in the
+      # updater (cloud-init.ts / install.sh) and re-verified here.
+      #
+      # Mandated dry-run: we verify the freshly-made signature with the
+      # SAME pinned public key the fleet's updater uses, IN THIS JOB,
+      # before any asset is published. A broken signing setup fails the
+      # release here instead of shipping a release the fleet rejects.
+      #
+      # Fail-safe: if the secret is unset the step is a no-op (no .sig
+      # asset) and the updater stays SHA256-only — non-bricking.
+      - name: Sign daemon (Ed25519 release key) + dry-run verify
+        working-directory: daemon
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+            echo "RELEASE_SIGNING_KEY unset — skipping signing (SHA256 remains the release gate)"
+            exit 0
+          fi
+          printf '%s' "$RELEASE_SIGNING_KEY" > /tmp/rel_priv.pem
+          openssl pkeyutl -sign -inkey /tmp/rel_priv.pem -rawin \
+            -in vibecraft-daemon-linux-amd64 \
+            -out vibecraft-daemon-linux-amd64.sig
+          shred -u /tmp/rel_priv.pem 2>/dev/null || rm -f /tmp/rel_priv.pem
+          cat > /tmp/rel_pub.pem <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MCowBQYDK2VwAyEAhteWVbSpt50y4gcb79L8gU1F+uWld3CO1JM91nCfLB0=
+          -----END PUBLIC KEY-----
+          EOF
+          openssl pkeyutl -verify -pubin -inkey /tmp/rel_pub.pem -rawin \
+            -in vibecraft-daemon-linux-amd64 \
+            -sigfile vibecraft-daemon-linux-amd64.sig
+          echo "release signature verified with the pinned fleet public key"
+
+      - name: Upload daemon to release
+        working-directory: daemon
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FILES="vibecraft-daemon-linux-amd64 vibecraft-daemon-linux-amd64.sha256"
+          [ -f vibecraft-daemon-linux-amd64.sig ] && FILES="$FILES vibecraft-daemon-linux-amd64.sig"
+          gh release upload "${GITHUB_REF_NAME}" $FILES --clobber
+
+  # ──────────────────────────────────────────────
+  # Build CLI for release (multi-platform, pure Go)
+  # ──────────────────────────────────────────────
+  cli:
+    name: Build CLI
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            suffix: windows-arm64
+            ext: .exe
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+          cache-dependency-path: cli/go.sum
+
+      - name: Build CLI (${{ matrix.suffix }})
+        working-directory: cli
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build \
+            -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o vibecraft-${{ matrix.suffix }}${{ matrix.ext }} \
+            .
+
+      - name: Generate checksum
+        working-directory: cli
+        run: sha256sum vibecraft-${{ matrix.suffix }}${{ matrix.ext }} > vibecraft-${{ matrix.suffix }}.sha256
+
+      # Ed25519 release signature. The CLI's self-updater verifies this
+      # against a pinned public key (cli/cmd/verify.go) before swapping
+      # the binary — provenance the same-origin SHA-256 cannot give. Same
+      # RELEASE_SIGNING_KEY + pinned key the daemon uses; the dry-run
+      # verify fails the release in-job if signing is misconfigured.
+      # Fail-safe: if the secret is unset the step is a no-op.
+      - name: Sign CLI (Ed25519 release key) + dry-run verify
+        working-directory: cli
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+            echo "RELEASE_SIGNING_KEY unset — skipping Ed25519 signing"
+            exit 0
+          fi
+          BIN="vibecraft-${{ matrix.suffix }}${{ matrix.ext }}"
+          SIG="vibecraft-${{ matrix.suffix }}.ed25519.sig"
+          printf '%s' "$RELEASE_SIGNING_KEY" > /tmp/rel_priv.pem
+          openssl pkeyutl -sign -inkey /tmp/rel_priv.pem -rawin -in "$BIN" -out "$SIG"
+          shred -u /tmp/rel_priv.pem 2>/dev/null || rm -f /tmp/rel_priv.pem
+          cat > /tmp/rel_pub.pem <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MCowBQYDK2VwAyEAhteWVbSpt50y4gcb79L8gU1F+uWld3CO1JM91nCfLB0=
+          -----END PUBLIC KEY-----
+          EOF
+          openssl pkeyutl -verify -pubin -inkey /tmp/rel_pub.pem -rawin -in "$BIN" -sigfile "$SIG"
+          echo "CLI Ed25519 signature verified with the pinned public key"
+
+      # D2 — Cosign keyless signing. Uses the workflow's GitHub OIDC
+      # token (no key management). Each CLI binary gets a .sig + .pem
+      # bundle uploaded next to it; the install script can verify if
+      # cosign is present, and the github.io transparency log gives
+      # us provenance regardless.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.1"
+
+      - name: Cosign sign (keyless, OIDC)
+        working-directory: cli
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          COSIGN_YES: "true"
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "vibecraft-${{ matrix.suffix }}.sig" \
+            --output-certificate "vibecraft-${{ matrix.suffix }}.pem" \
+            "vibecraft-${{ matrix.suffix }}${{ matrix.ext }}"
+
+      - name: Upload CLI to release (${{ matrix.suffix }})
+        working-directory: cli
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FILES="vibecraft-${{ matrix.suffix }}${{ matrix.ext }} vibecraft-${{ matrix.suffix }}.sha256 vibecraft-${{ matrix.suffix }}.sig vibecraft-${{ matrix.suffix }}.pem"
+          # The Ed25519 signature is absent only when RELEASE_SIGNING_KEY
+          # is unset (preview / fork builds) — keep the upload non-fatal.
+          [ -f vibecraft-${{ matrix.suffix }}.ed25519.sig ] && FILES="$FILES vibecraft-${{ matrix.suffix }}.ed25519.sig"
+          gh release upload "${GITHUB_REF_NAME}" $FILES --clobber
+
+  # ──────────────────────────────────────────────
+  # Generate manifest.json from the uploaded checksums
+  # ──────────────────────────────────────────────
+  manifest:
+    name: Generate Manifest
+    runs-on: ubuntu-latest
+    needs: [daemon, cli]
+    steps:
+      - name: Download checksums from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p release
+          cd release
+          # Only the tiny .sha256 files — never the binaries. This is
+          # the sole cross-job transfer and it stays off artifact
+          # storage entirely.
+          gh release download "${GITHUB_REF_NAME}" --pattern '*.sha256' --dir .
+          # Best-effort: the daemon signature (absent if RELEASE_SIGNING_KEY
+          # is unset). Its presence drives the manifest `sig` field.
+          gh release download "${GITHUB_REF_NAME}" --pattern 'vibecraft-daemon-linux-amd64.sig' --dir . || true
+          ls -la
+
+      - name: Generate manifest.json
+        working-directory: release
+        run: |
+          VERSION="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+
+          echo '{' > manifest.json
+          echo "  \"version\": \"${VERSION}\"," >> manifest.json
+          echo '  "binaries": {' >> manifest.json
+
+          DAEMON_SHA=$(cat vibecraft-daemon-linux-amd64.sha256 | awk '{print $1}')
+          echo '    "daemon-linux-amd64": {' >> manifest.json
+          echo "      \"url\": \"${BASE_URL}/vibecraft-daemon-linux-amd64\"," >> manifest.json
+          if [ -f vibecraft-daemon-linux-amd64.sig ]; then
+            echo "      \"sha256\": \"${DAEMON_SHA}\"," >> manifest.json
+            echo "      \"sig\": \"${BASE_URL}/vibecraft-daemon-linux-amd64.sig\"" >> manifest.json
+          else
+            echo "      \"sha256\": \"${DAEMON_SHA}\"" >> manifest.json
+          fi
+          echo '    },' >> manifest.json
+
+          TARGETS=("darwin-amd64" "darwin-arm64" "linux-amd64" "linux-arm64" "windows-amd64" "windows-arm64")
+          LAST_IDX=$(( ${#TARGETS[@]} - 1 ))
+
+          for i in "${!TARGETS[@]}"; do
+            TARGET="${TARGETS[$i]}"
+
+            case "$TARGET" in
+              windows-*) BIN_NAME="vibecraft-${TARGET}.exe" ;;
+              *)         BIN_NAME="vibecraft-${TARGET}" ;;
+            esac
+
+            SHA=$(cat "vibecraft-${TARGET}.sha256" | awk '{print $1}')
+
+            echo "    \"cli-${TARGET}\": {" >> manifest.json
+            echo "      \"url\": \"${BASE_URL}/${BIN_NAME}\"," >> manifest.json
+            echo "      \"sha256\": \"${SHA}\"" >> manifest.json
+
+            if [ "$i" -eq "$LAST_IDX" ]; then
+              echo '    }' >> manifest.json
+            else
+              echo '    },' >> manifest.json
+            fi
+          done
+
+          echo '  }' >> manifest.json
+          echo '}' >> manifest.json
+
+          echo "Generated manifest.json:"
+          cat manifest.json
+
+      - name: Upload manifest to release
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "${GITHUB_REF_NAME}" manifest.json --clobber
+
+      - name: Publish release (flip draft → public)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        # Every asset (daemon, all CLI targets, manifest.json) is now
+        # attached. Flipping the draft to published is the first moment
+        # releases/latest returns this tag — so the platform's manifest
+        # endpoint only ever sees a complete release. --latest makes it
+        # unambiguous for the GitHub "latest" resolution the platform
+        # relies on.
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+
+  # ──────────────────────────────────────────────
+  # Update the Homebrew tap (D8). Renders
+  # HomebrewFormula/vibecraft.rb.template against the just-published
+  # manifest and pushes the formula to github.com/carloslfu/homebrew-tap.
+  # No-op if HOMEBREW_TAP_TOKEN secret is unset (preview / fork releases).
+  # ──────────────────────────────────────────────
+  homebrew:
+    name: Update Homebrew tap
+    runs-on: ubuntu-latest
+    needs: [manifest]
+    if: ${{ !github.event.repository.fork }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tap token
+        id: tok
+        run: |
+          if [ -z "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_TOKEN unset — skipping tap update"
+          fi
+
+      - name: Download manifest
+        if: steps.tok.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "${GITHUB_REF_NAME}" --pattern 'manifest.json' --dir .
+
+      - name: Render formula
+        if: steps.tok.outputs.skip != 'true'
+        run: |
+          chmod +x HomebrewFormula/render.sh
+          HomebrewFormula/render.sh "${GITHUB_REF_NAME}" manifest.json > vibecraft.rb
+          echo "--- rendered formula ---"
+          cat vibecraft.rb
+
+      - name: Push to tap repo
+        if: steps.tok.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="carloslfu/homebrew-tap"
+          if ! gh repo view "$REPO" >/dev/null 2>&1; then
+            echo "tap repo $REPO not accessible with HOMEBREW_TAP_TOKEN; skipping"
+            exit 0
+          fi
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" tap-repo
+          mkdir -p tap-repo/Formula
+          cp vibecraft.rb tap-repo/Formula/vibecraft.rb
+          cd tap-repo
+          git config user.name  "vibecraft-release-bot"
+          git config user.email "release-bot@vibecraft.so"
+          git add Formula/vibecraft.rb
+          if git diff --cached --quiet; then
+            echo "no formula changes"
+            exit 0
+          fi
+          git commit -m "vibecraft: update to ${GITHUB_REF_NAME}"
+          git push origin HEAD

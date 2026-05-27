@@ -1,0 +1,7 @@
+node_modules
+# dist/ is committed at the placeholder level so //go:embed compiles on
+# fresh checkouts; the Makefile and CI rebuild it.
+dist/assets
+dist/*.js.map
+*.log
+.DS_Store
