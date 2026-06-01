@@ -127,7 +127,7 @@ jobs:
           shred -u /tmp/rel_priv.pem 2>/dev/null || rm -f /tmp/rel_priv.pem
           cat > /tmp/rel_pub.pem <<'EOF'
           -----BEGIN PUBLIC KEY-----
-          MCowBQYDK2VwAyEAhteWVbSpt50y4gcb79L8gU1F+uWld3CO1JM91nCfLB0=
+          MCowBQYDK2VwAyEA+Lcb8IpwuZjZHh6FddfgliKbupMfUSXv4PKCSjBn5mw=
           -----END PUBLIC KEY-----
           EOF
           openssl pkeyutl -verify -pubin -inkey /tmp/rel_pub.pem -rawin \
@@ -220,7 +220,7 @@ jobs:
           shred -u /tmp/rel_priv.pem 2>/dev/null || rm -f /tmp/rel_priv.pem
           cat > /tmp/rel_pub.pem <<'EOF'
           -----BEGIN PUBLIC KEY-----
-          MCowBQYDK2VwAyEAhteWVbSpt50y4gcb79L8gU1F+uWld3CO1JM91nCfLB0=
+          MCowBQYDK2VwAyEA+Lcb8IpwuZjZHh6FddfgliKbupMfUSXv4PKCSjBn5mw=
           -----END PUBLIC KEY-----
           EOF
           openssl pkeyutl -verify -pubin -inkey /tmp/rel_pub.pem -rawin -in "$BIN" -sigfile "$SIG"

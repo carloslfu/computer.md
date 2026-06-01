@@ -17,17 +17,26 @@ import (
 
 // releasePublicKeyPEM is the pinned Ed25519 public key the release
 // pipeline signs every binary with (the "Sign CLI (Ed25519 release key)"
-// step in .github/workflows/release.yml). It is the same key the daemon
-// updater pins in lib/cloud-init.ts. selfUpdate refuses to swap in a
+// step in .github/workflows/release.yml). selfUpdate refuses to swap in a
 // binary whose detached .ed25519.sig does not verify against this key —
 // so a compromised download origin cannot push a forged or unsigned
 // binary, which the same-origin SHA-256 check alone cannot prevent.
 //
-// To rotate: ship a CLI release that pins the new key here (and update
-// release.yml + lib/cloud-init.ts), THEN switch RELEASE_SIGNING_KEY —
-// clients keep trusting the old key until they have updated.
+// This is computer.md's OWN release-signing identity, generated for and
+// owned by this repository. It is deliberately INDEPENDENT of any other
+// project's signing key — this repo signs and verifies entirely on its
+// own key, with no shared trust root. See SIGNING.md.
+//
+// To rotate: ship a CLI release that pins the new key here AND updates
+// release.yml's two verify blocks, THEN switch the RELEASE_SIGNING_KEY
+// repo secret — clients keep trusting the old key until they have
+// updated to a binary that pins the new one. Keep the private key backed
+// up (a password manager): if it is lost, already-installed clients
+// cannot be migrated to a new key via self-update (they hard-fail on a
+// signature they cannot verify) and must reinstall. Full procedure in
+// SIGNING.md.
 const releasePublicKeyPEM = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAhteWVbSpt50y4gcb79L8gU1F+uWld3CO1JM91nCfLB0=
+MCowBQYDK2VwAyEA+Lcb8IpwuZjZHh6FddfgliKbupMfUSXv4PKCSjBn5mw=
 -----END PUBLIC KEY-----`
 
 // releaseSignatureURL returns the URL of a binary's detached Ed25519

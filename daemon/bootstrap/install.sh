@@ -226,7 +226,7 @@ chmod 700 /etc/vibecraft
 # updater to verify the daemon's Ed25519 signature before any swap.
 cat > /etc/vibecraft/release_pub.pem << 'PUBEOF'
 -----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAhteWVbSpt50y4gcb79L8gU1F+uWld3CO1JM91nCfLB0=
+MCowBQYDK2VwAyEA+Lcb8IpwuZjZHh6FddfgliKbupMfUSXv4PKCSjBn5mw=
 -----END PUBLIC KEY-----
 PUBEOF
 chmod 644 /etc/vibecraft/release_pub.pem
