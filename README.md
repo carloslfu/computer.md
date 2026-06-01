@@ -31,6 +31,7 @@ computer-md validate
 ```
 
 The spec, the parser, and the example role files live in [`spec/`](spec/SPEC.md).
+The current spec is **v0.1** (tagged [`v0.1`](https://github.com/carloslfu/computer.md/releases/tag/v0.1); additive changes only — see [SPEC.md § Versioning](spec/SPEC.md)).
 The Go daemon lives in [`daemon/`](daemon/). The CLI lives in [`cli/`](cli/).
 
 ## The four deployment shapes
