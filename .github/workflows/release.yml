@@ -3,7 +3,10 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      # 3-part version tags only (v0.71.4, v1.2.3, v0.71.4-rc.1) cut a
+      # binary release. 2-part tags like v0.1 are reserved for the SPEC
+      # (see spec/SPEC.md § Versioning) and deliberately do NOT trigger.
+      - "v*.*.*"
 
 permissions:
   contents: write
