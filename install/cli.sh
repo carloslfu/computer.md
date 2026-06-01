@@ -21,22 +21,21 @@ set -eu
 INSTALL_BASE_URL="${VIBECRAFT_INSTALL_URL:-https://www.vibecraft.so/install}"
 DASHBOARD_URL="https://www.vibecraft.so/dashboard"
 
-# Cosign keyless-signing pins. The release pipeline signs every CLI
+# Cosign keyless-signing pin. The release pipeline signs every CLI
 # binary with the GitHub Actions OIDC identity of the release workflow;
 # verification only proves provenance if it pins that exact signer +
 # issuer. A wildcard would accept a binary signed by anyone who can get
-# a Fulcio certificate. These MUST stay in sync with the cosign sign-blob
-# step in .github/workflows/release.yml of the repo the platform serves
-# Cosign identity is dual-trust during the OSS-extraction rotation
-# window: existing installed CLIs were signed under
-# carloslfu/vibecraft-so (the private platform repo where the release
-# pipeline ran originally); new releases ship from
-# carloslfu/computer.md (the OSS repo where the pipeline lives now).
-# Trusting both identities lets in-field CLIs self-update across the
-# rotation. After 1-2 weeks of dual-trust uptake (tracked via the
-# manifest-fetch install-telemetry signal), the next release tightens
-# this regex to the new identity only.
-COSIGN_IDENTITY_REGEXP='^https://github\.com/carloslfu/(vibecraft-so|computer\.md)/\.github/workflows/release\.yml@refs/tags/v'
+# a Fulcio certificate. This MUST stay in sync with the cosign sign-blob
+# step in .github/workflows/release.yml of carloslfu/computer.md.
+#
+# The OSS-extraction rotation is COMPLETE: the release pipeline lives in
+# and signs from carloslfu/computer.md, so the identity is pinned to that
+# repo only. (History: during the rotation window this regex briefly
+# dual-trusted carloslfu/vibecraft-so — the private platform repo where
+# the pipeline originally ran — so in-field CLIs could self-update across
+# the cutover. With the cutover done and no installs pinned to the old
+# identity, the pin is tightened to computer.md alone.)
+COSIGN_IDENTITY_REGEXP='^https://github\.com/carloslfu/computer\.md/\.github/workflows/release\.yml@refs/tags/v'
 COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 
 INSTALL_PATH=""
