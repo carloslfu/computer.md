@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/disintegration/imaging"
+	"golang.org/x/image/draw"
 )
 
 // ScreenshotService handles screen capture and image processing.
@@ -187,8 +187,11 @@ func (s *ScreenshotService) smartCrop(img image.Image) image.Image {
 	newW := int(float64(srcW) * scale)
 	newH := int(float64(srcH) * scale)
 
-	// Use Lanczos for high-quality downscaling.
-	return imaging.Resize(img, newW, newH, imaging.Lanczos)
+	// High-quality downscale via golang.org/x/image/draw (Catmull-Rom),
+	// replacing the unmaintained github.com/disintegration/imaging.
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, bounds, draw.Src, nil)
+	return dst
 }
 
 // ListScreenshots returns all screenshot file paths in the screenshot directory,
