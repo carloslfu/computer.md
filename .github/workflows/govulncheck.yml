@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Vulnerability gate for the computer.md Go modules (daemon + cli + spec).
+#
+# Runs govulncheck in symbol (reachability) mode: it fails the build only when
+# code actually CALLS a vulnerable function, in a dependency or in the Go
+# standard library. This is the gate that turns "Dependabot alert after merge"
+# into "fail the PR" for Go (the Rust equivalent is db.md's audit.yml).
+#
+# Scanned with `go-version: stable` on purpose: standard-library advisories are
+# resolved by building with a current Go toolchain, so using the latest release
+# keeps the gate self-healing as Go ships security patches.
+#
+# Runs on Go source / module changes AND on a daily schedule, so a newly
+# published advisory against unchanged code is caught with no commit.
+
+name: govulncheck
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "daemon/**"
+      - "cli/**"
+      - "spec/**"
+      - ".github/workflows/govulncheck.yml"
+  pull_request:
+    paths:
+      - "daemon/**"
+      - "cli/**"
+      - "spec/**"
+      - ".github/workflows/govulncheck.yml"
+  schedule:
+    # Daily at 07:00 UTC: catch advisories published against existing deps.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [daemon, cli, spec]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      # The daemon links SQLCipher via cgo (github.com/mutecomm/go-sqlcipher);
+      # govulncheck must build it for reachability analysis. Mirrors release.yml.
+      - name: Install SQLCipher build dependencies (daemon)
+        if: matrix.module == 'daemon'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlcipher-dev gcc
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: govulncheck ./...
+        working-directory: ${{ matrix.module }}
+        env:
+          CGO_ENABLED: ${{ matrix.module == 'daemon' && '1' || '0' }}
+        run: govulncheck ./...
