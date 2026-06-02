@@ -4,7 +4,7 @@
 
 `computer.md` is two things in one repo:
 
-1. **A spec** — `SPEC.md` defines the customer-authored `COMPUTER.md`
+1. **A spec** — [`SPEC.md`](spec/SPEC.md) defines the customer-authored `COMPUTER.md`
    file: who the computer is for, what its standing rules are, what
    tools it has access to.
 2. **A reference runtime** — the `daemon/`, `cli/`, and `daemon/web/`
@@ -142,9 +142,10 @@ keep all old URLs working.
 
 ## Related
 
-- **db.md** — the LLM-curated markdown knowledge base standard,
-  the natural storage layer for a computer.md computer. Stewarded
-  by VibeCraft alongside computer.md. See
-  [github.com/carloslfu/db.md](https://github.com/carloslfu/db.md).
+- **db.md** — the open database in plain files, the natural storage
+  layer for a computer.md computer. An independent standard, usable
+  on its own. See its
+  [SPEC.md](https://github.com/carloslfu/db.md/blob/main/SPEC.md) and
+  [repo](https://github.com/carloslfu/db.md).
 - **AGENTS.md** — the agent-instruction convention computer.md
   composes with. See [agentsmd/agents.md](https://github.com/agentsmd/agents.md).
