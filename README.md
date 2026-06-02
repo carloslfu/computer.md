@@ -110,7 +110,21 @@ Sign the Apache ICLA via the CLA Assistant bot on your first PR.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Reports go to security@vibecraft.so.
+Report vulnerabilities to security@vibecraft.so; see
+[SECURITY.md](SECURITY.md) for the threat model. Two things worth
+knowing if you run this:
+
+**Releases are verifiable.** Every binary is built in CI,
+SHA256-checksummed, and signed with computer.md's Ed25519 release key,
+which `install.sh` and the CLI self-updater check against a pinned
+public key (plus cosign keyless signatures and build-provenance
+attestations). See [SIGNING.md](SIGNING.md).
+
+**Dependencies are continuously audited.** Every pull request runs
+`govulncheck` over the Go modules and fails on a reachable
+vulnerability; the Go and web (npm) dependency trees are also watched
+by GitHub Dependabot and Socket supply-chain scanning (malware,
+typosquats, suspicious install scripts).
 
 ## Stewardship
 
