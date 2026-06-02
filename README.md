@@ -2,6 +2,8 @@
 
 **The open agentic computer.**
 
+A computer you direct in plain language. A capable model runs the real machine for you: terminal, browser, filesystem. You say what you want; it does the work.
+
 `computer.md` is two things in one repo:
 
 1. **A spec** — [`SPEC.md`](spec/SPEC.md) defines the customer-authored `COMPUTER.md`
@@ -16,6 +18,16 @@ A `COMPUTER.md` file is the first **open, customer-owned,
 machine-level, portable state primitive** for the agentic-computer
 era. The format is plain markdown — anyone can read it, edit it, or
 build a runtime that understands it.
+
+## The bet
+
+computer.md is a bold bet, made in the open.
+
+The bet is that frontier models keep getting better, fast. And that the right thing to build is not another app on top of an operating system, but a thin substrate a model can operate directly. Give a capable model a real computer and a few good primitives, and it outperforms any framework you could wrap around it. Every model release makes the substrate stronger, with no new code.
+
+Taken to its conclusion, the agentic computer is what replaces the operating system as the surface you talk to. The OS becomes plumbing. The model becomes the interface. You stop operating the computer. The computer operates itself, for you.
+
+This is what computers should be. computer.md is the open standard for getting there.
 
 ## Quick start
 
@@ -128,11 +140,13 @@ typosquats, suspicious install scripts).
 
 ## Stewardship
 
-`computer.md` is stewarded by **VibeCraft** (the commercial product
-at [vibecraft.so](https://www.vibecraft.so)). VibeCraft is the
-company behind the standard; the standard's name is broader than
-any one implementation. Think HashiCorp ↔ Terraform, Docker Inc. ↔
-Dockerfile.
+`computer.md` is created by **Carlos Galarza** ([carloslfu](https://github.com/carloslfu))
+and stewarded by **VibeCraft**, the commercial product at
+[vibecraft.so](https://www.vibecraft.so) and the company behind the
+standard. computer.md is VibeCraft's open-source bet: the substrate is
+open and anyone can run it; the hosted product is the business. The
+standard's name is broader than any one implementation. Think
+HashiCorp ↔ Terraform, Docker Inc. ↔ Dockerfile.
 
 When the project hits 1,000+ stars, an outside contributor wanting
 commit access, or 12 months from public launch — whichever fires
