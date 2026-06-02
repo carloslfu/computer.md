@@ -130,7 +130,7 @@ Format suggestion: bullet list. Each rule short and unambiguous.
 ```markdown
 ## Standing rules
 - Never publish to production without my approval.
-- Always log expense entries to db/wiki/expenses/ with frontmatter.
+- Always log expense entries to db/records/expenses/ with frontmatter.
 - If a customer email mentions cancellation, escalate to me before replying.
 ```
 
