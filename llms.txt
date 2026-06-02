@@ -294,6 +294,11 @@ Note: `vault get` does not exist by design. The daemon never returns plaintext
 over the network. If you need to inspect a secret, do so from the dashboard
 (which decrypts locally on the machine).
 
+To wire a secret into a deployed tool's environment, store it with `vault set`
+then reference it at deploy time: `tools deploy <name> --env KEY=$SECRET_NAME`.
+The daemon resolves the `$SECRET_NAME` on the machine. See "Deploying &
+updating tools" below.
+
 ### Memory (long-term facts the manager refers to)
 
 | Verb | Purpose |
@@ -323,10 +328,63 @@ Everything the dashboard can do against the machine, the CLI can do too:
 | `rules delete <id>` | Remove a guardrail rule. |
 | `conversations list` | Every conversation on the machine. |
 | `conversations get <id>` | One conversation whole — messages + tasks. |
-| `apps list` | Web apps the manager has deployed (name, port, URL, SSO). |
-| `apps sso <name> --on\|--off` | Toggle SSO protection on a deployed app. |
-| `apps restart <name>` | Restart a deployed app and verify old/new PID plus port listening state. |
-| `apps remove <name>` | Unregister a deployed app's route. |
+| `tools list` | Hosted tools the manager has deployed (name, port, URL, SSO). |
+| `tools status <name>` | What a tool is actually running: systemd state, MainPID, port-listening, ExecStart, env KEYS, working-copy git HEAD. |
+| `tools logs <name> [--lines N]` | Tail a tool's journal (journalctl). Default 100 lines, max 1000. |
+| `tools deploy <name> [--env KEY=VAL] [--port N]` | Apply a code/env change and verify it serves. Reuses the stored command; repeatable `--env` values may use `$SECRET_NAME` (resolved from the vault). |
+| `tools env <name>` | A tool's environment variable keys (never values). |
+| `tools restart <name>` | Cycle a tool's process from the SAME unit/build. Does NOT rebuild — use `deploy` after a code/env change. |
+| `tools sso <name> --on\|--off` | Toggle SSO protection on a deployed tool. |
+| `tools remove <name>` | Unregister a deployed tool's route. |
+
+(`apps` is a deprecated alias for `tools`; the backend endpoints still use `/hosted-apps`.)
+
+### Deploying & updating tools
+
+A **hosted tool** is a web service the manager deployed on the machine: a
+systemd-user unit (owned by the `vibecraft` user) listening on a local port,
+fronted by Caddy on a registered route. `tools list` shows them; `tools status`
+shows what one is actually running right now.
+
+**restart != deploy.** `tools restart` cycles the *existing* process from the
+*same* unit and the *same* build artifact. It does not rebuild, does not pick up
+changed source for compiled/bundled tools, and does not change environment. To
+apply a change, use `tools deploy`: it re-renders the unit, re-injects
+environment, restarts on the host, proves the process actually cycled
+(`old_pid` != `new_pid`), and waits for the port to listen. The response is the
+deterministic "now serving" signal — check `ok` / `status` / `listening_after`,
+not just that the command exited 0.
+
+**Applying a code change.** The task shell shares the machine's real filesystem
+(`/home/vibecraft` is the same path inside and outside it), so files you edit or
+build there are already in place. The loop is:
+
+    vibecraft task submit "cd ~/systems/my-tool && git pull && npm run build"
+    vibecraft tools deploy my-tool
+
+For an interpreted tool a deploy alone is enough; for a compiled/bundled tool,
+build first (as above) so deploy runs the new artifact. `tools status` reports
+the working copy's git commit + dirty flag so you can tell whether the running
+build is current.
+
+**Why a backgrounded server doesn't count.** The task shell has its own network
+namespace. A server you start with `node server.js &` (or inside an xterm) binds
+to the *sandbox's* loopback, which Caddy on the host cannot reach — it looks live
+to you and returns 502 to the customer. A hosted tool only serves when it runs as
+a host systemd-user unit, which is exactly what deploy produces. Don't background
+long-running servers from the shell; deploy them.
+
+**Environment & the vault.** A tool's environment lives as `Environment=` lines
+in its systemd unit. `tools env <name>` lists the KEYS (values are never returned
+over the network). Set or change a value with `tools deploy <name> --env
+KEY=VALUE`; the value may reference a vault secret as `$SECRET_NAME`, which the
+daemon resolves on the machine, so plaintext never touches your shell history.
+Store the secret first with `vault set`. On Managed machines the AI-credit proxy
+variables (`VIBECRAFT_AI_PROXY_URL`, `VIBECRAFT_AI_CREDITS_TOKEN`) are injected
+automatically and shown as VibeCraft-managed in `tools env`.
+
+**Creating a new tool** (choosing the command it runs) is the manager's job —
+ask it in chat. `tools deploy` operates on tools that already exist.
 
 ### Meta
 

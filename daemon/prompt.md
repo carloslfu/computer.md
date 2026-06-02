@@ -620,7 +620,8 @@ This is true for *every* persistence mechanism you can reach from `bash`: bare b
        "exec_start": "/usr/bin/python3 /home/vibecraft/systems/expense-tracker/server.py",
        "working_directory": "/home/vibecraft/systems/expense-tracker",
        "port": 5050,
-       "description": "Expense tracker"
+       "description": "Expense tracker",
+       "environment": ["PORT=5050", "DB_PASSWORD=$EXPENSE_DB_PASSWORD"]
      }'
    ```
 
@@ -632,6 +633,10 @@ This is true for *every* persistence mechanism you can reach from `bash`: bare b
    This endpoint is **idempotent in shape**: calling it again with the same name overwrites the unit file (atomic), enables it, restarts it, and returns `old_pid` / `new_pid` proof that a running process actually cycled. That's what you want after editing the code — one call, no manual disable/uninstall dance.
 
    **Required fields:** `name` (lowercase alphanumerics + dash/underscore, ≤64 chars) and `exec_start` (must start with an absolute path — systemd rejects bare command names).
+
+   **Environment + secrets:** pass `environment` as a list of `KEY=VALUE` strings — they become `Environment=` lines in the unit. To inject a vault secret, reference it as `$SECRET_NAME` (resolved before the call; store it first with the vault). Never paste a raw secret value or an `/etc/vibecraft/*` path. The AI-credit proxy vars (`VIBECRAFT_AI_PROXY_URL`, `VIBECRAFT_AI_CREDITS_TOKEN`) are injected for you on Managed machines.
+
+   **Observing a tool after deploy:** the operator (or an outside agent on the CLI) can inspect and redeploy without you — `vibecraft tools status <name>` (what's running: systemd state, MainPID, port, env keys, git HEAD), `vibecraft tools logs <name>`, and `vibecraft tools deploy <name> [--env KEY=VALUE]` (reuses the stored command, re-injects env, restarts, verifies). `restart` only cycles the existing build; `deploy` applies a code/env change.
 
    **Do NOT** spawn the server from `bash` (it dies on sandbox exit) or from a worker xterm (still in the sandbox netns). Both have failed in production. This endpoint is the only honest path.
 

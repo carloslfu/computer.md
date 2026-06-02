@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/carloslfu/computer.md/daemon/audit"
+	"github.com/carloslfu/computer.md/daemon/vault"
 )
 
 // app_service.go is the daemon-side primitive for "make this command
@@ -171,8 +172,9 @@ var (
 
 // systemdUserDir is the per-user systemd unit directory. The
 // vibecraft user's units land here; `systemctl --user daemon-reload`
-// picks them up.
-const systemdUserDir = "/home/vibecraft/.config/systemd/user"
+// picks them up. A var (not const) only so tests can redirect it at a
+// temp dir — production never reassigns it.
+var systemdUserDir = "/home/vibecraft/.config/systemd/user"
 
 // vibecraftUser is the local user that owns hosted apps. Hardcoded
 // because the daemon's whole model is "one customer per machine, one
@@ -774,4 +776,420 @@ func indexByte(s string, b byte) int {
 		}
 	}
 	return -1
+}
+
+// ---------------------------------------------------------------------------
+// Operator-/CLI-facing hosted-tool lifecycle: deploy, status, logs, env.
+//
+// These live on /api/hosted-apps/<name>/<action> (withCookieOrBearer) — the
+// same auth surface as restart. They are the deterministic "update a deployed
+// tool" loop an outside agent needs: status -> (edit + rebuild in the task
+// shell, which shares the host filesystem) -> deploy -> verify "now serving".
+//
+// Security boundary: every action requires an EXISTING route (404 otherwise)
+// and deploy REUSES the unit's stored ExecStart — the CLI cannot set an
+// arbitrary command, so this adds no RCE surface beyond restart. Creating a
+// new tool and setting ExecStart stays manager-only via install-app-service
+// (localhost). See the plan: plans/seamless-tool-deploy.md.
+// ---------------------------------------------------------------------------
+
+// portStatusProbe is the short dial budget for the read-only `status` port
+// check. Unlike deploy (which waits portListenTimeout for a cold start), a
+// status read just wants the current truth, so it probes briefly.
+const portStatusProbe = 1500 * time.Millisecond
+
+// parsedUnit is what we recover from an already-written unit file so a
+// redeploy can reuse the stored shape without the caller re-sending it.
+type parsedUnit struct {
+	ExecStart        string
+	WorkingDirectory string
+	Description      string
+	Environment      []string // verbatim KEY=VALUE lines
+}
+
+// parseUnitFile reads the fields renderUnitFile wrote. Tolerant by design:
+// it ignores comments, blank lines, and section headers, and only extracts
+// the four directives we round-trip.
+func parseUnitFile(path string) (parsedUnit, error) {
+	var pu parsedUnit
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return pu, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case t == "" || strings.HasPrefix(t, "#"):
+			continue
+		case strings.HasPrefix(t, "Description="):
+			pu.Description = strings.TrimPrefix(t, "Description=")
+		case strings.HasPrefix(t, "WorkingDirectory="):
+			pu.WorkingDirectory = strings.TrimPrefix(t, "WorkingDirectory=")
+		case strings.HasPrefix(t, "ExecStart="):
+			pu.ExecStart = strings.TrimPrefix(t, "ExecStart=")
+		case strings.HasPrefix(t, "Environment="):
+			pu.Environment = append(pu.Environment, strings.TrimPrefix(t, "Environment="))
+		}
+	}
+	return pu, nil
+}
+
+// envKeys returns the KEY half of each KEY=VALUE line. Used everywhere we
+// expose environment to the operator — values are NEVER returned over the
+// network (a unit file holds already-resolved secret values).
+func envKeys(env []string) []string {
+	keys := make([]string, 0, len(env))
+	for _, kv := range env {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		if i := indexByte(kv, '='); i > 0 {
+			keys = append(keys, kv[:i])
+		}
+	}
+	return keys
+}
+
+// stripReservedInjectedEnv drops VibeCraft-managed env entries (the AI proxy
+// vars, etc.) from a unit's stored environment before a redeploy. They are
+// re-injected fresh by doInstallAppService — keeping a stale copy would (a)
+// fail validateAppServiceEnvironment and (b) pin a possibly-rotated token.
+func stripReservedInjectedEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		i := indexByte(kv, '=')
+		if i <= 0 {
+			continue
+		}
+		if appServiceReservedEnvName(kv[:i]) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// mergeEnv overlays `override` onto `base` by KEY, preserving base order and
+// appending override-only keys after. Provided values win.
+func mergeEnv(base, override []string) []string {
+	ov := map[string]string{}
+	for _, kv := range override {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		if i := indexByte(kv, '='); i > 0 {
+			ov[kv[:i]] = kv
+		}
+	}
+	seen := map[string]bool{}
+	result := make([]string, 0, len(base)+len(override))
+	for _, kv := range base {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		i := indexByte(kv, '=')
+		if i <= 0 {
+			continue
+		}
+		k := kv[:i]
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		if repl, ok := ov[k]; ok {
+			result = append(result, repl)
+		} else {
+			result = append(result, kv)
+		}
+	}
+	for _, kv := range override {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		i := indexByte(kv, '=')
+		if i <= 0 {
+			continue
+		}
+		k := kv[:i]
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		result = append(result, kv)
+	}
+	return result
+}
+
+// systemdUserShow returns the requested unit properties as a map. Best-effort:
+// an error (no such unit, no user bus) yields an empty map, not a failure —
+// callers treat absent keys as "unknown."
+func systemdUserShow(ctx context.Context, uid, runtimeDir, unit string, props ...string) map[string]string {
+	args := []string{"--user", "show", unit}
+	for _, p := range props {
+		args = append(args, "--property="+p)
+	}
+	out, err := runAsVibecraftUserFn(ctx, uid, runtimeDir, "systemctl", args...)
+	m := map[string]string{}
+	if err != nil {
+		return m
+	}
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+// appServiceDeployResult is returned by POST /api/hosted-apps/<name>/deploy.
+// Same proof-oriented shape as restart, plus the unit path.
+type appServiceDeployResult struct {
+	OK             bool   `json:"ok"`
+	Name           string `json:"name"`
+	Unit           string `json:"unit"`
+	Status         string `json:"status"`
+	OldPID         int    `json:"old_pid"`
+	NewPID         int    `json:"new_pid"`
+	Port           int    `json:"port,omitempty"`
+	ListeningAfter bool   `json:"listening_after"`
+	UnitPath       string `json:"unit_path,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+}
+
+// deployHostedAppService redeploys an EXISTING hosted tool: it reuses the
+// unit's stored ExecStart/WorkingDirectory/Description, optionally updates the
+// environment (provided KEY=VALUE pairs win; $SECRET refs resolve from the
+// vault) and the port, then re-runs the full install path (re-render unit,
+// daemon-reload, restart, prove the MainPID cycled, wait for the host port).
+// This is the deterministic "apply my change" verb the CLI exposes.
+func (s *Server) deployHostedAppService(ctx context.Context, name string, env []string, portOverride *int) (appServiceDeployResult, int) {
+	result := appServiceDeployResult{Name: name, Unit: name + ".service", Status: "failed"}
+	if !systemNamePattern.MatchString(name) {
+		result.Detail = "invalid tool name"
+		return result, http.StatusBadRequest
+	}
+	route, err := s.db.GetRoute(name)
+	if err != nil {
+		result.Detail = "hosted tool route not found — create it via the manager first"
+		return result, http.StatusNotFound
+	}
+
+	unitPath := filepath.Join(systemdUserDir, name+".service")
+	pu, err := parseUnitFile(unitPath)
+	if err != nil {
+		result.Detail = fmt.Sprintf("reading unit file %s: %v — redeploy needs an existing unit; create the tool via the manager first", unitPath, err)
+		return result, http.StatusConflict
+	}
+	if strings.TrimSpace(pu.ExecStart) == "" {
+		result.Detail = "unit has no ExecStart — cannot redeploy; recreate the tool via the manager"
+		return result, http.StatusConflict
+	}
+
+	// Validate caller-provided env (reserved keys/paths) before resolution so
+	// a clean 400 explains the rejection instead of a downstream systemd error.
+	if err := validateAppServiceEnvironment(env); err != nil {
+		result.Detail = err.Error()
+		return result, http.StatusBadRequest
+	}
+
+	// Merge stored env (minus VibeCraft-injected) with provided overrides,
+	// then resolve $SECRET references against the machine vault.
+	merged := mergeEnv(stripReservedInjectedEnv(pu.Environment), env)
+	resolver := vault.NewResolver(s.vaultStore)
+	resolved := make([]string, 0, len(merged))
+	for _, kv := range merged {
+		resolved = append(resolved, resolver.ResolveEnvLine(kv))
+	}
+
+	port := route.Port
+	if portOverride != nil {
+		port = *portOverride
+	}
+
+	req := installAppServiceRequest{
+		Name:             name,
+		ExecStart:        pu.ExecStart,
+		WorkingDirectory: pu.WorkingDirectory,
+		Description:      pu.Description,
+		Port:             port,
+		Environment:      resolved,
+	}
+	installResult, err := s.doInstallAppService(ctx, req)
+	if err != nil {
+		result.Detail = err.Error()
+		return result, http.StatusInternalServerError
+	}
+	result.Status = installResult.Status
+	result.OldPID = installResult.OldPID
+	result.NewPID = installResult.NewPID
+	result.Port = port
+	result.ListeningAfter = installResult.ListeningAfter
+	result.UnitPath = installResult.UnitPath
+	result.Detail = installResult.Detail
+	result.OK = installResult.Status == "running" || (port == 0 && installResult.Status == "started")
+	return result, http.StatusOK
+}
+
+// hostedAppStatusResult is what the operator sees for "what is actually
+// running": the route, the unit's stored shape, env KEYS (never values),
+// live systemd state + MainPID, whether the host port is listening, and the
+// working copy's git HEAD (so "is the running build current?" is answerable).
+type hostedAppStatusResult struct {
+	Name             string   `json:"name"`
+	Unit             string   `json:"unit"`
+	Port             int      `json:"port"`
+	URL              string   `json:"url,omitempty"`
+	SSOEnabled       bool     `json:"sso_enabled"`
+	CreatedAt        string   `json:"created_at,omitempty"`
+	UnitPresent      bool     `json:"unit_present"`
+	ExecStart        string   `json:"exec_start,omitempty"`
+	WorkingDirectory string   `json:"working_directory,omitempty"`
+	Description      string   `json:"description,omitempty"`
+	EnvKeys          []string `json:"env_keys"`
+	ActiveState      string   `json:"active_state,omitempty"`
+	SubState         string   `json:"sub_state,omitempty"`
+	MainPID          int      `json:"main_pid"`
+	Listening        bool     `json:"listening"`
+	Since            string   `json:"since,omitempty"`
+	GitCommit        string   `json:"git_commit,omitempty"`
+	GitDirty         bool     `json:"git_dirty,omitempty"`
+	Detail           string   `json:"detail,omitempty"`
+}
+
+func (s *Server) hostedAppStatus(ctx context.Context, name string) (hostedAppStatusResult, int) {
+	res := hostedAppStatusResult{Name: name, Unit: name + ".service", EnvKeys: []string{}}
+	if !systemNamePattern.MatchString(name) {
+		res.Detail = "invalid tool name"
+		return res, http.StatusBadRequest
+	}
+	route, err := s.db.GetRoute(name)
+	if err != nil {
+		res.Detail = "hosted tool route not found"
+		return res, http.StatusNotFound
+	}
+	res.Port = route.Port
+	res.SSOEnabled = route.SSOEnabled
+	res.CreatedAt = route.CreatedAt
+	if s.routeMgr != nil {
+		res.URL = s.routeMgr.URL(name)
+	}
+
+	unitPath := filepath.Join(systemdUserDir, name+".service")
+	if pu, err := parseUnitFile(unitPath); err == nil {
+		res.UnitPresent = true
+		res.ExecStart = pu.ExecStart
+		res.WorkingDirectory = pu.WorkingDirectory
+		res.Description = pu.Description
+		res.EnvKeys = envKeys(pu.Environment)
+	}
+
+	if uid, runtimeDir, err := vibecraftRuntimeContextFn(); err == nil {
+		props := systemdUserShow(ctx, uid, runtimeDir, res.Unit,
+			"MainPID", "ActiveState", "SubState", "ExecMainStartTimestamp")
+		res.MainPID, _ = strconv.Atoi(strings.TrimSpace(props["MainPID"]))
+		res.ActiveState = props["ActiveState"]
+		res.SubState = props["SubState"]
+		res.Since = props["ExecMainStartTimestamp"]
+		// Working-copy git state (best-effort; absent for non-git dirs).
+		if res.WorkingDirectory != "" {
+			if out, err := runAsVibecraftUserFn(ctx, uid, runtimeDir, "git", "-C", res.WorkingDirectory, "rev-parse", "--short", "HEAD"); err == nil {
+				res.GitCommit = strings.TrimSpace(out)
+				if st, err := runAsVibecraftUserFn(ctx, uid, runtimeDir, "git", "-C", res.WorkingDirectory, "status", "--porcelain"); err == nil {
+					res.GitDirty = strings.TrimSpace(st) != ""
+				}
+			}
+		}
+	} else {
+		res.Detail = err.Error()
+	}
+
+	res.Listening = waitForLocalPortFn(ctx, route.Port, portStatusProbe)
+	return res, http.StatusOK
+}
+
+// hostedAppLogsResult carries the tail of a tool's journal. Lines are the
+// raw journalctl output (short-iso), one entry per line.
+type hostedAppLogsResult struct {
+	Name   string   `json:"name"`
+	Unit   string   `json:"unit"`
+	Lines  []string `json:"lines"`
+	Detail string   `json:"detail,omitempty"`
+}
+
+func (s *Server) hostedAppLogs(ctx context.Context, name string, n int) (hostedAppLogsResult, int) {
+	res := hostedAppLogsResult{Name: name, Unit: name + ".service", Lines: []string{}}
+	if !systemNamePattern.MatchString(name) {
+		res.Detail = "invalid tool name"
+		return res, http.StatusBadRequest
+	}
+	if _, err := s.db.GetRoute(name); err != nil {
+		res.Detail = "hosted tool route not found"
+		return res, http.StatusNotFound
+	}
+	if n <= 0 {
+		n = 100
+	}
+	if n > 1000 {
+		n = 1000
+	}
+	uid, runtimeDir, err := vibecraftRuntimeContextFn()
+	if err != nil {
+		res.Detail = err.Error()
+		return res, http.StatusOK
+	}
+	out, err := runAsVibecraftUserFn(ctx, uid, runtimeDir, "journalctl",
+		"--user", "-u", res.Unit, "-n", strconv.Itoa(n), "--no-pager", "-o", "short-iso")
+	if err != nil {
+		res.Detail = fmt.Sprintf("journalctl: %v\n%s", err, out)
+		return res, http.StatusOK
+	}
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		res.Lines = append(res.Lines, line)
+	}
+	return res, http.StatusOK
+}
+
+// hostedAppEnvKey is one environment variable the tool runs with. Value is
+// never included — a unit file holds already-resolved secret values.
+type hostedAppEnvKey struct {
+	Key      string `json:"key"`
+	Reserved bool   `json:"reserved"` // VibeCraft-managed (AI proxy, etc.)
+}
+
+type hostedAppEnvResult struct {
+	Name   string            `json:"name"`
+	Unit   string            `json:"unit"`
+	Keys   []hostedAppEnvKey `json:"keys"`
+	Detail string            `json:"detail,omitempty"`
+}
+
+func (s *Server) hostedAppEnv(name string) (hostedAppEnvResult, int) {
+	res := hostedAppEnvResult{Name: name, Unit: name + ".service", Keys: []hostedAppEnvKey{}}
+	if !systemNamePattern.MatchString(name) {
+		res.Detail = "invalid tool name"
+		return res, http.StatusBadRequest
+	}
+	if _, err := s.db.GetRoute(name); err != nil {
+		res.Detail = "hosted tool route not found"
+		return res, http.StatusNotFound
+	}
+	unitPath := filepath.Join(systemdUserDir, name+".service")
+	pu, err := parseUnitFile(unitPath)
+	if err != nil {
+		res.Detail = fmt.Sprintf("reading unit file %s: %v", unitPath, err)
+		return res, http.StatusOK
+	}
+	for _, k := range envKeys(pu.Environment) {
+		res.Keys = append(res.Keys, hostedAppEnvKey{Key: k, Reserved: appServiceReservedEnvName(k)})
+	}
+	return res, http.StatusOK
 }

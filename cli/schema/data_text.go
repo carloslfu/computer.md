@@ -336,7 +336,7 @@ func (r RuleDeleteData) TextFormat() string {
 // TextFormat renders AppsListData.
 func (a AppsListData) TextFormat() string {
 	if len(a.Apps) == 0 {
-		return "No deployed apps."
+		return "No deployed tools."
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%-24s  %-6s  %-7s  %s\n", "NAME", "PORT", "SSO", "URL")
@@ -354,13 +354,13 @@ func (a AppsListData) TextFormat() string {
 
 // TextFormat renders AppActionData.
 func (a AppActionData) TextFormat() string {
-	return fmt.Sprintf("App %q: %s", a.Name, a.Status)
+	return fmt.Sprintf("Tool %q: %s", a.Name, a.Status)
 }
 
 // TextFormat renders AppRestartData.
 func (a AppRestartData) TextFormat() string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "App %q: %s\n", a.Name, a.Status)
+	fmt.Fprintf(&sb, "Tool %q: %s\n", a.Name, a.Status)
 	if a.Unit != "" {
 		fmt.Fprintf(&sb, "  Unit:      %s\n", a.Unit)
 	}
@@ -372,6 +372,109 @@ func (a AppRestartData) TextFormat() string {
 	}
 	if a.Detail != "" {
 		fmt.Fprintf(&sb, "  Detail:    %s\n", a.Detail)
+	}
+	// Honesty footer: restart re-runs the existing build. A code/env change
+	// needs deploy — say so here so a successful-looking restart isn't read
+	// as "my change is live."
+	fmt.Fprintf(&sb, "  Note:      re-ran the existing build; run 'vibecraft tools deploy %s' to apply a code/env change.", a.Name)
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// TextFormat renders ToolDeployData — the deterministic "now serving" line.
+func (d ToolDeployData) TextFormat() string {
+	var sb strings.Builder
+	verdict := "deploy failed"
+	if d.OK {
+		verdict = "deployed"
+	}
+	fmt.Fprintf(&sb, "Tool %q: %s (%s)\n", d.Name, verdict, d.Status)
+	if d.Unit != "" {
+		fmt.Fprintf(&sb, "  Unit:      %s\n", d.Unit)
+	}
+	fmt.Fprintf(&sb, "  Old PID:   %d\n", d.OldPID)
+	fmt.Fprintf(&sb, "  New PID:   %d\n", d.NewPID)
+	if d.Port != 0 {
+		fmt.Fprintf(&sb, "  Port:      %d\n", d.Port)
+		fmt.Fprintf(&sb, "  Listening: %v\n", d.ListeningAfter)
+	}
+	if d.Detail != "" {
+		fmt.Fprintf(&sb, "  Detail:    %s\n", d.Detail)
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// TextFormat renders ToolStatusData.
+func (s ToolStatusData) TextFormat() string {
+	var sb strings.Builder
+	state := s.ActiveState
+	if s.SubState != "" {
+		state += "/" + s.SubState
+	}
+	if state == "" {
+		state = "unknown"
+	}
+	fmt.Fprintf(&sb, "Tool %q: %s\n", s.Name, state)
+	if s.URL != "" {
+		fmt.Fprintf(&sb, "  URL:        %s\n", s.URL)
+	}
+	fmt.Fprintf(&sb, "  Port:       %d (listening=%v)\n", s.Port, s.Listening)
+	fmt.Fprintf(&sb, "  Main PID:   %d\n", s.MainPID)
+	if s.Since != "" {
+		fmt.Fprintf(&sb, "  Since:      %s\n", s.Since)
+	}
+	if s.ExecStart != "" {
+		fmt.Fprintf(&sb, "  ExecStart:  %s\n", s.ExecStart)
+	}
+	if s.WorkingDirectory != "" {
+		fmt.Fprintf(&sb, "  WorkingDir: %s\n", s.WorkingDirectory)
+	}
+	if s.GitCommit != "" {
+		dirty := ""
+		if s.GitDirty {
+			dirty = " (working copy dirty)"
+		}
+		fmt.Fprintf(&sb, "  Git:        %s%s\n", s.GitCommit, dirty)
+	}
+	if len(s.EnvKeys) > 0 {
+		fmt.Fprintf(&sb, "  Env keys:   %s\n", strings.Join(s.EnvKeys, ", "))
+	}
+	fmt.Fprintf(&sb, "  SSO:        %v\n", s.SSOEnabled)
+	if !s.UnitPresent {
+		sb.WriteString("  (no systemd unit on disk — never deployed, or removed)\n")
+	}
+	if s.Detail != "" {
+		fmt.Fprintf(&sb, "  Detail:     %s\n", s.Detail)
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// TextFormat renders ToolLogsData — raw journal lines, newline-joined.
+func (l ToolLogsData) TextFormat() string {
+	if len(l.Lines) == 0 {
+		if l.Detail != "" {
+			return l.Detail
+		}
+		return fmt.Sprintf("No logs for %q.", l.Name)
+	}
+	return strings.Join(l.Lines, "\n")
+}
+
+// TextFormat renders ToolEnvData — keys only, reserved ones marked.
+func (e ToolEnvData) TextFormat() string {
+	if len(e.Keys) == 0 {
+		if e.Detail != "" {
+			return e.Detail
+		}
+		return fmt.Sprintf("Tool %q has no environment variables.", e.Name)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Environment for %q (keys only — values are never shown):\n", e.Name)
+	for _, k := range e.Keys {
+		marker := ""
+		if k.Reserved {
+			marker = "  (VibeCraft-managed)"
+		}
+		fmt.Fprintf(&sb, "  %s%s\n", k.Key, marker)
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }

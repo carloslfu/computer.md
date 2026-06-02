@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 )
 
 // Client methods for the daemon surfaces that close the dashboard-parity
@@ -206,6 +207,132 @@ func (c *Client) RestartHostedApp(name string) (*HostedAppRestartResult, error) 
 		return nil, err
 	}
 	var resp HostedAppRestartResult
+	if err := c.do(req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// HostedAppDeployResult is returned when the daemon redeploys a tool —
+// same proof-oriented shape as restart, plus the written unit path.
+type HostedAppDeployResult struct {
+	OK             bool   `json:"ok"`
+	Name           string `json:"name"`
+	Unit           string `json:"unit"`
+	Status         string `json:"status"`
+	OldPID         int    `json:"old_pid"`
+	NewPID         int    `json:"new_pid"`
+	Port           int    `json:"port,omitempty"`
+	ListeningAfter bool   `json:"listening_after"`
+	UnitPath       string `json:"unit_path,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+}
+
+// DeployHostedApp redeploys an existing tool: the daemon reuses the unit's
+// stored command, applies any env overrides (values may carry $SECRET refs,
+// resolved on the machine), restarts on the host, and verifies the port.
+// port is optional (nil = reuse the registered port).
+func (c *Client) DeployHostedApp(name string, env []string, port *int) (*HostedAppDeployResult, error) {
+	body := map[string]any{}
+	if len(env) > 0 {
+		body["environment"] = env
+	}
+	if port != nil {
+		body["port"] = *port
+	}
+	req, err := c.newRequest("POST", "/hosted-apps/"+url.PathEscape(name)+"/deploy", body)
+	if err != nil {
+		return nil, err
+	}
+	var resp HostedAppDeployResult
+	if err := c.do(req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// HostedAppStatus is the running truth for a deployed tool.
+type HostedAppStatus struct {
+	Name             string   `json:"name"`
+	Unit             string   `json:"unit"`
+	Port             int      `json:"port"`
+	URL              string   `json:"url,omitempty"`
+	SSOEnabled       bool     `json:"sso_enabled"`
+	CreatedAt        string   `json:"created_at,omitempty"`
+	UnitPresent      bool     `json:"unit_present"`
+	ExecStart        string   `json:"exec_start,omitempty"`
+	WorkingDirectory string   `json:"working_directory,omitempty"`
+	Description      string   `json:"description,omitempty"`
+	EnvKeys          []string `json:"env_keys"`
+	ActiveState      string   `json:"active_state,omitempty"`
+	SubState         string   `json:"sub_state,omitempty"`
+	MainPID          int      `json:"main_pid"`
+	Listening        bool     `json:"listening"`
+	Since            string   `json:"since,omitempty"`
+	GitCommit        string   `json:"git_commit,omitempty"`
+	GitDirty         bool     `json:"git_dirty,omitempty"`
+	Detail           string   `json:"detail,omitempty"`
+}
+
+// GetHostedAppStatus reads what a deployed tool is actually running.
+func (c *Client) GetHostedAppStatus(name string) (*HostedAppStatus, error) {
+	req, err := c.newRequest("GET", "/hosted-apps/"+url.PathEscape(name)+"/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp HostedAppStatus
+	if err := c.do(req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// HostedAppLogs is the tail of a tool's journal.
+type HostedAppLogs struct {
+	Name   string   `json:"name"`
+	Unit   string   `json:"unit"`
+	Lines  []string `json:"lines"`
+	Detail string   `json:"detail,omitempty"`
+}
+
+// GetHostedAppLogs tails a deployed tool's logs (journalctl).
+func (c *Client) GetHostedAppLogs(name string, lines int) (*HostedAppLogs, error) {
+	path := "/hosted-apps/" + url.PathEscape(name) + "/logs"
+	if lines > 0 {
+		path += "?lines=" + strconv.Itoa(lines)
+	}
+	req, err := c.newRequest("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp HostedAppLogs
+	if err := c.do(req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// HostedAppEnvKey is one env var key a tool runs with (never the value).
+type HostedAppEnvKey struct {
+	Key      string `json:"key"`
+	Reserved bool   `json:"reserved"`
+}
+
+// HostedAppEnv lists a deployed tool's environment variable keys.
+type HostedAppEnv struct {
+	Name   string            `json:"name"`
+	Unit   string            `json:"unit"`
+	Keys   []HostedAppEnvKey `json:"keys"`
+	Detail string            `json:"detail,omitempty"`
+}
+
+// GetHostedAppEnv lists the environment variable keys a tool runs with.
+func (c *Client) GetHostedAppEnv(name string) (*HostedAppEnv, error) {
+	req, err := c.newRequest("GET", "/hosted-apps/"+url.PathEscape(name)+"/env", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp HostedAppEnv
 	if err := c.do(req, &resp); err != nil {
 		return nil, err
 	}

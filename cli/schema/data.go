@@ -315,7 +315,7 @@ type AppActionData struct {
 	Status string `json:"status"`
 }
 
-// AppRestartData is emitted by `vibecraft apps restart`.
+// AppRestartData is emitted by `vibecraft tools restart`.
 type AppRestartData struct {
 	OK             bool   `json:"ok"`
 	Name           string `json:"name"`
@@ -326,6 +326,67 @@ type AppRestartData struct {
 	Port           int    `json:"port,omitempty"`
 	ListeningAfter bool   `json:"listening_after"`
 	Detail         string `json:"detail,omitempty"`
+}
+
+// ToolDeployData is emitted by `vibecraft tools deploy <name>`. Proof-
+// oriented like restart, plus the written unit path.
+type ToolDeployData struct {
+	OK             bool   `json:"ok"`
+	Name           string `json:"name"`
+	Unit           string `json:"unit"`
+	Status         string `json:"status"`
+	OldPID         int    `json:"old_pid"`
+	NewPID         int    `json:"new_pid"`
+	Port           int    `json:"port,omitempty"`
+	ListeningAfter bool   `json:"listening_after"`
+	UnitPath       string `json:"unit_path,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+}
+
+// ToolStatusData is emitted by `vibecraft tools status <name>` — what the
+// tool is actually running right now.
+type ToolStatusData struct {
+	Name             string   `json:"name"`
+	Unit             string   `json:"unit"`
+	Port             int      `json:"port"`
+	URL              string   `json:"url,omitempty"`
+	SSOEnabled       bool     `json:"sso_enabled"`
+	CreatedAt        string   `json:"created_at,omitempty"`
+	UnitPresent      bool     `json:"unit_present"`
+	ExecStart        string   `json:"exec_start,omitempty"`
+	WorkingDirectory string   `json:"working_directory,omitempty"`
+	Description      string   `json:"description,omitempty"`
+	EnvKeys          []string `json:"env_keys"`
+	ActiveState      string   `json:"active_state,omitempty"`
+	SubState         string   `json:"sub_state,omitempty"`
+	MainPID          int      `json:"main_pid"`
+	Listening        bool     `json:"listening"`
+	Since            string   `json:"since,omitempty"`
+	GitCommit        string   `json:"git_commit,omitempty"`
+	GitDirty         bool     `json:"git_dirty,omitempty"`
+	Detail           string   `json:"detail,omitempty"`
+}
+
+// ToolLogsData is emitted by `vibecraft tools logs <name>`.
+type ToolLogsData struct {
+	Name   string   `json:"name"`
+	Unit   string   `json:"unit"`
+	Lines  []string `json:"lines"`
+	Detail string   `json:"detail,omitempty"`
+}
+
+// ToolEnvKeyData is one environment variable key (never the value).
+type ToolEnvKeyData struct {
+	Key      string `json:"key"`
+	Reserved bool   `json:"reserved"`
+}
+
+// ToolEnvData is emitted by `vibecraft tools env <name>`.
+type ToolEnvData struct {
+	Name   string           `json:"name"`
+	Unit   string           `json:"unit"`
+	Keys   []ToolEnvKeyData `json:"keys"`
+	Detail string           `json:"detail,omitempty"`
 }
 
 // ComputerMDData is emitted by `vibecraft computer-md`.

@@ -1198,20 +1198,72 @@ func (s *Server) handleHostedAppByName(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "route name is required", http.StatusBadRequest)
 		return
 	}
-	if restartName, action, ok := parseAppActionPath(r.URL.Path, "/api/hosted-apps/"); ok {
-		if action != "restart" || r.Method != http.MethodPost {
+	if actionName, action, ok := parseAppActionPath(r.URL.Path, "/api/hosted-apps/"); ok {
+		switch action {
+		case "restart":
+			if r.Method != http.MethodPost {
+				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			result, code := s.restartHostedAppService(r.Context(), actionName)
+			s.auditLog.Log(audit.Entry{
+				Action:   "hosted_app_restart",
+				Category: "systems",
+				Details: fmt.Sprintf("name=%s status=%s old_pid=%d new_pid=%d port=%d listening=%v actor=operator",
+					result.Name, result.Status, result.OldPID, result.NewPID, result.Port, result.ListeningAfter),
+				RiskLevel: "low",
+			})
+			jsonResponse(w, code, result)
+		case "deploy":
+			if r.Method != http.MethodPost {
+				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			var req struct {
+				Environment []string `json:"environment"`
+				Port        *int     `json:"port"`
+			}
+			// Body is optional: a bare deploy redeploys the current code.
+			if r.ContentLength != 0 {
+				if err := readJSON(r, &req); err != nil {
+					jsonError(w, "invalid request body", http.StatusBadRequest)
+					return
+				}
+			}
+			result, code := s.deployHostedAppService(r.Context(), actionName, req.Environment, req.Port)
+			s.auditLog.Log(audit.Entry{
+				Action:   "hosted_app_deploy",
+				Category: "systems",
+				Details: fmt.Sprintf("name=%s status=%s old_pid=%d new_pid=%d port=%d listening=%v env_overrides=%d actor=operator",
+					result.Name, result.Status, result.OldPID, result.NewPID, result.Port, result.ListeningAfter, len(req.Environment)),
+				RiskLevel: "medium",
+			})
+			jsonResponse(w, code, result)
+		case "status":
+			if r.Method != http.MethodGet {
+				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			result, code := s.hostedAppStatus(r.Context(), actionName)
+			jsonResponse(w, code, result)
+		case "logs":
+			if r.Method != http.MethodGet {
+				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			n, _ := strconv.Atoi(r.URL.Query().Get("lines"))
+			result, code := s.hostedAppLogs(r.Context(), actionName, n)
+			jsonResponse(w, code, result)
+		case "env":
+			if r.Method != http.MethodGet {
+				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			result, code := s.hostedAppEnv(actionName)
+			jsonResponse(w, code, result)
+		default:
 			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
 		}
-		result, code := s.restartHostedAppService(r.Context(), restartName)
-		s.auditLog.Log(audit.Entry{
-			Action:   "hosted_app_restart",
-			Category: "systems",
-			Details: fmt.Sprintf("name=%s status=%s old_pid=%d new_pid=%d port=%d listening=%v actor=operator",
-				result.Name, result.Status, result.OldPID, result.NewPID, result.Port, result.ListeningAfter),
-			RiskLevel: "low",
-		})
-		jsonResponse(w, code, result)
 		return
 	}
 	if strings.Contains(name, "/") {
