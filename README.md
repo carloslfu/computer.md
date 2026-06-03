@@ -138,22 +138,6 @@ vulnerability; the Go and web (npm) dependency trees are also watched
 by GitHub Dependabot and Socket supply-chain scanning (malware,
 typosquats, suspicious install scripts).
 
-## Stewardship
-
-`computer.md` is created by **Carlos Galarza** ([carloslfu](https://github.com/carloslfu))
-and stewarded by **VibeCraft**, the commercial product at
-[vibecraft.so](https://www.vibecraft.so) and the company behind the
-standard. computer.md is VibeCraft's open-source bet: the substrate is
-open and anyone can run it; the hosted product is the business. The
-standard's name is broader than any one implementation. Think
-HashiCorp ↔ Terraform, Docker Inc. ↔ Dockerfile.
-
-When the project hits 1,000+ stars, an outside contributor wanting
-commit access, or 12 months from public launch — whichever fires
-first — the repo migrates from `carloslfu/computer.md` to
-`vibecraft-so/computer.md` via `gh repo transfer`. GitHub auto-redirects
-keep all old URLs working.
-
 ## Related
 
 - **db.md** — the open database in plain files, the natural storage
