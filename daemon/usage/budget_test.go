@@ -20,21 +20,22 @@ import (
 // the tests exercise exactly what runs in production: HTTP request +
 // Bearer auth + JSON parse + cache.
 type fakeBudget struct {
-	server  *httptest.Server
-	mu      sync.Mutex
-	budget  float64
-	start   string
-	end     string
-	status  int    // 0 or 200 → serve the budget; anything else → that status code
-	gotAuth string // the Authorization header the daemon actually sent
-	gotPath string // the request path the daemon actually hit
+	server   *httptest.Server
+	mu       sync.Mutex
+	budget   float64
+	start    string
+	end      string
+	status   int    // 0 or 200 → serve the budget; anything else → that status code
+	gotAuth  string // the Authorization header the daemon actually sent
+	gotPath  string // the request path the daemon actually hit
 	gotQuery string
-	calls   int
+	calls    int
 }
 
 func newFakeBudget(t *testing.T) *fakeBudget {
 	t.Helper()
-	fb := &fakeBudget{budget: 200, start: "2026-05-02", end: "2026-06-02", status: 200}
+	start, end := CurrentMonthBounds()
+	fb := &fakeBudget{budget: 200, start: start, end: end, status: 200}
 	fb.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fb.mu.Lock()
 		defer fb.mu.Unlock()
@@ -123,8 +124,8 @@ func TestBudget_RefreshFetchesAndParsesAllFields(t *testing.T) {
 	if !st.Enforced {
 		t.Errorf("a fetched positive budget must engage enforcement")
 	}
-	if st.ResetsOn != "2026-06-02" {
-		t.Errorf("period_end didn't parse: got %q want 2026-06-02", st.ResetsOn)
+	if st.ResetsOn != fb.end {
+		t.Errorf("period_end didn't parse: got %q want %q", st.ResetsOn, fb.end)
 	}
 }
 
@@ -476,14 +477,14 @@ func TestBudget_RefreshParsesNonAIConfig(t *testing.T) {
 	}
 	fb.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"ai_budget_usd":       100.0,
-			"period_start":        "2026-05-02",
-			"period_end":          "2026-06-02",
-			"period_source":       "subscription",
-			"plan_name":           "Business",
-			"backup_cadence":      "aws-dlm-hourly-daily-weekly-s3-continuous-30d",
-			"region":              "us-east-1",
-			"manager_key_mode":    "platform",
+			"ai_budget_usd":    100.0,
+			"period_start":     "2026-05-02",
+			"period_end":       "2026-06-02",
+			"period_source":    "subscription",
+			"plan_name":        "Business",
+			"backup_cadence":   "aws-dlm-hourly-daily-weekly-s3-continuous-30d",
+			"region":           "us-east-1",
+			"manager_key_mode": "platform",
 		})
 	}))
 	t.Cleanup(fb.server.Close)

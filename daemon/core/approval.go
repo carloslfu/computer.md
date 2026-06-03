@@ -8,8 +8,8 @@ import (
 	"regexp"
 	"strings"
 
-	managerclient "github.com/carloslfu/computer.md/daemon/manager"
 	"github.com/carloslfu/computer.md/daemon/guardrails"
+	managerclient "github.com/carloslfu/computer.md/daemon/manager"
 )
 
 // Severity tells the dashboard how to frame an approval card. "escalate"

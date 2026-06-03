@@ -80,7 +80,11 @@ func Cost(model string, u manager.Usage) float64 {
 // manager.Usage object isn't carried along.
 func CostFromCounts(p ModelPricing, input, output, cacheRead, cacheCreate int64) float64 {
 	const perMillion = 1_000_000.0
-	return float64(input)*p.InputPerMTok/perMillion +
+	uncachedInput := input - cacheRead - cacheCreate
+	if uncachedInput < 0 {
+		uncachedInput = 0
+	}
+	return float64(uncachedInput)*p.InputPerMTok/perMillion +
 		float64(output)*p.OutputPerMTok/perMillion +
 		float64(cacheRead)*p.CacheReadPerMTok/perMillion +
 		float64(cacheCreate)*p.CacheCreatePerMTok/perMillion

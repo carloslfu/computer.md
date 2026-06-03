@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/base64"
 	"io"
 	"os"
 	"path/filepath"
@@ -135,8 +136,8 @@ func runFilesCat(cmd *cobra.Command, args []string) error {
 	return output.Emit(map[string]any{
 		"path":     args[0],
 		"size":     buf.Len(),
-		"content":  buf.String(),
-		"encoding": "utf8",
+		"content":  base64.StdEncoding.EncodeToString(buf.Bytes()),
+		"encoding": "base64",
 	})
 }
 
@@ -185,6 +186,10 @@ func runFilesPull(cmd *cobra.Command, args []string) error {
 func runFilesPush(cmd *cobra.Command, args []string) error {
 	localArg := args[0]
 	remote := args[1]
+
+	if err := validateInboxPushRemote(localArg, remote); err != nil {
+		return err
+	}
 
 	c, err := newClient()
 	if err != nil {
@@ -256,4 +261,30 @@ func runFilesPush(cmd *cobra.Command, args []string) error {
 		Bytes:      size,
 		Original:   name,
 	})
+}
+
+func validateInboxPushRemote(localArg, remote string) error {
+	const inboxRoot = "/home/vibecraft/inbox"
+	normalized := filepath.ToSlash(filepath.Clean(remote))
+	if remote == "" || (normalized != inboxRoot && !strings.HasPrefix(normalized, inboxRoot+"/")) {
+		return schema.Newf(schema.CodeValidationError,
+			"files push currently uploads through the inbox; remote must be under %s/", inboxRoot).
+			WithHint("use /home/vibecraft/inbox/ or /home/vibecraft/inbox/<filename>")
+	}
+
+	// /api/upload stores files in the selected conversation namespace and
+	// derives the destination name from the multipart filename. For local
+	// file uploads the CLI cannot rename the file remotely; reject paths
+	// that imply a different target name so callers don't get a silent
+	// upload to a different location than requested.
+	if localArg != "-" && !strings.HasSuffix(remote, "/") {
+		localName := filepath.Base(localArg)
+		remoteName := filepath.Base(normalized)
+		if remoteName != "" && remoteName != "." && remoteName != localName {
+			return schema.Newf(schema.CodeValidationError,
+				"local file upload cannot rename %q to %q through the inbox upload endpoint", localName, remoteName).
+				WithHint("rename the local file first, upload to /home/vibecraft/inbox/, or pipe stdin with '-' to choose a filename")
+		}
+	}
+	return nil
 }

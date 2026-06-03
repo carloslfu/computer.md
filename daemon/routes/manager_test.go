@@ -104,10 +104,10 @@ func TestVerify(t *testing.T) {
 	}{
 		{"dashboard.vc-abc123.vc.vibecraft.so", true},
 		{"nonexistent.vc-abc123.vc.vibecraft.so", false},
-		{"vc-abc123.vc.vibecraft.so", false},                   // Base domain, not a route.
-		{"evil.dashboard.vc-abc123.vc.vibecraft.so", false},    // Nested subdomain.
-		{"dashboard.vc-wrong.vc.vibecraft.so", false},          // Wrong machine.
-		{"dashboard.totally-different.com", false},              // Wrong domain.
+		{"vc-abc123.vc.vibecraft.so", false},                // Base domain, not a route.
+		{"evil.dashboard.vc-abc123.vc.vibecraft.so", false}, // Nested subdomain.
+		{"dashboard.vc-wrong.vc.vibecraft.so", false},       // Wrong machine.
+		{"dashboard.totally-different.com", false},          // Wrong domain.
 		{"", false},
 	}
 
@@ -253,6 +253,37 @@ func TestBuildCaddyfile_WhoamiHelperShortCircuitsGate(t *testing.T) {
 		t.Errorf("/__auth/whoami handle must appear BEFORE forward_auth so it short-circuits "+
 			"and apps fetching whoami see real 401/200 instead of a sign-in redirect "+
 			"(whoami at %d, forward_auth at %d)", whoamiIdx, forwardAuthIdx)
+	}
+}
+
+func TestWriteCaddyfileAtomicDoesNotFollowPredictableTmpSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "Caddyfile")
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	predictableTmp := target + ".tmp"
+	if err := os.Symlink(victim, predictableTmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCaddyfileAtomic(target, "new config"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(victim); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "old" {
+		t.Fatalf("predictable tmp symlink target was modified: %q", got)
+	}
+	if got, err := os.ReadFile(target); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "new config" {
+		t.Fatalf("Caddyfile = %q", got)
+	}
+	if fi, err := os.Lstat(predictableTmp); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("predictable tmp symlink should have been ignored, mode=%s", fi.Mode())
 	}
 }
 

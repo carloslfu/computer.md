@@ -150,6 +150,13 @@ func (c *Client) SetAPIKey(apiKey string) {
 	c.apiKey = strings.TrimSpace(apiKey)
 }
 
+// Model returns the configured model for the main manager loop.
+func (c *Client) Model() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.model
+}
+
 // Message represents a conversation message for the manager API.
 type Message struct {
 	Role        string       `json:"role"`
@@ -248,9 +255,11 @@ type Usage struct {
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
 }
 
-// TotalInputTokens returns all input tokens that count against context.
+// TotalInputTokens returns the raw input-token count that counts against
+// context. OpenAI reports cached input inside InputTokens; do not add cached
+// buckets again or compaction will fire early.
 func (u Usage) TotalInputTokens() int {
-	return u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+	return u.InputTokens
 }
 
 type apiRequest struct {

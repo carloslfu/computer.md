@@ -114,6 +114,9 @@ func TestNameDerivation(t *testing.T) {
 	if VethHostName("x") == VethSandboxName("x") {
 		t.Fatal("host and sandbox veth names must differ")
 	}
+	if VethHostName("system-a-very-long-sandbox-alpha") == VethHostName("system-a-very-long-sandbox-bravo") {
+		t.Fatal("long sandbox ids must not collide after veth name shortening")
+	}
 }
 
 func TestRenderNftables_Enforce(t *testing.T) {
@@ -130,12 +133,14 @@ func TestRenderNftables_Enforce(t *testing.T) {
 		"ip daddr 10.0.0.0/8 accept",
 		"ip daddr 192.168.1.0/24 accept",
 		"ip daddr @allow_worker_23 accept",
-		"udp dport 53 accept",
 		"log prefix \"vc-egress-drop \" drop",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("enforce ruleset missing %q\n---\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "dport 53 accept") {
+		t.Fatalf("external DNS port 53 must not bypass the allowlist:\n%s", out)
 	}
 	if strings.Contains(out, "vc-egress-audit") {
 		t.Fatalf("enforce mode must not contain the audit-accept line\n%s", out)
@@ -251,6 +256,9 @@ func TestRenderForwardNftables(t *testing.T) {
 		if !strings.Contains(out, w) {
 			t.Fatalf("missing %q in:\n%s", w, out)
 		}
+	}
+	if strings.Contains(out, "dport 53 accept") {
+		t.Fatalf("external DNS port 53 must not bypass forward allowlist:\n%s", out)
 	}
 	// audit mode must not drop
 	a, _ := RenderForwardNftables("w1", "vchw1", "10.77.1.0/30", EgressPolicy{}, EgressAudit)

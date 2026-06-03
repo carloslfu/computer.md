@@ -124,8 +124,10 @@ func (e *Engine) AddRule(rule Rule) error {
 		return err
 	}
 
-	// Add to in-memory policies.
-	e.policies = append(e.policies, &CustomRulePolicy{rule: rule})
+	e.removeCustomRulePolicyLocked(rule.ID)
+	if rule.Enabled {
+		e.policies = append(e.policies, &CustomRulePolicy{rule: rule})
+	}
 	return nil
 }
 
@@ -139,7 +141,11 @@ func (e *Engine) RemoveRule(id string) error {
 		return err
 	}
 
-	// Remove from in-memory policies.
+	e.removeCustomRulePolicyLocked(id)
+	return nil
+}
+
+func (e *Engine) removeCustomRulePolicyLocked(id string) {
 	var filtered []Policy
 	for _, p := range e.policies {
 		if crp, ok := p.(*CustomRulePolicy); ok {
@@ -150,7 +156,6 @@ func (e *Engine) RemoveRule(id string) error {
 		filtered = append(filtered, p)
 	}
 	e.policies = filtered
-	return nil
 }
 
 // ListRules returns all custom rules from the database.

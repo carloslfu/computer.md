@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,7 +96,19 @@ func selfUpdate(baseURL string, check bool) (schema.UpdateData, error) {
 			WithHint("the release may still be building — try again in a minute")
 	}
 
-	if manifest.Version == cliVersion {
+	if cmp, ok := compareReleaseVersions(manifest.Version, cliVersion); ok {
+		switch {
+		case cmp < 0:
+			return schema.UpdateData{}, schema.Newf(schema.CodeValidationError,
+				"manifest version %s is older than current CLI %s", manifest.Version, cliVersion).
+				WithHint("refusing to roll back a signed release automatically")
+		case cmp == 0:
+			return schema.UpdateData{
+				Status:         "up_to_date",
+				CurrentVersion: cliVersion,
+			}, nil
+		}
+	} else if manifest.Version == cliVersion {
 		return schema.UpdateData{
 			Status:         "up_to_date",
 			CurrentVersion: cliVersion,
@@ -237,4 +251,39 @@ func downloadAndVerify(downloadURL, expectedSHA, destPath string) error {
 			WithHint("refusing to install a binary that doesn't match the manifest")
 	}
 	return nil
+}
+
+var releaseVersionPattern = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+].*)?$`)
+
+func compareReleaseVersions(a, b string) (int, bool) {
+	av, okA := parseReleaseVersion(a)
+	bv, okB := parseReleaseVersion(b)
+	if !okA || !okB {
+		return 0, false
+	}
+	for i := 0; i < len(av); i++ {
+		switch {
+		case av[i] < bv[i]:
+			return -1, true
+		case av[i] > bv[i]:
+			return 1, true
+		}
+	}
+	return 0, true
+}
+
+func parseReleaseVersion(v string) ([3]int, bool) {
+	var out [3]int
+	m := releaseVersionPattern.FindStringSubmatch(strings.TrimSpace(v))
+	if m == nil {
+		return out, false
+	}
+	for i := 0; i < 3; i++ {
+		n, err := strconv.Atoi(m[i+1])
+		if err != nil {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
 }

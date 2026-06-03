@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/carloslfu/computer.md/daemon/audit"
+	"github.com/carloslfu/computer.md/daemon/vault"
 )
 
 // platformAuditSink streams audit entries to the platform's append-only
@@ -25,12 +26,13 @@ import (
 // authoritative local copy; the sink is best-effort durability, not a
 // transaction). It must never slow or wedge the audit hot path.
 type platformAuditSink struct {
-	cfg *Config
-	ch  chan audit.Entry
+	cfg  *Config
+	mask *vault.Masker
+	ch   chan audit.Entry
 }
 
-func newPlatformAuditSink(cfg *Config) *platformAuditSink {
-	s := &platformAuditSink{cfg: cfg, ch: make(chan audit.Entry, 256)}
+func newPlatformAuditSink(cfg *Config, mask *vault.Masker) *platformAuditSink {
+	s := &platformAuditSink{cfg: cfg, mask: mask, ch: make(chan audit.Entry, 256)}
 	go s.run()
 	return s
 }
@@ -63,6 +65,18 @@ func (s *platformAuditSink) run() {
 }
 
 func (s *platformAuditSink) post(e audit.Entry) error {
+	// Last-hop secret scrub before the entry leaves the machine. Engine
+	// call sites already mask tool input, but the sink is the single choke
+	// point every audit entry passes through on its way off-box, so we
+	// mask Details here too: a future (or third-party) audit caller that
+	// records a raw secret in Details still cannot exfiltrate it through
+	// the write-only platform sink. Defense in depth, not the primary
+	// control. Nil-safe so tests that build the sink without a masker
+	// (and any pre-wiring caller) still work.
+	details := e.Details
+	if s.mask != nil {
+		details = s.mask.Mask(details)
+	}
 	payload := map[string]any{
 		"machine_id": s.cfg.MachineID,
 		"id":         e.ID,
@@ -71,7 +85,7 @@ func (s *platformAuditSink) post(e audit.Entry) error {
 		"category":   e.Category,
 		"user_id":    e.UserID,
 		"task_id":    e.TaskID,
-		"details":    e.Details,
+		"details":    details,
 		"risk_level": e.RiskLevel,
 	}
 	data, err := json.Marshal(payload)

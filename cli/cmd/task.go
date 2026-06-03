@@ -390,6 +390,14 @@ func runTaskStream(cmd *cobra.Command, args []string) error {
 
 	terminate := errors.New("stream: terminal task event reached")
 
+	// Track whether we actually observed a terminal event. The daemon's
+	// SSE connection can drop (idle proxy, daemon restart, network blip)
+	// before the terminal event is sent; parseSSE treats a clean EOF as a
+	// nil return, so without this flag a truncated stream looks identical
+	// to a completed one and the CLI would exit 0 — an agent then reads
+	// truncation as success. See the close-handling block after Stream().
+	sawTerminal := false
+
 	onEvent := func(ev client.StreamEvent) error {
 		// Forward the event as a JSON Lines line. We pass through the
 		// daemon's payload verbatim; the schema's job here is just to add
@@ -425,8 +433,10 @@ func runTaskStream(cmd *cobra.Command, args []string) error {
 			// are the load-bearing terminal signals on the wire.
 			switch eventType {
 			case "task:completed", "task:failed", "task:cancelled":
+				sawTerminal = true
 				return terminate
 			case schema.EventFinal:
+				sawTerminal = true
 				return terminate
 			}
 			// Belt-and-suspenders: some payloads also carry a `status` field
@@ -434,6 +444,7 @@ func runTaskStream(cmd *cobra.Command, args []string) error {
 			if statusStr, ok := fields["status"].(string); ok {
 				switch statusStr {
 				case "completed", "failed", "cancelled":
+					sawTerminal = true
 					return terminate
 				}
 			}
@@ -448,6 +459,46 @@ func runTaskStream(cmd *cobra.Command, args []string) error {
 			return output.EmitEvent(schema.EventEnd, time.Now().UTC().Format(time.RFC3339Nano), map[string]any{"reason": "interrupted"})
 		}
 		return mapDaemonError(streamErr, "streaming")
+	}
+
+	// Clean stream end (Stream returned nil, or our terminate sentinel).
+	// In --follow-final mode the caller asked to stream until the
+	// connection drops, so a clean end IS the success condition.
+	if flagStreamFollowFinal {
+		return nil
+	}
+
+	// Default mode: a stream that ended WITHOUT a terminal event is a
+	// dropped connection, not a finished task. Returning nil here would
+	// make an agent read truncation as success. Fall back to the
+	// authoritative task state so the exit code reflects the real
+	// outcome; if the task is still in flight, surface a distinct,
+	// non-zero "connection_closed" end instead of a false success.
+	if !sawTerminal {
+		ts := time.Now().UTC().Format(time.RFC3339Nano)
+		task, getErr := c.GetTask(id)
+		if getErr != nil {
+			// Couldn't recover the terminal state — emit the end marker and
+			// fail loudly rather than exit 0 on a half-read stream.
+			_ = output.EmitEvent(schema.EventEnd, ts, map[string]any{"reason": "connection_closed"})
+			return mapDaemonError(getErr, "stream closed before a terminal event; fetching task state")
+		}
+		if code := exit.ForTaskStatus(task.Status); code != exit.OK {
+			// Task actually reached a terminal state we missed on the wire.
+			_ = output.EmitEvent(schema.EventFinal, ts, map[string]any{"status": task.Status})
+			return &exit.OutcomeError{Code: code}
+		}
+		if task.Status == "completed" {
+			// Genuinely done; the terminal event was just lost in transit.
+			_ = output.EmitEvent(schema.EventFinal, ts, map[string]any{"status": task.Status})
+			return nil
+		}
+		// Still queued/running: the connection dropped on a live task.
+		// Distinct non-zero exit so the caller never mistakes this for done.
+		_ = output.EmitEvent(schema.EventEnd, ts, map[string]any{"reason": "connection_closed", "status": task.Status})
+		return schema.Newf(schema.CodeMachineUnreachable,
+			"stream closed before task %s reached a terminal state (last status: %s)", id, task.Status).
+			WithHint("re-attach with 'vibecraft task stream " + id + "' or poll with 'vibecraft task wait " + id + "'")
 	}
 	return nil
 }

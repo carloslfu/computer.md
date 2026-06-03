@@ -3,6 +3,7 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -164,7 +165,13 @@ func (cb *ContextBuilder) Build() string {
 			if len(value) > MaxMemoryValueLength {
 				value = value[:MaxMemoryValueLength] + "..."
 			}
-			b.WriteString(fmt.Sprintf("- [%s] %s: %s\n", m.Category, m.Key, value))
+			data, _ := json.Marshal(map[string]string{
+				"category": m.Category,
+				"key":      m.Key,
+				"value":    value,
+			})
+			b.Write(data)
+			b.WriteByte('\n')
 		}
 		b.WriteString("</stored_data>\n\n")
 	}
@@ -242,7 +249,7 @@ func (cb *ContextBuilder) BuildMessages() []ConversationMessage {
 	var result []ConversationMessage
 
 	for _, msg := range cb.messages {
-		if msg.Type == "approval" {
+		if isUIOnlyMessageType(msg.Type) {
 			continue
 		}
 		result = append(result, ConversationMessage{
@@ -253,6 +260,15 @@ func (cb *ContextBuilder) BuildMessages() []ConversationMessage {
 	}
 
 	return result
+}
+
+func isUIOnlyMessageType(typ string) bool {
+	switch typ {
+	case "approval", "credential_request", "activity_summary":
+		return true
+	default:
+		return false
+	}
 }
 
 // ConversationMessage is the minimal representation for API calls.

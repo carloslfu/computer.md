@@ -29,28 +29,38 @@ func withTempSystemdDir(t *testing.T) string {
 	return dir
 }
 
+// writeUnit mirrors what doInstallAppService lays down on disk: the
+// world-readable 0644 unit AND, when the request carries env, the 0600
+// sidecar EnvironmentFile the unit points at. parseUnitFile reads env
+// back from that sidecar, so the deploy/status/env round-trip tests need
+// both files present.
 func writeUnit(t *testing.T, dir string, req installAppServiceRequest) {
 	t.Helper()
+	old := systemdUserDir
+	systemdUserDir = dir // so appServiceEnvFilePath resolves into dir
+	defer func() { systemdUserDir = old }()
 	if err := os.WriteFile(filepath.Join(dir, req.Name+".service"), []byte(renderUnitFile(req)), 0o644); err != nil {
 		t.Fatalf("writeUnit: %v", err)
+	}
+	if hasEnvironment(req.Environment) {
+		if err := os.WriteFile(appServiceEnvFilePath(req.Name), []byte(renderEnvFile(req.Environment)), 0o600); err != nil {
+			t.Fatalf("writeUnit env: %v", err)
+		}
 	}
 }
 
 // ---- pure helpers ----
 
 func TestParseUnitFile_RoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "x.service")
-	if err := os.WriteFile(p, []byte(renderUnitFile(installAppServiceRequest{
+	dir := withTempSystemdDir(t)
+	writeUnit(t, dir, installAppServiceRequest{
 		Name:             "x",
 		ExecStart:        "/usr/bin/node /home/vibecraft/systems/x/s.js",
 		WorkingDirectory: "/home/vibecraft/systems/x",
 		Description:      "X tool",
 		Environment:      []string{"A=1", "B=2"},
-	})), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	pu, err := parseUnitFile(p)
+	})
+	pu, err := parseUnitFile(filepath.Join(dir, "x.service"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +75,83 @@ func TestParseUnitFile_RoundTrip(t *testing.T) {
 	}
 	if len(pu.Environment) != 2 || pu.Environment[0] != "A=1" || pu.Environment[1] != "B=2" {
 		t.Errorf("Environment = %+v", pu.Environment)
+	}
+}
+
+func TestParseUnitFile_RejectsUnexpectedEnvironmentFile(t *testing.T) {
+	dir := withTempSystemdDir(t)
+	unitPath := filepath.Join(dir, "x.service")
+	err := os.WriteFile(unitPath, []byte(strings.Join([]string{
+		"[Unit]",
+		"Description=X",
+		"[Service]",
+		"WorkingDirectory=/home/vibecraft/systems/x",
+		"EnvironmentFile=-/etc/vibecraft/encryption.key",
+		"ExecStart=/usr/bin/node /home/vibecraft/systems/x/s.js",
+	}, "\n")), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseUnitFile(unitPath); err == nil {
+		t.Fatal("expected parseUnitFile to reject EnvironmentFile outside expected sidecar")
+	}
+}
+
+func TestParseUnitFile_RejectsSymlinkEnvironmentFile(t *testing.T) {
+	dir := withTempSystemdDir(t)
+	unitPath := filepath.Join(dir, "x.service")
+	err := os.WriteFile(unitPath, []byte(strings.Join([]string{
+		"[Unit]",
+		"Description=X",
+		"[Service]",
+		"WorkingDirectory=/home/vibecraft/systems/x",
+		"EnvironmentFile=-" + appServiceEnvFilePath("x"),
+		"ExecStart=/usr/bin/node /home/vibecraft/systems/x/s.js",
+	}, "\n")), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(t.TempDir(), "victim.env")
+	if err := os.WriteFile(victim, []byte("SECRET=leaked\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, appServiceEnvFilePath("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseUnitFile(unitPath); err == nil {
+		t.Fatal("expected parseUnitFile to reject symlink EnvironmentFile")
+	}
+}
+
+func TestWriteVibecraftFileAtomic_DoesNotFollowPredictableTmpSymlink(t *testing.T) {
+	dir := withTempSystemdDir(t)
+	target := filepath.Join(dir, "x.service")
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	predictableTmp := target + ".tmp"
+	if err := os.Symlink(victim, predictableTmp); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeVibecraftFileAtomic(target, []byte("unit-body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(victim); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "unchanged" {
+		t.Fatalf("predictable tmp symlink target was modified: %q", got)
+	}
+	if got, err := os.ReadFile(target); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "unit-body" {
+		t.Fatalf("target = %q", got)
+	}
+	if fi, err := os.Lstat(predictableTmp); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("predictable tmp symlink should have been ignored, mode=%s", fi.Mode())
 	}
 }
 
@@ -147,20 +234,41 @@ func TestDeployHostedAppService_ReusesUnitAndResolvesVault(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(b)
-	if !strings.Contains(got, "Environment=DB_PASSWORD=s3cr3t") {
-		t.Errorf("resolved vault value missing:\n%s", got)
+	// Secrets must NOT be in the world-readable unit anymore — they live
+	// in the 0600 EnvironmentFile the unit points at.
+	if strings.Contains(got, "s3cr3t") {
+		t.Errorf("resolved vault value leaked into 0644 unit:\n%s", got)
 	}
-	if strings.Contains(got, "$NOTES_DB_PASSWORD") {
-		t.Errorf("unresolved $ref leaked into unit:\n%s", got)
-	}
-	if !strings.Contains(got, "Environment=OLD_FLAG=changed") {
-		t.Errorf("env override did not win:\n%s", got)
-	}
-	if !strings.Contains(got, "Environment=PORT=5055") {
-		t.Errorf("base env dropped:\n%s", got)
+	if !strings.Contains(got, "EnvironmentFile=") {
+		t.Errorf("unit does not reference an EnvironmentFile:\n%s", got)
 	}
 	if !strings.Contains(got, "ExecStart=/usr/bin/node /home/vibecraft/systems/notes/server.js") {
 		t.Errorf("stored ExecStart not reused:\n%s", got)
+	}
+
+	// The resolved env now lands in the 0600 sidecar.
+	ePath := filepath.Join(dir, "notes.env")
+	eb, err := os.ReadFile(ePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := string(eb)
+	if !strings.Contains(env, "DB_PASSWORD=s3cr3t") {
+		t.Errorf("resolved vault value missing from env file:\n%s", env)
+	}
+	if strings.Contains(env, "$NOTES_DB_PASSWORD") {
+		t.Errorf("unresolved $ref leaked into env file:\n%s", env)
+	}
+	if !strings.Contains(env, "OLD_FLAG=changed") {
+		t.Errorf("env override did not win:\n%s", env)
+	}
+	if !strings.Contains(env, "PORT=5055") {
+		t.Errorf("base env dropped:\n%s", env)
+	}
+	if fi, err := os.Stat(ePath); err != nil {
+		t.Fatal(err)
+	} else if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("env file mode = %o, want 600 (secrets must not be world-readable)", perm)
 	}
 }
 
@@ -181,6 +289,29 @@ func TestDeployHostedAppService_RequiresExistingUnit(t *testing.T) {
 	_, code := ts.server.deployHostedAppService(context.Background(), "notes", nil, nil)
 	if code != http.StatusConflict {
 		t.Fatalf("want 409 for missing unit, got %d", code)
+	}
+}
+
+func TestDeployHostedAppService_RejectsPortOverrideThatDiffersFromRoute(t *testing.T) {
+	ts := newTestServer(t)
+	dir := withTempSystemdDir(t)
+	if err := ts.server.db.CreateRoute("notes", 5055); err != nil {
+		t.Fatal(err)
+	}
+	writeUnit(t, dir, installAppServiceRequest{
+		Name:             "notes",
+		ExecStart:        "/usr/bin/node /home/vibecraft/systems/notes/server.js",
+		WorkingDirectory: "/home/vibecraft/systems/notes",
+		Description:      "Notes",
+		Port:             5055,
+	})
+	port := 6066
+	result, code := ts.server.deployHostedAppService(context.Background(), "notes", nil, &port)
+	if code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %+v", code, result)
+	}
+	if !strings.Contains(result.Detail, "does not match registered route port") {
+		t.Fatalf("unexpected detail: %+v", result)
 	}
 }
 
@@ -391,9 +522,13 @@ func TestHostedToolHTTP_DeployCyclesAndResolvesVault(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"ok":true`) || !strings.Contains(w.Body.String(), `"status":"running"`) {
 		t.Fatalf("want ok running, got %s", w.Body.String())
 	}
-	b, _ := os.ReadFile(filepath.Join(dir, "notes.service"))
-	if !strings.Contains(string(b), "Environment=DB_PASSWORD=s3cr3t") {
-		t.Errorf("vault ref not resolved into unit:\n%s", b)
+	u, _ := os.ReadFile(filepath.Join(dir, "notes.service"))
+	if strings.Contains(string(u), "s3cr3t") {
+		t.Errorf("vault value leaked into 0644 unit:\n%s", u)
+	}
+	e, _ := os.ReadFile(filepath.Join(dir, "notes.env"))
+	if !strings.Contains(string(e), "DB_PASSWORD=s3cr3t") {
+		t.Errorf("vault ref not resolved into 0600 env file:\n%s", e)
 	}
 }
 

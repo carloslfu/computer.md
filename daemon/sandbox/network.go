@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"sort"
 	"strings"
@@ -42,13 +43,24 @@ func CgroupName(sandboxID string) string {
 // Linux caps interface names at 15 bytes, so the sandbox ID (≤63 by
 // manifest rule) is truncated with a stable prefix. Both sides are
 // derived the same way so host teardown can find the peer by name.
-func VethHostName(sandboxID string) string  { return ifname("vch", sandboxID) }
+func VethHostName(sandboxID string) string    { return ifname("vch", sandboxID) }
 func VethSandboxName(sandboxID string) string { return ifname("vcs", sandboxID) }
 
 func ifname(prefix, id string) string {
 	name := prefix + strings.ReplaceAll(id, "-", "")
 	if len(name) > 15 {
-		name = name[:15]
+		compact := strings.ReplaceAll(id, "-", "")
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(id))
+		suffix := fmt.Sprintf("%06x", h.Sum32()&0xffffff)
+		keep := 15 - len(prefix) - 1 - len(suffix)
+		if keep < 1 {
+			keep = 1
+		}
+		if len(compact) > keep {
+			compact = compact[:keep]
+		}
+		name = prefix + compact + "_" + suffix
 	}
 	return name
 }
@@ -108,8 +120,6 @@ func RenderForwardNftables(sandboxID, vethHost, sandboxCIDR string, pol EgressPo
 	b.WriteString("  }\n")
 	b.WriteString("  chain sb_egress {\n")
 	b.WriteString("    ct state established,related accept\n")
-	b.WriteString("    udp dport 53 accept\n")
-	b.WriteString("    tcp dport 53 accept\n")
 	for _, c := range static {
 		fmt.Fprintf(&b, "    ip daddr %s accept\n", c)
 	}
@@ -169,11 +179,10 @@ func RenderNftables(sandboxID string, pol EgressPolicy, mode EgressMode) (string
 	fmt.Fprintf(&b, "    socket cgroupv2 level 2 %q jump sandbox_egress\n", cg)
 	b.WriteString("  }\n")
 	b.WriteString("  chain sandbox_egress {\n")
-	// Always-allow loopback + DNS to the daemon resolver (the proxy needs
-	// to answer before any allowlisted FQDN can resolve).
+	// Always allow loopback. DNS proxy traffic stays on loopback in the
+	// shared-host-netns model; external DNS on arbitrary port 53 does not
+	// get a blanket bypass and must match the allowlist like anything else.
 	b.WriteString("    oifname \"lo\" accept\n")
-	b.WriteString("    udp dport 53 accept\n")
-	b.WriteString("    tcp dport 53 accept\n")
 	for _, c := range staticIPs {
 		fmt.Fprintf(&b, "    ip daddr %s accept\n", c)
 	}

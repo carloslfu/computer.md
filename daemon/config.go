@@ -113,7 +113,7 @@ type Config struct {
 	// the agent a natural home-relative path to reference.
 	InboxDir string
 
-	// DBEncryptionKey is derived from the daemon token for SQLCipher.
+	// DBEncryptionKey is loaded from /etc/vibecraft/encryption.key for SQLCipher.
 	DBEncryptionKey string
 
 	// VaultEncryptionKey is the 32-byte key for AES-256-GCM vault encryption.
@@ -248,18 +248,20 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("local token is empty after ensure")
 	}
 
-	// DB encryption key: loaded from dedicated encryption key file.
-	// SQLCipher applies PBKDF2 internally on this hex-encoded key.
+	// Storage encryption key: loaded from the dedicated encryption key
+	// file. Existing machines have both the SQLCipher DB and the vault
+	// encrypted directly from this key material, so this derivation is an
+	// on-disk compatibility contract. Do not rotate or domain-separate it
+	// in place without a real migration that can open old DB/vault files,
+	// rewrite them, and roll back safely.
 	encKeyBytes, err := os.ReadFile("/etc/vibecraft/encryption.key")
 	if err != nil {
 		return nil, fmt.Errorf("reading encryption key: %w", err)
 	}
-	cfg.DBEncryptionKey = hex.EncodeToString(encKeyBytes)
-
-	// Vault encryption key: loaded from the same encryption key file.
 	if len(encKeyBytes) < 32 {
 		return nil, fmt.Errorf("encryption key too short (need >= 32 bytes, got %d)", len(encKeyBytes))
 	}
+	cfg.DBEncryptionKey = hex.EncodeToString(encKeyBytes)
 	copy(cfg.VaultEncryptionKey[:], encKeyBytes[:32])
 
 	// Override port from environment if set.

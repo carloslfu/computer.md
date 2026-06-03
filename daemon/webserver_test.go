@@ -174,6 +174,53 @@ func TestSPAHandler_FallbackAndAssetsBehaveCorrectly(t *testing.T) {
 	})
 }
 
+// TestSPAHandler_SecurityHeaders pins the baseline security response
+// headers on every response the SPA handler emits — the shell, hashed
+// assets, the SPA fallback, and a 404. A regression that drops the CSP /
+// nosniff / Referrer-Policy would re-open clickjacking, MIME-sniffing,
+// and Referer-leak surfaces, so assert them on each shape.
+func TestSPAHandler_SecurityHeaders(t *testing.T) {
+	h := spaHandler(fakeWeb())
+
+	paths := []struct {
+		desc string
+		path string
+	}{
+		{"root shell", "/"},
+		{"hashed asset", "/assets/app.js"},
+		{"spa fallback", "/c/some-conversation-id"},
+		{"missing asset 404", "/assets/does-not-exist.js"},
+	}
+	for _, tc := range paths {
+		t.Run(tc.desc, func(t *testing.T) {
+			req := httptest.NewRequest("GET", tc.path, nil)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+
+			csp := w.Header().Get("Content-Security-Policy")
+			if csp == "" {
+				t.Fatalf("%s: missing Content-Security-Policy", tc.path)
+			}
+			for _, want := range []string{
+				"default-src 'self'",
+				"frame-ancestors 'none'",
+				"connect-src 'self' https://www.vibecraft.so",
+				"img-src 'self' data: blob:",
+			} {
+				if !containsStr(csp, want) {
+					t.Errorf("%s: CSP %q missing directive %q", tc.path, csp, want)
+				}
+			}
+			if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", tc.path, got)
+			}
+			if got := w.Header().Get("Referrer-Policy"); got != "no-referrer" {
+				t.Errorf("%s: Referrer-Policy = %q, want no-referrer", tc.path, got)
+			}
+		})
+	}
+}
+
 // isAPIRoute is the guard's decision function; pin its contract directly
 // so a future route addition that forgets to extend it is caught here.
 func TestIsAPIRoute(t *testing.T) {

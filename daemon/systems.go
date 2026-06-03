@@ -64,15 +64,15 @@ func crontabHomes() []string {
 // small so the manager can list dozens of systems in one round trip
 // without a paging dance.
 type systemEntry struct {
-	Name           string `json:"name"`
-	Path           string `json:"path"`
-	HasCrontab     bool   `json:"has_crontab"`
-	CrontabLines   int    `json:"crontab_lines"`   // non-comment, non-blank
-	LastModified   string `json:"last_modified"`   // RFC3339; dir mtime
-	HasRunSh       bool   `json:"has_run_sh"`      // run.sh present + executable
-	HasManifest    bool   `json:"has_manifest"`    // manifest.json (locked) present
-	HasProposed    bool   `json:"has_proposed"`    // manifest.proposed.json present
-	LastRunAt      string `json:"last_run_at"`     // most-recent mtime under logs/, RFC3339
+	Name         string `json:"name"`
+	Path         string `json:"path"`
+	HasCrontab   bool   `json:"has_crontab"`
+	CrontabLines int    `json:"crontab_lines"` // non-comment, non-blank
+	LastModified string `json:"last_modified"` // RFC3339; dir mtime
+	HasRunSh     bool   `json:"has_run_sh"`    // run.sh present + executable
+	HasManifest  bool   `json:"has_manifest"`  // manifest.json (locked) present
+	HasProposed  bool   `json:"has_proposed"`  // manifest.proposed.json present
+	LastRunAt    string `json:"last_run_at"`   // most-recent mtime under logs/, RFC3339
 }
 
 // handleSystems lists all authored systems. GET only — the manager
@@ -171,7 +171,7 @@ func mostRecentMtime(dir string) (time.Time, bool) {
 // ~/crontab; deleted ~/systems/foo/") without needing a second
 // round-trip to verify.
 type uninstallResult struct {
-	Status           string   `json:"status"`            // "uninstalled" | "not_found"
+	Status           string   `json:"status"` // "uninstalled" | "not_found"
 	DirectoryRemoved bool     `json:"directory_removed"`
 	CrontabsEdited   []string `json:"crontabs_edited"` // absolute paths
 	LinesRemoved     int      `json:"lines_removed"`

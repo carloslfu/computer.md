@@ -9,14 +9,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/carloslfu/computer.md/daemon/persistence"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // signGrant produces a grant code for the test machine with the given
@@ -364,9 +366,9 @@ func TestWhoami_NoRefreshHintFarFromExpiry(t *testing.T) {
 	ts := newTestServer(t)
 	sess := ts.handshakeCookie(t, "user-refresh", "Dan", "dan@example.com", "control", "nonce-refresh-1")
 
-	// /api/auth/whoami doesn't go through withCookieAuth, it reads the
-	// cookie directly. So the X-Vc-Refresh path doesn't fire here. Use a
-	// route guarded by withCookieOrBearer instead.
+	// /api/auth/whoami reads the cookie directly rather than going
+	// through withCookieOrBearer, so the X-Vc-Refresh path doesn't fire
+	// there. Use a route guarded by withCookieOrBearer instead.
 	req := httptest.NewRequest("GET", "/api/conversations", nil)
 	req.AddCookie(sess)
 	w := httptest.NewRecorder()
@@ -438,6 +440,12 @@ func TestVerifyGrantCode_RejectsMalformedAndForged(t *testing.T) {
 	})
 	badAccessStr, _ := badAccess.SignedString(ts.privateKey)
 
+	badIssuer := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"sub": "u", "machine": ts.machineID, "nonce": "n", "access": "control",
+		"iss": "evil.example", "exp": time.Now().Add(time.Minute).Unix(),
+	})
+	badIssuerStr, _ := badIssuer.SignedString(ts.privateKey)
+
 	cases := []struct {
 		desc string
 		code string
@@ -452,6 +460,7 @@ func TestVerifyGrantCode_RejectsMalformedAndForged(t *testing.T) {
 		{"expired", expiredStr},
 		{"missing required claims", missingStr},
 		{"invalid access value", badAccessStr},
+		{"invalid issuer", badIssuerStr},
 	}
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
@@ -608,6 +617,84 @@ func TestWithCookieOrBearer_CSRFGate(t *testing.T) {
 			t.Errorf("GET with cookie: want 200, got %d: %s", w.Code, w.Body.String())
 		}
 	})
+}
+
+// TestSafeReturnPath_RejectsOpenRedirect pins the ?return= validator
+// against the open-redirect bypasses that send the user off-machine after
+// the handshake. Anything that isn't a same-origin path-only value must
+// collapse to "/". The backslash cases are the load-bearing ones: a
+// browser normalizes "\" to "/", so values like "/\evil.com" resolve to a
+// protocol-relative URL pointing at another origin, and Go's url.Parse
+// keeps the backslash literal — it won't flag them on its own.
+func TestSafeReturnPath_RejectsOpenRedirect(t *testing.T) {
+	cases := []struct {
+		desc string
+		in   string
+		want string
+	}{
+		// Accepted: genuine same-origin paths.
+		{"empty", "", "/"},
+		{"root", "/", "/"},
+		{"simple path", "/c/abc", "/c/abc"},
+		{"nested path", "/settings/vault", "/settings/vault"},
+		{"path with query", "/c/abc?tab=files", "/c/abc?tab=files"},
+		{"path with fragment", "/dashboard#section", "/dashboard#section"},
+
+		// Rejected: not path-rooted.
+		{"relative", "c/abc", "/"},
+		{"absolute https", "https://evil.com", "/"},
+		{"absolute http", "http://evil.com/path", "/"},
+		{"scheme-relative", "//evil.com", "/"},
+		{"scheme-relative path", "//evil.com/path", "/"},
+		{"javascript scheme", "javascript:alert(1)", "/"},
+		{"mailto scheme", "mailto:a@b.com", "/"},
+		{"data scheme", "data:text/html,evil", "/"},
+
+		// Rejected: backslash open-redirect bypasses (browser → "/").
+		{"backslash slash host", `/\evil.com`, "/"},
+		{"backslash backslash host", `\\evil.com`, "/"},
+		{"leading backslash slash", `\/evil.com`, "/"},
+		{"slash backslash slash host", `/\/evil.com`, "/"},
+		{"backslash mid path", `/foo\..\bar`, "/"},
+		{"backslash before scheme", `/\\evil.com/path`, "/"},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			if got := safeReturnPath(c.in); got != c.want {
+				t.Errorf("safeReturnPath(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestAuthCallback_HostileReturnNeverEscapesOrigin is the end-to-end twin:
+// a valid grant carrying a hostile ?return= must still 302, but the
+// Location header must be the safe "/" fallback, never an off-origin URL.
+func TestAuthCallback_HostileReturnNeverEscapesOrigin(t *testing.T) {
+	hostile := []string{
+		"https://evil.com",
+		"//evil.com",
+		`/\evil.com`,
+		`\/evil.com`,
+		`/\/evil.com`,
+	}
+	for i, ret := range hostile {
+		t.Run(ret, func(t *testing.T) {
+			ts := newTestServer(t)
+			grant := ts.signGrant(t, "u", "U", "u@e.com", "control",
+				fmt.Sprintf("nonce-hostile-return-%d", i))
+			req := httptest.NewRequest("GET",
+				"/auth/callback?code="+grant+"&return="+url.QueryEscape(ret), nil)
+			w := httptest.NewRecorder()
+			ts.mux.ServeHTTP(w, req)
+			if w.Code != http.StatusFound {
+				t.Fatalf("want 302, got %d: %s", w.Code, w.Body.String())
+			}
+			if loc := w.Header().Get("Location"); loc != "/" {
+				t.Errorf("hostile return %q → Location %q, want \"/\"", ret, loc)
+			}
+		})
+	}
 }
 
 func TestSessionSweeper_RemovesExpired(t *testing.T) {

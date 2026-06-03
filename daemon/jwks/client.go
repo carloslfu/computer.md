@@ -212,10 +212,10 @@ func (c *Client) refresh() {
 
 // Stats returns a snapshot of the in-process counters for /metrics.
 type Stats struct {
-	RefreshOK    int64
-	RefreshFail  int64
-	UnknownKid   int64
-	FetchedAt    time.Time
+	RefreshOK   int64
+	RefreshFail int64
+	UnknownKid  int64
+	FetchedAt   time.Time
 }
 
 // Stats returns counters + last-fetched time atomically so /metrics

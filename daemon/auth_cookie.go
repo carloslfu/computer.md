@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/carloslfu/computer.md/daemon/audit"
 	"github.com/carloslfu/computer.md/daemon/persistence"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // Cookie names.
@@ -63,70 +63,6 @@ func generateSessionID() (string, error) {
 		return "", fmt.Errorf("session id rand: %w", err)
 	}
 	return hex.EncodeToString(b), nil
-}
-
-// withCookieAuth is the middleware for the new browser-cookie path on
-// /api/* routes. It reads the vc_session cookie, verifies its hash
-// against the sessions table, and attaches identity to the request
-// context. On near-expiry it adds X-Vc-Refresh: 1 to the response.
-//
-// Anti-CSRF: mutating requests (POST/PUT/PATCH/DELETE) must declare
-// Content-Type: application/json (or multipart for /upload). Browsers
-// won't let a cross-origin form set application/json without a
-// preflight, and SameSite=Lax blocks the cross-origin preflight before
-// it ever leaves. Together with the no-Domain cookie attribute the
-// chat session is bound to the exact host.
-func (s *Server) withCookieAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// CSRF gate. /upload uses multipart/form-data; allow it.
-		switch r.Method {
-		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-			ct := r.Header.Get("Content-Type")
-			if !strings.HasPrefix(ct, "application/json") &&
-				!strings.HasPrefix(ct, "multipart/form-data") {
-				jsonError(w, "mutating requests require application/json or multipart/form-data", http.StatusUnsupportedMediaType)
-				return
-			}
-		}
-
-		c, err := r.Cookie(cookieSession)
-		if err != nil || c.Value == "" {
-			jsonError(w, "not authenticated", http.StatusUnauthorized)
-			return
-		}
-		idHash := hashSessionID(c.Value)
-		sess, err := s.db.GetSessionByIDHash(idHash)
-		if err != nil {
-			jsonError(w, "session not found", http.StatusUnauthorized)
-			return
-		}
-
-		// Touch last_seen in the background — never let DB I/O delay
-		// the response on the auth hot path.
-		go s.db.TouchSession(idHash)
-
-		// Hint refresh to the SPA when expiry is close. The SPA does a
-		// background round-trip to /auth/grant + /auth/callback to swap
-		// for a fresh cookie. User sees no interruption.
-		if time.Until(sess.ExpiresAt) < refreshHintWindow {
-			w.Header().Set("X-Vc-Refresh", "1")
-			defaultMetrics.SessionRefresh()
-		}
-
-		ctx := r.Context()
-		ctx = context.WithValue(ctx, ctxKeyCookieSub, sess.Sub)
-		ctx = context.WithValue(ctx, ctxKeyCookieName, sess.Name)
-		ctx = context.WithValue(ctx, ctxKeyCookieEmail, sess.Email)
-		ctx = context.WithValue(ctx, ctxKeyCookieAccess, sess.Access)
-		ctx = context.WithValue(ctx, ctxKeyCookieIDHash, idHash)
-		ctx = context.WithValue(ctx, ctxKeyCookieExpiry, sess.ExpiresAt)
-		// Also attach the sub under the legacy userID key so handlers
-		// that previously read ctxKeyUserID from JWT still work.
-		ctx = context.WithValue(ctx, ctxKeyUserID, sess.Sub)
-		r = r.WithContext(ctx)
-
-		next(w, r)
-	}
 }
 
 // withCookieOrBearer is the dual-auth path the SPA + legacy ChatLayout
@@ -477,7 +413,11 @@ func (s *Server) verifyGrantCode(tokenStr string) (*grantClaims, error) {
 			kid = "vibecraft-1"
 		}
 		return s.jwks.KeyFor(kid)
-	})
+	},
+		jwt.WithValidMethods([]string{"RS256"}),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuer(jwtExpectedIssuer),
+	)
 	if err != nil || !tok.Valid {
 		return nil, fmt.Errorf("verify: %w", err)
 	}
@@ -514,15 +454,39 @@ func stringClaim(m jwt.MapClaims, k string) string {
 
 // safeReturnPath validates the ?return= param so an attacker can't
 // redirect the user off-machine via a maliciously crafted handshake URL.
-// Only same-origin (path-only) paths are accepted.
+// Only same-origin, path-only values are accepted; anything that could
+// resolve to a different origin falls back to "/".
+//
+// Defense layers, in order:
+//   - Must be non-empty and start with a single "/" (path-rooted).
+//   - No backslashes. Browsers normalize "\" to "/", so "/\evil.com" and
+//     "\/evil.com" are treated as protocol-relative URLs pointing
+//     off-host. url.Parse does NOT catch these (Go keeps "\" literal), so
+//     we reject them before parsing.
+//   - No "//" or "/\" prefix (protocol-relative URL → other origin).
+//   - After parsing, the URL must carry no Scheme and no Host (and no
+//     opaque part). That rules out "https://evil.com", "javascript:…",
+//     and "mailto:…" style values that slipped past the prefix checks.
 func safeReturnPath(raw string) string {
 	if raw == "" || !strings.HasPrefix(raw, "/") {
 		return "/"
 	}
-	if strings.HasPrefix(raw, "//") {
-		return "/" // protocol-relative URL — drop.
+	// Backslashes are the classic open-redirect bypass: a browser reads
+	// "/\evil.com" (and "\/evil.com", "/\/evil.com") as protocol-relative.
+	if strings.Contains(raw, `\`) {
+		return "/"
 	}
-	if _, err := url.Parse(raw); err != nil {
+	// Protocol-relative ("//host") → resolves to a different origin.
+	if strings.HasPrefix(raw, "//") {
+		return "/"
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "/"
+	}
+	// Path-only: no scheme, no host, no opaque body. If any is present the
+	// value can target another origin, so reject it.
+	if u.Scheme != "" || u.Host != "" || u.Opaque != "" {
 		return "/"
 	}
 	return raw

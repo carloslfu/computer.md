@@ -29,11 +29,12 @@ var _ core.UsageRecorder = (*usage.BudgetTracker)(nil)
 // tests drive the daemon's budget through its REAL fetch path.
 func fakePlatformBudget(t *testing.T, budgetUSD float64) *httptest.Server {
 	t.Helper()
+	periodStart, periodEnd := usage.CurrentMonthBounds()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"ai_budget_usd": budgetUSD,
-			"period_start":  "2026-05-02",
-			"period_end":    "2026-06-02",
+			"period_start":  periodStart,
+			"period_end":    periodEnd,
 			"period_source": "subscription",
 		})
 	}))
@@ -82,6 +83,7 @@ func postTask(t *testing.T, srv *Server, convID, instruction string) (int, map[s
 	})
 	req := httptest.NewRequest("POST", "/api/task", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyAccess, "control"))
 	w := httptest.NewRecorder()
 	srv.handleTask(w, req)
 	var parsed map[string]interface{}

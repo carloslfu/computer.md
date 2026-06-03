@@ -94,6 +94,28 @@ func TestUploadRejectsInvalidConversationID(t *testing.T) {
 	}
 }
 
+func TestUploadRejectsSymlinkConversationDir(t *testing.T) {
+	ts := newTestServer(t)
+	jwt := ts.signJWT(t, "user-1")
+
+	outside := t.TempDir()
+	convID := "conv-symlink"
+	if err := os.Symlink(outside, filepath.Join(ts.server.cfg.InboxDir, convID)); err != nil {
+		t.Fatal(err)
+	}
+
+	body, ct := buildMultipart(t, convID, map[string][]byte{"a.txt": []byte("hi")}, nil)
+	w := uploadRequest(t, ts, "Bearer "+jwt, body, ct)
+	if w.Code == http.StatusOK {
+		t.Fatalf("upload through symlinked conversation dir must be rejected: %s", w.Body.String())
+	}
+	if entries, err := os.ReadDir(outside); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("outside target was written via symlink: %v", entries)
+	}
+}
+
 func TestUploadRejectsWithNoFile(t *testing.T) {
 	ts := newTestServer(t)
 	jwt := ts.signJWT(t, "user-1")
@@ -309,6 +331,28 @@ func TestInboxRejectsPathTraversal(t *testing.T) {
 		if rr.Code == http.StatusOK {
 			t.Errorf("path %q should NOT have returned 200", p)
 		}
+	}
+}
+
+func TestInboxRejectsSymlinkConversationDir(t *testing.T) {
+	ts := newTestServer(t)
+	jwt := ts.signJWT(t, "user-1")
+
+	convID := "conv-symlink-fetch"
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(ts.server.cfg.InboxDir, convID)); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/inbox/"+convID+"/secret.txt", nil)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	rr := httptest.NewRecorder()
+	ts.mux.ServeHTTP(rr, req)
+	if rr.Code == http.StatusOK {
+		t.Fatalf("inbox fetch through symlinked conversation dir must be rejected, got body %q", rr.Body.String())
 	}
 }
 

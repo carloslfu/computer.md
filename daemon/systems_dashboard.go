@@ -40,12 +40,12 @@ import (
 // has_run_sh leak through — those are developer artifacts; the
 // non-technical operator wants name + status + last-touched.
 type dashboardSystemView struct {
-	Name        string `json:"name"`         // raw folder name (the manager's identifier)
-	DisplayName string `json:"display_name"` // humanized (kebab→space, title case)
-	Kind        string `json:"kind"`         // "app" | "scheduled" | "idle"
-	URL         string `json:"url,omitempty"`            // public URL if this is a hosted app
-	Live        string `json:"live,omitempty"`           // "up" | "down" — populated only when URL is set
-	LastActive  string `json:"last_active,omitempty"`    // RFC3339; most recent of dir mtime / logs / route timestamp
+	Name        string `json:"name"`                  // raw folder name (the manager's identifier)
+	DisplayName string `json:"display_name"`          // humanized (kebab→space, title case)
+	Kind        string `json:"kind"`                  // "app" | "scheduled" | "idle"
+	URL         string `json:"url,omitempty"`         // public URL if this is a hosted app
+	Live        string `json:"live,omitempty"`        // "up" | "down" — populated only when URL is set
+	LastActive  string `json:"last_active,omitempty"` // RFC3339; most recent of dir mtime / logs / route timestamp
 }
 
 // handleDashboardSystems lists authored systems for the sidebar. Auth
@@ -280,15 +280,15 @@ func probeLiveStatus(ctx context.Context, views []dashboardSystemView, portByNam
 // probeLocalPort returns "up" | "down" for 127.0.0.1:port within
 // httpProbeTimeout. Two-stage check:
 //
-//   1. TCP dial first — if nothing's listening, we're done and the
-//      app is "down" without bothering to construct an HTTP request.
-//      This is the dominant failure mode (server died, never started,
-//      bound to a different port). Fast.
+//  1. TCP dial first — if nothing's listening, we're done and the
+//     app is "down" without bothering to construct an HTTP request.
+//     This is the dominant failure mode (server died, never started,
+//     bound to a different port). Fast.
 //
-//   2. HEAD then GET on http://127.0.0.1:PORT/. Any 2xx/3xx/4xx means
-//      the backend answered (a 404 from a wrong path still means the
-//      server is alive). 5xx counts as "down" — the backend is
-//      broken in a customer-visible way.
+//  2. HEAD then GET on http://127.0.0.1:PORT/. Any 2xx/3xx/4xx means
+//     the backend answered (a 404 from a wrong path still means the
+//     server is alive). 5xx counts as "down" — the backend is
+//     broken in a customer-visible way.
 //
 // The probe deliberately does NOT follow the public URL through
 // Caddy — see the package-level comment on probeLiveStatus for why.

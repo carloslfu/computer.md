@@ -4,10 +4,11 @@ package audit
 
 import (
 	"log"
+	"regexp"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/carloslfu/computer.md/daemon/persistence"
+	"github.com/google/uuid"
 )
 
 // Entry represents a single audit log entry.
@@ -40,6 +41,18 @@ type Logger struct {
 	sink Sink
 }
 
+const maxAuditDetailsLen = 4096
+
+var auditDetailRedactions = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`\bvc_machine_[A-Za-z0-9_=-]+`), `vc_machine_[REDACTED]`},
+	{regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{12,}`), `sk-[REDACTED]`},
+	{regexp.MustCompile(`(?i)\b(password|passwd|token|secret|api[_-]?key|key)=("[^"]*"|'[^']*'|[^\s,;]+)`), `${1}=[REDACTED]`},
+}
+
 // NewLogger creates an audit logger backed by the given database.
 func NewLogger(db *persistence.DB) *Logger {
 	return &Logger{db: db}
@@ -63,6 +76,7 @@ func (l *Logger) Log(entry Entry) {
 	if entry.Category == "" {
 		entry.Category = "general"
 	}
+	entry.Details = sanitizeDetails(entry.Details)
 
 	_, err := l.db.Conn().Exec(
 		`INSERT INTO audit_log (id, timestamp, action, category, user_id, task_id, details, risk_level)
@@ -80,6 +94,16 @@ func (l *Logger) Log(entry Entry) {
 	if l.sink != nil {
 		l.sink.Forward(entry)
 	}
+}
+
+func sanitizeDetails(details string) string {
+	for _, r := range auditDetailRedactions {
+		details = r.re.ReplaceAllString(details, r.repl)
+	}
+	if len(details) > maxAuditDetailsLen {
+		return details[:maxAuditDetailsLen] + "...[truncated]"
+	}
+	return details
 }
 
 // Query returns audit log entries with pagination.

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/carloslfu/computer.md/daemon/persistence"
+	"github.com/google/uuid"
 )
 
 // Item represents a single memory entry.

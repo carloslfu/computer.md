@@ -17,13 +17,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/carloslfu/computer.md/daemon/audit"
 	"github.com/carloslfu/computer.md/daemon/core"
 	"github.com/carloslfu/computer.md/daemon/jwks"
 	"github.com/carloslfu/computer.md/daemon/memory"
 	"github.com/carloslfu/computer.md/daemon/persistence"
 	"github.com/carloslfu/computer.md/daemon/vault"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // testServer sets up a daemon Server with real DB, real auth middleware,
@@ -132,9 +132,15 @@ func newTestServer(t *testing.T) *testServer {
 // signJWT creates a valid JWT for testing.
 func (ts *testServer) signJWT(t *testing.T, sub string) string {
 	t.Helper()
+	return ts.signJWTWithAccess(t, sub, "control")
+}
+
+func (ts *testServer) signJWTWithAccess(t *testing.T, sub, access string) string {
+	t.Helper()
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 		"sub":     sub,
 		"machine": ts.machineID,
+		"access":  access,
 		"iss":     "vibecraft.so",
 		"iat":     time.Now().Unix(),
 		"exp":     time.Now().Add(5 * time.Minute).Unix(),
@@ -152,6 +158,7 @@ func (ts *testServer) signJWTWrongMachine(t *testing.T) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 		"sub":     "user-123",
 		"machine": "vc-wrong",
+		"access":  "control",
 		"iss":     "vibecraft.so",
 		"iat":     time.Now().Unix(),
 		"exp":     time.Now().Add(5 * time.Minute).Unix(),
@@ -344,6 +351,31 @@ func TestKeysAcceptsJWT(t *testing.T) {
 	w := ts.do(t, "GET", "/keys", "Bearer "+jwtToken, "")
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestKeysRejectViewJWTForAllMethods(t *testing.T) {
+	ts := newTestServer(t)
+	jwtToken := ts.signJWTWithAccess(t, "viewer-123", "view")
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "list", method: http.MethodGet, path: "/keys"},
+		{name: "create", method: http.MethodPost, path: "/keys", body: `{"name":"viewer escalation"}`},
+		{name: "delete", method: http.MethodDelete, path: "/keys/some-key-id"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := ts.do(t, tc.method, tc.path, "Bearer "+jwtToken, tc.body)
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+			}
+		})
 	}
 }
 

@@ -28,7 +28,7 @@ const ClassifierTimeout = 8 * time.Second
 //   - approve:  silently safe, skip the human card entirely
 //   - escalate: classifier isn't sure, ask the human as a peer ("your call")
 //   - deny:     classifier sees genuine risk; default to no, but the human
-//               can override with friction proportional to consequence.
+//     can override with friction proportional to consequence.
 //
 // Note: deny is *not* the same as a hard System Block. System Block is
 // non-negotiable (credentials, killing the daemon, fork bomb). Deny is
@@ -63,7 +63,7 @@ type ClassifierResult struct {
 // risk.
 type RiskClassifier struct {
 	manager *managerclient.Client
-	model  string
+	model   string
 }
 
 // NewRiskClassifier returns a classifier wired against the manager client.

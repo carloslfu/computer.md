@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/carloslfu/computer.md/daemon/persistence"
+	"github.com/google/uuid"
 )
 
 // Attachment is a single file the user uploaded with a message.
@@ -192,8 +192,9 @@ func (s *TaskStore) UpdateStatus(id string, status TaskStatus) error {
 		args = append(args, now)
 	}
 
-	query += ` WHERE id = ?`
+	query += ` WHERE id = ? AND status NOT IN (?, ?, ?)`
 	args = append(args, id)
+	args = append(args, string(TaskCompleted), string(TaskFailed), string(TaskCancelled))
 
 	_, err := s.db.Conn().Exec(query, args...)
 	return err
@@ -203,8 +204,9 @@ func (s *TaskStore) UpdateStatus(id string, status TaskStatus) error {
 func (s *TaskStore) SetResult(id, result string) error {
 	_, err := s.db.Conn().Exec(
 		`UPDATE tasks SET result = ?, status = ?, updated_at = ?, completed_at = ?
-		 WHERE id = ?`,
+		 WHERE id = ? AND status NOT IN (?, ?, ?)`,
 		result, string(TaskCompleted), time.Now().UTC(), time.Now().UTC(), id,
+		string(TaskCompleted), string(TaskFailed), string(TaskCancelled),
 	)
 	return err
 }
@@ -213,8 +215,9 @@ func (s *TaskStore) SetResult(id, result string) error {
 func (s *TaskStore) SetError(id, errMsg string) error {
 	_, err := s.db.Conn().Exec(
 		`UPDATE tasks SET error_message = ?, status = ?, updated_at = ?, completed_at = ?
-		 WHERE id = ?`,
+		 WHERE id = ? AND status NOT IN (?, ?, ?)`,
 		errMsg, string(TaskFailed), time.Now().UTC(), time.Now().UTC(), id,
+		string(TaskCompleted), string(TaskFailed), string(TaskCancelled),
 	)
 	return err
 }
@@ -222,8 +225,10 @@ func (s *TaskStore) SetError(id, errMsg string) error {
 // SetWaitingForInput marks a task as needing user input.
 func (s *TaskStore) SetWaitingForInput(id, question string) error {
 	_, err := s.db.Conn().Exec(
-		`UPDATE tasks SET result = ?, status = ?, updated_at = ? WHERE id = ?`,
+		`UPDATE tasks SET result = ?, status = ?, updated_at = ?
+		 WHERE id = ? AND status NOT IN (?, ?, ?)`,
 		question, string(TaskWaitingForInput), time.Now().UTC(), id,
+		string(TaskCompleted), string(TaskFailed), string(TaskCancelled),
 	)
 	return err
 }
@@ -334,6 +339,64 @@ func (s *TaskStore) NextQueued() (*Task, error) {
 		return nil, nil
 	}
 	return t, err
+}
+
+// ClaimNextQueued atomically moves the oldest queued task to running and
+// returns it. If a cancel changes the row before the claim, the UPDATE affects
+// no rows and the caller sees no task instead of resurrecting a cancellation.
+func (s *TaskStore) ClaimNextQueued() (*Task, error) {
+	now := time.Now().UTC()
+	tx, err := s.db.Conn().Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin claim tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row := tx.QueryRow(
+		`SELECT id, conversation_id, instruction, status, result, error_message,
+		        created_at, updated_at, started_at, completed_at
+		 FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT 1`,
+		string(TaskQueued),
+	)
+	t, err := scanTask(row)
+	if err == sql.ErrNoRows {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit empty claim tx: %w", err)
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := tx.Exec(
+		`UPDATE tasks
+		 SET status = ?, updated_at = ?, started_at = COALESCE(started_at, ?)
+		 WHERE id = ? AND status = ?`,
+		string(TaskRunning), now, now, t.ID, string(TaskQueued),
+	)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n != 1 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit skipped claim tx: %w", err)
+		}
+		return nil, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claim tx: %w", err)
+	}
+	t.Status = TaskRunning
+	t.UpdatedAt = now
+	if t.StartedAt == nil {
+		t.StartedAt = &now
+	}
+	return t, nil
 }
 
 // EnsureConversation creates a conversation if it doesn't exist.

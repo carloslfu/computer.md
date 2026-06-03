@@ -152,7 +152,7 @@ func TestBackup_Rotate(t *testing.T) {
 		"vibecraft-2026-04-30T10-00-00Z.db",
 		"vibecraft-2026-04-23T10-00-00Z.db",
 		"vibecraft-2026-04-09T10-00-00Z.db", // 5 weeks back — drop
-		"random-noise.db",                    // ignored by rotation
+		"random-noise.db",                   // ignored by rotation
 	} {
 		if err := os.WriteFile(filepath.Join(backupDir, name), []byte("x"), 0600); err != nil {
 			t.Fatalf("write: %v", err)

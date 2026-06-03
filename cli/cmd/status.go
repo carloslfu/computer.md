@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -87,6 +88,12 @@ func mapDaemonError(err error, defaultMessage string) error {
 		case 403:
 			return schema.Newf(schema.CodeAuthForbidden, "%s", apiErr.Error())
 		case 404:
+			if isPathNotFoundContext(defaultMessage) {
+				return schema.Newf(schema.CodePathNotFound, "%s", apiErr.Error())
+			}
+			if defaultMessage != "machine unreachable" && defaultMessage != "version probe" {
+				return schema.Newf(schema.CodeValidationError, "%s", apiErr.Error())
+			}
 			return schema.Newf(schema.CodeMachineNotFound, "%s", apiErr.Error())
 		case 429:
 			return schema.Newf(schema.CodeRateLimited, "%s", apiErr.Error())
@@ -97,4 +104,14 @@ func mapDaemonError(err error, defaultMessage string) error {
 		return schema.Newf(schema.CodeInternal, "%s", apiErr.Error())
 	}
 	return schema.Newf(schema.CodeMachineUnreachable, "%s: %s", defaultMessage, err.Error())
+}
+
+func isPathNotFoundContext(defaultMessage string) bool {
+	msg := strings.ToLower(defaultMessage)
+	for _, needle := range []string{"file", "download", "computer.md"} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }

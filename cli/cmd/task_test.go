@@ -152,6 +152,114 @@ func TestTaskSubmit_NoWait_EmitsTaskSubmitData(t *testing.T) {
 	flagTaskWait = true
 }
 
+// resetVersionHandshake clears the once-per-process version handshake
+// cache so a test's fresh httptest server is probed again. Without this,
+// the first newClient() in the package run pins the result and later
+// tests against a different server skip the probe.
+func resetVersionHandshake() {
+	versionHandshakeMu.Lock()
+	versionHandshakeDone = false
+	versionHandshakeErr = nil
+	versionHandshakeMu.Unlock()
+}
+
+// streamDaemon serves an SSE stream that writes the given raw event
+// blocks (each a complete "event:/data:\n\n" chunk) and then CLOSES the
+// connection WITHOUT a terminal event — simulating a dropped proxy /
+// daemon restart. GET /api/task/<id>/status returns statusBody so the
+// CLI's fallback can read the authoritative terminal state. It does not
+// serve /api/version (404 → treated as implicit schema v1, like the
+// real install base).
+func streamDaemon(t *testing.T, events []string, statusBody string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for _, ev := range events {
+			_, _ = w.Write([]byte(ev))
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		// Return without sending a terminal event: the handler exiting
+		// closes the response body, which the client reads as EOF.
+	})
+	mux.HandleFunc("/api/task/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(statusBody))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(func() { srv.Close() })
+	return srv
+}
+
+// A dropped SSE connection on a task that actually finished as `failed`
+// must NOT exit 0. The CLI falls back to GET /status and surfaces the
+// real terminal outcome (exit 2), so an agent never reads truncation as
+// success.
+func TestTaskStream_ConnectionClosed_FallsBackToTerminalStatus(t *testing.T) {
+	srv := streamDaemon(t,
+		[]string{"event: message\ndata: {\"text\":\"working\"}\n\n"},
+		`{"id":"t1","status":"failed","error_message":"boom","instruction":"go"}`,
+	)
+	isolateEnv(t, srv.URL, "vc_machine_test_test_test_xyz")
+	withOutputMode(t, output.ModeJSON)
+	resetVersionHandshake()
+	flagStreamFollowFinal = false
+
+	_, runErr := captureStdout(t, func() error {
+		return runTaskStream(taskStreamCmd, []string{"t1"})
+	})
+
+	if runErr == nil {
+		t.Fatalf("expected non-nil error for a stream that closed on a failed task, got nil (exit 0)")
+	}
+	var oe *exit.OutcomeError
+	if !errors.As(runErr, &oe) {
+		t.Fatalf("expected *OutcomeError from the status fallback, got %T: %v", runErr, runErr)
+	}
+	if oe.Code != exit.TaskFailed {
+		t.Errorf("OutcomeError.Code: got %d, want %d (TaskFailed)", oe.Code, exit.TaskFailed)
+	}
+}
+
+// A dropped SSE connection on a task that is STILL running must surface a
+// distinct non-zero error (not a false success and not a task-outcome
+// code), so the caller knows the stream was truncated mid-flight.
+func TestTaskStream_ConnectionClosed_StillRunning_NonZero(t *testing.T) {
+	srv := streamDaemon(t,
+		[]string{"event: message\ndata: {\"text\":\"still going\"}\n\n"},
+		`{"id":"t1","status":"running","instruction":"go"}`,
+	)
+	isolateEnv(t, srv.URL, "vc_machine_test_test_test_xyz")
+	withOutputMode(t, output.ModeJSON)
+	resetVersionHandshake()
+	flagStreamFollowFinal = false
+
+	out, runErr := captureStdout(t, func() error {
+		return runTaskStream(taskStreamCmd, []string{"t1"})
+	})
+
+	if runErr == nil {
+		t.Fatalf("expected a non-nil error for a stream dropped on a running task, got nil (exit 0)")
+	}
+	// Must NOT be an OutcomeError (the task did not reach a terminal state).
+	var oe *exit.OutcomeError
+	if errors.As(runErr, &oe) {
+		t.Fatalf("did not expect an OutcomeError for a still-running task, got code %d", oe.Code)
+	}
+	// It maps to a CLI-class failure (exit 1), and a connection_closed end
+	// marker should have been emitted on stdout.
+	if code := exit.FromError(runErr); code != exit.CLIError {
+		t.Errorf("exit.FromError: got %d, want %d (CLIError)", code, exit.CLIError)
+	}
+	if !strings.Contains(out, "connection_closed") {
+		t.Errorf("expected a connection_closed end event on stdout, got: %q", out)
+	}
+}
+
 func TestTaskCancel_EmitsCancelData(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/task/t1/cancel", func(w http.ResponseWriter, r *http.Request) {

@@ -24,35 +24,37 @@ func approxEqual(t *testing.T, got, want float64, msg string) {
 // fat-finger the constant), this test breaks immediately and the user
 // stops being billed the old (lower) rate while charging the new one.
 func TestPricing_GPT54MiniSample(t *testing.T) {
-	// 1M input + 1M output + 1M cache-read + 1M cache-create:
-	//   1.0 * 0.75  = 0.75
+	// 2M total input, of which 1M is cache-read and 1M is cache-create,
+	// plus 1M output:
+	//   0.0 * 0.75  = 0.00
 	//   1.0 * 4.50  = 4.50
 	//   1.0 * 0.075 = 0.075
 	//   1.0 * 0.00  = 0.00
-	//   total = 5.325
+	//   total = 4.575
 	u := manager.Usage{
-		InputTokens:              1_000_000,
+		InputTokens:              2_000_000,
 		OutputTokens:             1_000_000,
 		CacheReadInputTokens:     1_000_000,
 		CacheCreationInputTokens: 1_000_000,
 	}
-	approxEqual(t, Cost("gpt-5.4-mini", u), 5.325, "gpt-5.4-mini 1M of each")
+	approxEqual(t, Cost("gpt-5.4-mini", u), 4.575, "gpt-5.4-mini cached input subsets")
 }
 
 func TestPricing_GPT54Sample(t *testing.T) {
-	// 1M input + 1M output + 1M cache-read + 1M cache-create:
-	//   1.0 * 2.50 = 2.50
+	// 2M total input, of which 1M is cache-read and 1M is cache-create,
+	// plus 1M output:
+	//   0.0 * 2.50 = 0.00
 	//   1.0 * 15.0 = 15.00
 	//   1.0 * 0.25 = 0.25
 	//   1.0 * 0.00 = 0.00
-	//   total = 17.75
+	//   total = 15.25
 	u := manager.Usage{
-		InputTokens:              1_000_000,
+		InputTokens:              2_000_000,
 		OutputTokens:             1_000_000,
 		CacheReadInputTokens:     1_000_000,
 		CacheCreationInputTokens: 1_000_000,
 	}
-	approxEqual(t, Cost("gpt-5.4", u), 17.75, "gpt-5.4 1M of each")
+	approxEqual(t, Cost("gpt-5.4", u), 15.25, "gpt-5.4 cached input subsets")
 }
 
 // TestPricing_RealisticTask is closer to what one agent loop actually
@@ -65,11 +67,22 @@ func TestPricing_RealisticTask(t *testing.T) {
 	//   50_000 * 0.075 / 1e6 = 0.00375
 	//   total = 0.0165
 	u := manager.Usage{
-		InputTokens:          5_000,
+		InputTokens:          55_000,
 		OutputTokens:         2_000,
 		CacheReadInputTokens: 50_000,
 	}
 	approxEqual(t, Cost("gpt-5.4-mini", u), 0.0165, "realistic 1-turn cost")
+}
+
+func TestPricing_ClampsImpossibleCacheSubset(t *testing.T) {
+	u := manager.Usage{
+		InputTokens:          10_000,
+		OutputTokens:         1_000,
+		CacheReadInputTokens: 50_000,
+	}
+	want := (1_000 * Pricing["gpt-5.4-mini"].OutputPerMTok / 1_000_000.0) +
+		(50_000 * Pricing["gpt-5.4-mini"].CacheReadPerMTok / 1_000_000.0)
+	approxEqual(t, Cost("gpt-5.4-mini", u), want, "impossible cached subset should not make input cost negative")
 }
 
 // TestPricing_UnknownModelReturnsZero verifies the deliberate-zero

@@ -28,6 +28,13 @@ import (
 
 const socketDir = "/run/vibecraft"
 
+// AgentShellID is the single long-lived sandbox that represents the
+// manager's own shell. It is trusted to use socket-implicit localhost
+// auth because the daemon creates it as the manager's computer-use
+// surface. System/tool sandboxes get their own socket identity but not
+// this privilege.
+const AgentShellID = "agent-shell"
+
 // SocketPath is the host-side per-sandbox socket path. Deterministic so
 // the spawner (SpawnOpts.HostSocketPath) and the server agree.
 func SocketPath(id string) string {
@@ -55,6 +62,13 @@ func SandboxID(r *http.Request) string {
 		return v
 	}
 	return ""
+}
+
+// ContextWithSandboxID returns a context tagged the same way SandboxServer
+// tags requests accepted on a per-sandbox unix socket. It is exported for
+// middleware tests; production callers should come through SandboxServer.
+func ContextWithSandboxID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, sandboxCtxKey{}, id)
 }
 
 // agentSockUser resolves the unprivileged user the agent-shell sandbox

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"time"
 )
@@ -35,10 +34,10 @@ type SecretInfo struct {
 // Store manages encrypted secrets using AES-256-GCM.
 // Secrets are stored as an encrypted JSON blob on disk.
 type Store struct {
-	mu       sync.RWMutex
-	path     string
-	key      [32]byte
-	secrets  map[string]*Secret
+	mu      sync.RWMutex
+	path    string
+	key     [32]byte
+	secrets map[string]*Secret
 }
 
 // NewStore creates or loads a vault from the given file path.
@@ -151,20 +150,25 @@ func (s *Store) AllValues() map[string]string {
 	return values
 }
 
-// ResolveReferences replaces $SECRET_NAME patterns in text with actual values.
+// ResolveReferences replaces $SECRET_NAME / ${SECRET_NAME} references in
+// text with their actual values.
+//
+// This routes through the boundary-safe Resolver rather than doing raw
+// substring replacement. Naive ReplaceAll over each secret name is
+// order-dependent and corrupts overlapping names: with secrets A and ABC,
+// resolving "$ABC" could first expand the "$A" prefix (leaving "<A>BC")
+// and never match "$ABC" at all — the result depends on Go's
+// non-deterministic map iteration order. The Resolver matches whole
+// $NAME / ${NAME} tokens via a single regex pass with a longest-token
+// boundary, so "$ABC" always resolves to ABC and "$A" inside "$ABC" is
+// never seen as a separate reference.
+//
+// We do NOT hold s.mu here: Resolver.Resolve looks each name up via
+// s.Get, which takes its own RLock per name. Holding the lock across that
+// call would be a recursive RLock and can deadlock if a writer is queued
+// between the two acquisitions.
 func (s *Store) ResolveReferences(text string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	result := text
-	for name, secret := range s.secrets {
-		placeholder := "$" + name
-		result = strings.ReplaceAll(result, placeholder, secret.Value)
-		// Also support ${SECRET_NAME} syntax.
-		placeholder = "${" + name + "}"
-		result = strings.ReplaceAll(result, placeholder, secret.Value)
-	}
-	return result
+	return NewResolver(s).Resolve(text)
 }
 
 // BuildEnv builds a KEY=VALUE environment slice for the given secret names.

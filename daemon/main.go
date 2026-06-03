@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -26,8 +27,6 @@ import (
 
 	_ "image/png"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"github.com/carloslfu/computer.md/daemon/audit"
 	"github.com/carloslfu/computer.md/daemon/computer"
 	"github.com/carloslfu/computer.md/daemon/core"
@@ -40,6 +39,8 @@ import (
 	"github.com/carloslfu/computer.md/daemon/sandbox"
 	"github.com/carloslfu/computer.md/daemon/usage"
 	"github.com/carloslfu/computer.md/daemon/vault"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 // embeddedPrompt is the system prompt compiled into the binary.
@@ -94,18 +95,21 @@ func main() {
 	// Initialize subsystems.
 	taskStore := core.NewTaskStore(db)
 	memStore := memory.NewStore(db)
-	auditLog := audit.NewLogger(db)
-	if cfg.AuditSink {
-		auditLog.SetSink(newPlatformAuditSink(cfg))
-		log.Printf("Phase 6: remote audit sink enabled (write-only stream to platform)")
-	}
-	grEngine := guardrails.NewEngine(db)
 
+	// Vault + masker are created before the audit sink so the sink can
+	// scrub secret values out of audit Details on the last hop off-machine.
 	vaultStore, err := vault.NewStore(cfg.VaultPath, cfg.VaultEncryptionKey)
 	if err != nil {
 		log.Fatalf("failed to open vault: %v", err)
 	}
 	vaultMasker := vault.NewMasker(vaultStore)
+
+	auditLog := audit.NewLogger(db)
+	if cfg.AuditSink {
+		auditLog.SetSink(newPlatformAuditSink(cfg, vaultMasker))
+		log.Printf("Phase 6: remote audit sink enabled (write-only stream to platform)")
+	}
+	grEngine := guardrails.NewEngine(db)
 
 	managerClient := managerclient.NewClientWithOptions(cfg.OpenAIKey, managerclient.ClientOptions{
 		Model:               cfg.ManagerModel,
@@ -822,7 +826,20 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 				Details:  fmt.Sprintf("key=%s endpoint=%s method=%s ip=%s", apiKey.KeyHint, r.URL.Path, r.Method, remoteIP(r)),
 			})
 
-			next(w, r)
+			// Machine API keys are a control-tier credential. They can only
+			// be minted by a control user (handleKeys is JWT-gated; the v1
+			// relay signs `access:"control"` for the same reason — see
+			// lib/relay.ts), and they exist for CLI/programmatic writes
+			// (task submission, vault, fanout, systems). Set the tier
+			// explicitly so requireControl lets these through; without it
+			// the key would carry no tier and every mutating route would
+			// 403, silently breaking the entire CLI write surface.
+			ctx := r.Context()
+			if apiKey.CreatedBy != "" {
+				ctx = context.WithValue(ctx, ctxKeyUserID, apiKey.CreatedBy)
+			}
+			ctx = context.WithValue(ctx, ctxKeyAccess, "control")
+			next(w, r.WithContext(ctx))
 			return
 		}
 
@@ -865,10 +882,16 @@ func (s *Server) validateJWTAndServe(w http.ResponseWriter, r *http.Request, tok
 		return
 	}
 
+	// Harden validation against algorithm-confusion and unbounded tokens:
+	//   - WithValidMethods pins RS256 so an attacker can't downgrade to
+	//     "none" or coerce an HMAC verify against the public key.
+	//   - WithExpirationRequired rejects any token with no exp — a forged
+	//     or legacy never-expiring token must not authenticate.
+	//   - WithIssuer binds to the platform's iss ("vibecraft.so"), which
+	//     both signers (legacy PEM + KMS) stamp on every token.
+	// The platform never sets an `aud` claim; the `machine` claim below is
+	// the per-machine audience binding and is checked explicitly.
 	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
 		kid, _ := token.Header["kid"].(string)
 		if kid == "" {
 			// Legacy JWTs predate explicit kid; the bootstrap PEM
@@ -876,7 +899,11 @@ func (s *Server) validateJWTAndServe(w http.ResponseWriter, r *http.Request, tok
 			kid = "vibecraft-1"
 		}
 		return s.jwks.KeyFor(kid)
-	})
+	},
+		jwt.WithValidMethods([]string{"RS256"}),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuer(jwtExpectedIssuer),
+	)
 
 	if err != nil || !token.Valid {
 		jsonError(w, "invalid token", http.StatusUnauthorized)
@@ -931,6 +958,12 @@ const (
 	ctxKeyAccess ctxKey = "access"
 )
 
+// jwtExpectedIssuer is the `iss` claim both platform signers stamp on
+// every data-plane token (lib/jwt.ts signLegacy + lib/kms-signer.ts).
+// validateJWTAndServe pins it so a token minted for a different issuer
+// can't authenticate here.
+const jwtExpectedIssuer = "vibecraft.so"
+
 func (s *Server) withManagementAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -968,16 +1001,6 @@ func (s *Server) withManagementAuth(next http.HandlerFunc) http.HandlerFunc {
 // discriminator and a token would only break Caddy's ask.
 func (s *Server) withLoopbackOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Phase 2: a request that arrived over a per-sandbox unix socket
-		// (/run/vibecraft/<id>.sock) is authenticated BY THE SOCKET — only
-		// that one sandbox can reach it, and SandboxServer injected its id
-		// into the context. The sandboxed agent's netns severs host
-		// loopback, so this is its only daemon channel; trust it (and skip
-		// the token — the socket is the credential).
-		if sandbox.SandboxID(r) != "" {
-			next(w, r)
-			return
-		}
 		// Caddy always sets X-Forwarded-For when proxying external traffic.
 		// Direct localhost connections (agent's curl) don't have this header.
 		if r.Header.Get("X-Forwarded-For") != "" {
@@ -1012,24 +1035,31 @@ func (s *Server) withLoopbackOnly(next http.HandlerFunc) http.HandlerFunc {
 // MUST present it. /routes/verify deliberately uses withLoopbackOnly,
 // NOT this — Caddy's `ask` cannot supply a token.
 func (s *Server) withLocalhostAuth(next http.HandlerFunc) http.HandlerFunc {
-	return s.withLoopbackOnly(func(w http.ResponseWriter, r *http.Request) {
-		// Per-sandbox socket request: already authenticated by the socket
-		// (see withLoopbackOnly). No token needed — keeps the in-sandbox
-		// prompt recipes simple (`curl --unix-socket /run/vibecraft.sock`).
-		if sandbox.SandboxID(r) != "" {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Only the daemon-created manager shell keeps socket-implicit
+		// localhost auth. System/tool sandboxes have a socket identity for
+		// scoped endpoints, but that identity must not become a host-level
+		// local token bypass.
+		if id := sandbox.SandboxID(r); id != "" {
+			if id != sandbox.AgentShellID {
+				jsonError(w, "local daemon access is only available to the agent shell", http.StatusForbidden)
+				return
+			}
 			next(w, r)
 			return
 		}
-		const prefix = "Bearer "
-		authz := r.Header.Get("Authorization")
-		presented := strings.TrimPrefix(authz, prefix)
-		if !strings.HasPrefix(authz, prefix) ||
-			subtle.ConstantTimeCompare([]byte(presented), []byte(s.cfg.LocalToken)) != 1 {
-			jsonError(w, "local token required", http.StatusUnauthorized)
-			return
-		}
-		next(w, r)
-	})
+		s.withLoopbackOnly(func(w http.ResponseWriter, r *http.Request) {
+			const prefix = "Bearer "
+			authz := r.Header.Get("Authorization")
+			presented := strings.TrimPrefix(authz, prefix)
+			if !strings.HasPrefix(authz, prefix) ||
+				subtle.ConstantTimeCompare([]byte(presented), []byte(s.cfg.LocalToken)) != 1 {
+				jsonError(w, "local token required", http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		})(w, r)
+	}
 }
 
 // --- Route handlers ---
@@ -1205,6 +1235,9 @@ func (s *Server) handleHostedAppByName(w http.ResponseWriter, r *http.Request) {
 				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
+			if !s.requireControl(w, r) {
+				return
+			}
 			result, code := s.restartHostedAppService(r.Context(), actionName)
 			s.auditLog.Log(audit.Entry{
 				Action:   "hosted_app_restart",
@@ -1217,6 +1250,9 @@ func (s *Server) handleHostedAppByName(w http.ResponseWriter, r *http.Request) {
 		case "deploy":
 			if r.Method != http.MethodPost {
 				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if !s.requireControl(w, r) {
 				return
 			}
 			var req struct {
@@ -1272,6 +1308,9 @@ func (s *Server) handleHostedAppByName(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodDelete:
+		if !s.requireControl(w, r) {
+			return
+		}
 		if err := s.routeMgr.Unregister(name); err != nil {
 			jsonError(w, err.Error(), http.StatusNotFound)
 			return
@@ -1283,6 +1322,9 @@ func (s *Server) handleHostedAppByName(w http.ResponseWriter, r *http.Request) {
 		})
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "deleted"})
 	case http.MethodPatch:
+		if !s.requireControl(w, r) {
+			return
+		}
 		var req struct {
 			SSOEnabled *bool `json:"sso_enabled"`
 		}
@@ -1526,6 +1568,9 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireControl(w, r) {
 		return
 	}
 
@@ -1782,6 +1827,9 @@ func (s *Server) handleTaskRespond(w http.ResponseWriter, r *http.Request, taskI
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireControl(w, r) {
+		return
+	}
 
 	var req struct {
 		Input string `json:"input"`
@@ -1818,6 +1866,9 @@ func (s *Server) handleTaskRespond(w http.ResponseWriter, r *http.Request, taskI
 func (s *Server) handleTaskCredentials(w http.ResponseWriter, r *http.Request, taskID string) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireControl(w, r) {
 		return
 	}
 
@@ -1868,6 +1919,9 @@ func (s *Server) handleTaskCredentials(w http.ResponseWriter, r *http.Request, t
 func (s *Server) handleTaskCancel(w http.ResponseWriter, r *http.Request, taskID string) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireControl(w, r) {
 		return
 	}
 
@@ -1979,6 +2033,9 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusOK, items)
 
 	case http.MethodPost:
+		if !s.requireControl(w, r) {
+			return
+		}
 		var req struct {
 			Category string  `json:"category"`
 			Key      string  `json:"key"`
@@ -2035,6 +2092,9 @@ func (s *Server) handleComputerMD(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case http.MethodPut:
+		if !s.requireControl(w, r) {
+			return
+		}
 		var req struct {
 			Content string `json:"content"`
 		}
@@ -2062,6 +2122,9 @@ func (s *Server) handleComputerMD(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMemoryByID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireControl(w, r) {
 		return
 	}
 
@@ -2100,6 +2163,9 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusOK, rules)
 
 	case http.MethodPost:
+		if !s.requireControl(w, r) {
+			return
+		}
 		var rule guardrails.Rule
 		if err := readJSON(r, &rule); err != nil {
 			jsonError(w, "invalid request body", http.StatusBadRequest)
@@ -2136,6 +2202,9 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRuleByID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireControl(w, r) {
 		return
 	}
 
@@ -2209,6 +2278,9 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusOK, secrets)
 
 	case http.MethodPost:
+		if !s.requireControl(w, r) {
+			return
+		}
 		var req struct {
 			Name  string `json:"name"`
 			Value string `json:"value"`
@@ -2255,6 +2327,9 @@ func (s *Server) handleVaultByName(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireControl(w, r) {
+		return
+	}
 
 	name := strings.TrimPrefix(r.URL.Path, "/vault/")
 	if name == "" {
@@ -2280,6 +2355,10 @@ func (s *Server) handleVaultByName(w http.ResponseWriter, r *http.Request) {
 
 // handleKeys dispatches POST /keys (create) and GET /keys (list).
 func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
+	if !s.requireControlTier(w, r) {
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		keys, err := s.db.ListAPIKeys()
@@ -2353,6 +2432,10 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 
 // handleKeyByID dispatches DELETE /keys/{id} (revoke).
 func (s *Server) handleKeyByID(w http.ResponseWriter, r *http.Request) {
+	if !s.requireControlTier(w, r) {
+		return
+	}
+
 	if r.Method != http.MethodDelete {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -2494,6 +2577,9 @@ func writeOperatorManagerKey(key string) error {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireControl(w, r) {
+		return
+	}
 	routeList, _ := s.routeMgr.List()
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
@@ -2600,7 +2686,13 @@ func (s *Server) handleManagementRefreshJWKS(w http.ResponseWriter, r *http.Requ
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	s.jwks.ClearCache()
+	// Do NOT ClearCache() before fetching. ForceRefresh → refresh()
+	// builds a fresh kid→key map and swaps it in only on a successful
+	// fetch (preserving the bootstrap PEM kid). Wiping the live cache
+	// first meant any transient JWKS fetch failure during incident
+	// response left the daemon with zero verification keys — bricking
+	// every cookie/JWT until the next successful fetch. Keeping the live
+	// keys until the swap makes a failed refresh a no-op for auth.
 	if err := s.jwks.ForceRefresh(); err != nil {
 		s.auditLog.Log(audit.Entry{
 			Action:    "jwks_refresh_forced",
@@ -2764,10 +2856,10 @@ func (rl *rateLimiter) cleanup() {
 
 func (rl *rateLimiter) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := r.RemoteAddr
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			ip = strings.Split(fwd, ",")[0]
-		}
+		// Key on the last-hop IP (see clientIP). Keying on the spoofable
+		// leftmost X-Forwarded-For let a single attacker rotate the
+		// header to get unlimited fresh rate-limit buckets.
+		ip := clientIP(r)
 
 		if !rl.allow(strings.TrimSpace(ip)) {
 			w.Header().Set("Retry-After", "60")
@@ -2799,6 +2891,44 @@ func hasControlAccess(r *http.Request) bool {
 	return accessFromCtx(r) == "control"
 }
 
+// requireControl enforces the control access tier server-side on a
+// mutating request. The view/control split was previously gated only in
+// the SPA, so a `view` principal that talked to the daemon directly
+// could still mutate state. This is the authoritative gate.
+//
+// Read methods (GET/HEAD/OPTIONS) are always allowed — `view` is a
+// read-only tier, not a no-access tier. Any other method on a non-control
+// principal gets a 403 and the denial is audited. Returns true when the
+// caller may proceed; on denial it has already written the response and
+// the handler must return.
+func (s *Server) requireControl(w http.ResponseWriter, r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	return s.requireControlTier(w, r)
+}
+
+// requireControlTier enforces control access even for read methods. Use it
+// for endpoints whose read surface leaks control-only credentials or
+// administration metadata, such as machine API key management.
+func (s *Server) requireControlTier(w http.ResponseWriter, r *http.Request) bool {
+	if hasControlAccess(r) {
+		return true
+	}
+	if s.auditLog != nil {
+		go s.auditLog.Log(audit.Entry{
+			Action:    "access_denied_view_tier",
+			Category:  "security",
+			UserID:    userFromCtx(r),
+			Details:   fmt.Sprintf("endpoint=%s method=%s ip=%s", r.URL.Path, r.Method, remoteIP(r)),
+			RiskLevel: "low",
+		})
+	}
+	jsonError(w, "Control access required", http.StatusForbidden)
+	return false
+}
+
 // presenceUserFromCtx builds a PresenceUser from the request context.
 // Cookie-authed requests carry name + email; Bearer-authed requests (API
 // keys, CLI) only carry the user id and fall back to that as the
@@ -2814,13 +2944,38 @@ func presenceUserFromCtx(r *http.Request) PresenceUser {
 	return PresenceUser{UserID: uid, Name: name, Email: email}
 }
 
-// remoteIP extracts the client IP from the request, preferring X-Forwarded-For
-// (set by Caddy/reverse proxies) over RemoteAddr.
-func remoteIP(r *http.Request) string {
+// clientIP returns the caller's IP, trusting only the last hop.
+//
+// The daemon sits behind exactly one trusted reverse proxy (Caddy on the
+// same host — see lib/cloud-init.ts). Caddy's default reverse_proxy
+// APPENDS the immediate downstream peer to X-Forwarded-For, so the
+// RIGHTMOST entry is the address Caddy actually observed (the real
+// client for internet traffic). Every entry to the LEFT is supplied by
+// the client and is freely spoofable.
+//
+// The old code took the leftmost entry, which let an attacker pick any
+// X-Forwarded-For value to dodge the rate limiter and poison audit IPs.
+// Taking the last entry (or the socket peer when no XFF is present) ties
+// the value to what the trusted hop saw.
+func clientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+		parts := strings.Split(fwd, ",")
+		last := strings.TrimSpace(parts[len(parts)-1])
+		if last != "" {
+			return last
+		}
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
 	}
 	return r.RemoteAddr
+}
+
+// remoteIP is the audit-log client IP. It uses the last-hop rule (see
+// clientIP) so a forged X-Forwarded-For can't be written into the audit
+// trail as if it were the real source.
+func remoteIP(r *http.Request) string {
+	return clientIP(r)
 }
 
 func jsonResponse(w http.ResponseWriter, status int, data interface{}) {
@@ -2836,11 +2991,25 @@ func jsonError(w http.ResponseWriter, message string, status int) {
 }
 
 func readJSON(r *http.Request, v interface{}) error {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1024*1024)) // 1 MB limit
+	const maxJSONBodySize = 1024 * 1024
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodySize+1))
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(body, v)
+	if len(body) > maxJSONBodySize {
+		return fmt.Errorf("request body exceeds %d byte limit", maxJSONBodySize)
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func execDir() string {

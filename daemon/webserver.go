@@ -32,9 +32,34 @@ func (s *Server) registerWebRoutes(mux *http.ServeMux) {
 	mux.Handle("/", spaHandler(sub))
 }
 
+// spaSecurityHeaders are the baseline security response headers set on
+// every SPA (and SPA-404) response. The CSP locks the app to its own
+// origin: scripts/styles/fonts/etc. come from 'self' only, the page may
+// not be framed (clickjacking), XHR/SSE may only reach 'self' and the
+// platform API, and images may load from data:/blob: URLs so the chat
+// can render inline screenshots the daemon hands back as data URIs.
+// X-Content-Type-Options stops MIME sniffing; Referrer-Policy keeps the
+// (potentially sensitive) machine host out of outbound Referer headers.
+const spaContentSecurityPolicy = "default-src 'self'; " +
+	"img-src 'self' data: blob:; " +
+	"connect-src 'self' https://www.vibecraft.so; " +
+	"frame-ancestors 'none'; " +
+	"base-uri 'self'; " +
+	"form-action 'self'"
+
+func setSPASecurityHeaders(h http.Header) {
+	h.Set("Content-Security-Policy", spaContentSecurityPolicy)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "no-referrer")
+}
+
 func spaHandler(fsys fs.FS) http.Handler {
 	fileServer := http.FileServer(http.FS(fsys))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Security headers on every response this handler emits, including
+		// the SPA shell, hashed assets, the SPA fallback, and 404s.
+		setSPASecurityHeaders(w.Header())
+
 		// http.ServeMux routes everything not matched by a more specific
 		// pattern to "/", so this handler also receives requests for
 		// /favicon.ico, /robots.txt, etc. Anything starting with "/api/",

@@ -103,14 +103,14 @@ func TestStore_RecordAndAggregate(t *testing.T) {
 	}
 
 	// ── total cost: hand-compute and compare ──
-	// mini: 15k * 0.75/M + 1.5k * 4.50/M + 180k * 0.075/M
-	//       = 0.01125 + 0.00675 + 0.0135
-	//       = 0.0315
+	// mini: max(15k - 180k - 5k, 0) * 0.75/M + 1.5k * 4.50/M + 180k * 0.075/M
+	//       = 0 + 0.00675 + 0.0135
+	//       = 0.02025
 	// full: 2k * 2.50/M + 0.2k * 15.00/M
 	//       = 0.005 + 0.003 = 0.008
-	// total = 0.0395
-	approxEqual(t, sum.TotalCostUSD, 0.0395, "total cost across models")
-	approxEqual(t, mini.CostUSD, 0.0315, "mini cost")
+	// total = 0.02825
+	approxEqual(t, sum.TotalCostUSD, 0.02825, "total cost across models")
+	approxEqual(t, mini.CostUSD, 0.02025, "mini cost")
 	approxEqual(t, full.CostUSD, 0.008, "full model cost")
 
 	// ── top conversations: only convo-1 has cost (full model call had no convo) ──
@@ -120,7 +120,7 @@ func TestStore_RecordAndAggregate(t *testing.T) {
 	if sum.TopConversations[0].ConversationID != "convo-1" {
 		t.Errorf("top convo id: got %q want convo-1", sum.TopConversations[0].ConversationID)
 	}
-	approxEqual(t, sum.TopConversations[0].CostUSD, 0.0315, "convo-1 cost = mini total")
+	approxEqual(t, sum.TopConversations[0].CostUSD, 0.02025, "convo-1 cost = mini total")
 }
 
 // TestStore_UpsertDedupesByDayAndModel — two Records to the same
@@ -254,9 +254,9 @@ func TestStore_TopConvosOrderedByCostDesc(t *testing.T) {
 	store := NewStore(openTestDB(t))
 
 	// Three conversations, hand-built so ranking is unambiguous.
-	store.Record("gpt-5.4-mini", "small", manager.Usage{OutputTokens: 1_000})  // $0.0045
-	store.Record("gpt-5.4-mini", "big", manager.Usage{OutputTokens: 100_000})  // $0.45
-	store.Record("gpt-5.4-mini", "mid", manager.Usage{OutputTokens: 10_000})   // $0.045
+	store.Record("gpt-5.4-mini", "small", manager.Usage{OutputTokens: 1_000}) // $0.0045
+	store.Record("gpt-5.4-mini", "big", manager.Usage{OutputTokens: 100_000}) // $0.45
+	store.Record("gpt-5.4-mini", "mid", manager.Usage{OutputTokens: 10_000})  // $0.045
 
 	start, end := CurrentMonthBounds()
 	sum, _ := store.Aggregate(start, end, 10)

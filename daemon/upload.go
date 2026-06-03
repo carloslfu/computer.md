@@ -141,9 +141,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	convDir := filepath.Join(s.cfg.InboxDir, convID)
-	if err := os.MkdirAll(convDir, 0700); err != nil {
-		log.Printf("upload: mkdir %s: %v", convDir, err)
+	convDir, err := ensureInboxConversationDir(s.cfg.InboxDir, convID)
+	if err != nil {
+		log.Printf("upload: prepare inbox conversation dir: %v", err)
 		jsonError(w, "could not create inbox directory", http.StatusInternalServerError)
 		return
 	}
@@ -318,19 +318,8 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	convDir := filepath.Join(s.cfg.InboxDir, convID)
 	fullPath := filepath.Join(convDir, name)
 
-	// Canonicalize and reject if the resolved path escapes the conv jail.
-	realConv, err := filepath.EvalSymlinks(convDir)
+	realFull, err := resolveInboxFilePath(s.cfg.InboxDir, convDir, fullPath)
 	if err != nil {
-		jsonError(w, "not found", http.StatusNotFound)
-		return
-	}
-	realFull, err := filepath.EvalSymlinks(fullPath)
-	if err != nil {
-		jsonError(w, "not found", http.StatusNotFound)
-		return
-	}
-	rel, err := filepath.Rel(realConv, realFull)
-	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
 		jsonError(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -361,6 +350,76 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	http.ServeContent(w, r, name, info.ModTime(), f)
+}
+
+func ensureInboxConversationDir(inboxRoot, convID string) (string, error) {
+	if err := rejectSymlinkPath(inboxRoot); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(inboxRoot, 0o700); err != nil {
+		return "", err
+	}
+	if err := rejectSymlinkPath(inboxRoot); err != nil {
+		return "", err
+	}
+
+	convDir := filepath.Join(inboxRoot, convID)
+	if fi, err := os.Lstat(convDir); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("conversation dir is a symlink: %s", convDir)
+		}
+		if !fi.IsDir() {
+			return "", fmt.Errorf("conversation path is not a directory: %s", convDir)
+		}
+	} else if os.IsNotExist(err) {
+		if err := os.Mkdir(convDir, 0o700); err != nil {
+			return "", err
+		}
+	} else {
+		return "", err
+	}
+	if err := rejectSymlinkPath(convDir); err != nil {
+		return "", err
+	}
+	if _, err := resolveInboxDir(inboxRoot, convDir); err != nil {
+		return "", err
+	}
+	return convDir, nil
+}
+
+func resolveInboxFilePath(inboxRoot, convDir, fullPath string) (string, error) {
+	if err := rejectSymlinkPath(convDir); err != nil {
+		return "", err
+	}
+	realConv, err := resolveInboxDir(inboxRoot, convDir)
+	if err != nil {
+		return "", err
+	}
+	realFull, err := filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(realConv, realFull)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("file escapes conversation dir")
+	}
+	return realFull, nil
+}
+
+func resolveInboxDir(inboxRoot, convDir string) (string, error) {
+	realRoot, err := filepath.EvalSymlinks(inboxRoot)
+	if err != nil {
+		return "", err
+	}
+	realConv, err := filepath.EvalSymlinks(convDir)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(realRoot, realConv)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("conversation dir escapes inbox root")
+	}
+	return realConv, nil
 }
 
 // sanitizeFilename reduces a client-provided filename to a safe, bounded,

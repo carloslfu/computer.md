@@ -369,6 +369,9 @@ func resolveAPIKeyInput(apiKeyFlag, fromFileFlag string) (string, error) {
 		}
 		return strings.TrimSpace(string(b)), nil
 	}
+	if apiKeyFlag != "" {
+		fmt.Fprintln(os.Stderr, "warning: --api-key with a literal value is visible in shell history and process listings. Prefer VIBECRAFT_API_KEY, '--api-key -' (stdin), or '--from-file'.")
+	}
 	return strings.TrimSpace(apiKeyFlag), nil
 }
 

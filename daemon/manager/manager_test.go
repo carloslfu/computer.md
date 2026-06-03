@@ -51,6 +51,16 @@ func TestParseResponse_TextToolCallAndUsage(t *testing.T) {
 	if resp.Usage.InputTokens != 100 || resp.Usage.CacheReadInputTokens != 40 || resp.Usage.OutputTokens != 25 {
 		t.Fatalf("unexpected usage: %+v", resp.Usage)
 	}
+	if resp.Usage.TotalInputTokens() != 100 {
+		t.Fatalf("TotalInputTokens double-counted cached input: got %d", resp.Usage.TotalInputTokens())
+	}
+}
+
+func TestClientModelReportsConfiguredOverride(t *testing.T) {
+	c := NewClientWithOptions("test-key", ClientOptions{Model: "gpt-5.4"})
+	if got := c.Model(); got != "gpt-5.4" {
+		t.Fatalf("Model() = %q, want gpt-5.4", got)
+	}
 }
 
 func TestParseResponse_PreservesReasoningItemsForStatelessToolLoop(t *testing.T) {

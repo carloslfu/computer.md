@@ -59,6 +59,10 @@ type NoToolsManagerAPI interface {
 	SendNoTools(ctx context.Context, systemPrompt string, messages []managerclient.Message) (*managerclient.Response, error)
 }
 
+type ManagerModelProvider interface {
+	Model() string
+}
+
 // Screenshotter captures the current display and returns a base64-encoded
 // PNG. Extracted from *computer.ScreenshotService so tests can inject a
 // fake that returns canned image data without requiring a real X display.
@@ -221,18 +225,18 @@ func NewEngine(
 	broker EventBroker,
 ) *Engine {
 	return &Engine{
-		tasks:              tasks,
-		manager:            manager,
-		computer:           ctrl,
-		screenshot:         ss,
-		shell:              sh,
-		guardrails:         ge,
-		memory:             mem,
-		vault:              v,
-		vaultMask:          vm,
-		audit:              al,
-		prompt:             prompt,
-		broker:             broker,
+		tasks:               tasks,
+		manager:             manager,
+		computer:            ctrl,
+		screenshot:          ss,
+		shell:               sh,
+		guardrails:          ge,
+		memory:              mem,
+		vault:               v,
+		vaultMask:           vm,
+		audit:               al,
+		prompt:              prompt,
+		broker:              broker,
 		progressSteps:       make(map[string]int),
 		inputCh:             make(chan string, 1),
 		credentialsInputCh:  make(chan CredentialResponse, 1),
@@ -554,6 +558,13 @@ func (e *Engine) SubmitCredentials(taskID string, resp CredentialResponse) error
 
 		var created []string // names newly created by this submission
 		for _, v := range resp.Values {
+			fresh, err := e.tasks.GetTask(taskID)
+			if err != nil {
+				return err
+			}
+			if fresh.Status != TaskWaitingForInput {
+				return errTaskNoLongerActive
+			}
 			label := v.Label
 			if label == "" {
 				label = allowed[v.Name].Label
@@ -845,7 +856,7 @@ func (e *Engine) loop(ctx context.Context) {
 			continue
 		}
 
-		task, err := e.tasks.NextQueued()
+		task, err := e.tasks.ClaimNextQueued()
 		if err != nil {
 			log.Printf("error fetching next task: %v", err)
 			time.Sleep(2 * time.Second)
@@ -1236,6 +1247,15 @@ func clippedOneLine(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
+func (e *Engine) managerModelID() string {
+	if mp, ok := e.manager.(ManagerModelProvider); ok {
+		if model := strings.TrimSpace(mp.Model()); model != "" {
+			return model
+		}
+	}
+	return managerclient.DefaultModelID
+}
+
 // agentLoop runs the manager computer-use loop for a single task.
 // It sends messages to the manager, processes tool calls (screenshot, shell,
 // etc.), applies guardrails, and iterates until the manager produces a final
@@ -1360,6 +1380,7 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 		})
 	}
 	initMsgCount := len(apiMessages) // track initial messages for context windowing
+	modelID := e.managerModelID()
 
 	if shouldAnswerImageAttachmentDirectly(task.Instruction, convMsgs) {
 		if directManager, ok := e.manager.(NoToolsManagerAPI); ok {
@@ -1368,7 +1389,7 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 			callCancel()
 			if err == nil {
 				if e.usage != nil {
-					if recErr := e.usage.Record(managerclient.DefaultModelID, task.ConversationID, resp.Usage); recErr != nil {
+					if recErr := e.usage.Record(modelID, task.ConversationID, resp.Usage); recErr != nil {
 						log.Printf("usage: record failed for direct attachment task %s: %v", task.ID, recErr)
 					}
 				}
@@ -1403,12 +1424,10 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 			return "", fmt.Errorf("manager API error: %w", err)
 		}
 
-		// Record token consumption for the Usage panel. The model is the
-		// engine's configured default — SendComputerUse doesn't accept a
-		// per-call model override. A nil usage recorder is the test
-		// path; production always wires usage.Store at startup.
+		// Record token consumption for the Usage panel. A nil usage recorder
+		// is the test path; production always wires usage.Store at startup.
 		if e.usage != nil {
-			if err := e.usage.Record(managerclient.DefaultModelID, task.ConversationID, resp.Usage); err != nil {
+			if err := e.usage.Record(modelID, task.ConversationID, resp.Usage); err != nil {
 				// Usage tracking must never break a task. Log and continue.
 				log.Printf("engine: usage.Record(SendComputerUse): %v", err)
 			}
@@ -1559,6 +1578,25 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 	return "", fmt.Errorf("agent loop exceeded maximum iterations (%d)", maxIterations)
 }
 
+// maskToolCall returns a copy of the tool call whose input values have all
+// been run through the vault masker, so any plaintext secret that the
+// manager passed inline (or that would be resolved into the value before
+// execution) is replaced with its [SECRET_NAME] marker. The returned copy
+// is used only for audit/stream/approval rendering — never for execution.
+// The original tc is left untouched; the copy gets a fresh map so mutating
+// it can never alias back into the live call.
+func (e *Engine) maskToolCall(tc managerclient.ToolCall) managerclient.ToolCall {
+	if len(tc.Input) == 0 {
+		return tc
+	}
+	masked := make(map[string]string, len(tc.Input))
+	for k, v := range tc.Input {
+		masked[k] = e.vaultMask.Mask(v)
+	}
+	tc.Input = masked
+	return tc
+}
+
 // runToolBlock handles guardrails, optional user confirmation, and tool
 // execution for a single tool_use block. Returns a ToolResult ready to send
 // back to the manager on the next turn. The skip return is true only when the
@@ -1584,6 +1622,23 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 		return res, sk, false
 	}
 
+	// Masked view of the tool call for everything that gets PERSISTED,
+	// STREAMED, or sent OFF-MACHINE: audit Details, SSE payloads, and the
+	// approval card the user sees and that lands in the durable chat
+	// history. Tool output is already scrubbed with e.vaultMask; input was
+	// not, so a command like `curl -H "Authorization: Bearer $API_KEY"`
+	// (resolved at execution time) would otherwise leak the plaintext
+	// secret into the audit log, the SSE stream, and the platform audit
+	// sink. tcMasked replaces each input value with its [SECRET_NAME]
+	// marker; maskedInput is its rendered one-liner.
+	//
+	// The guardrail engine and the risk classifier below still receive the
+	// REAL tc — they must pattern-match the actual command to judge
+	// safety, and they neither persist nor transmit it. executeTool also
+	// uses the real tc so the resolved secret reaches the child process.
+	tcMasked := e.maskToolCall(tc)
+	maskedInput := tcMasked.InputString()
+
 	decision := e.guardrails.Evaluate(guardrails.Action{
 		Type:    tc.Name,
 		Command: tc.InputString(),
@@ -1595,7 +1650,7 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 			Action:    "action_blocked",
 			Category:  "guardrail",
 			TaskID:    task.ID,
-			Details:   fmt.Sprintf("Blocked %s: %s. Reason: %s", tc.Name, tc.InputString(), decision.Reason),
+			Details:   fmt.Sprintf("Blocked %s: %s. Reason: %s", tc.Name, maskedInput, decision.Reason),
 			RiskLevel: "high",
 		})
 		return managerclient.ToolResult{
@@ -1640,7 +1695,7 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 					Action:    "action_auto_approved",
 					Category:  "guardrail",
 					TaskID:    task.ID,
-					Details:   fmt.Sprintf("Auto-approved %s: %s. Rule: %s. Auto-review: %s", tc.Name, tc.InputString(), decision.Rule, result.Reason),
+					Details:   fmt.Sprintf("Auto-approved %s: %s. Rule: %s. Auto-review: %s", tc.Name, maskedInput, decision.Rule, result.Reason),
 					RiskLevel: "low",
 				})
 				// Surface auto-approvals inline in the chat so the
@@ -1650,9 +1705,9 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 				e.broker.Emit("task:auto_approved", map[string]interface{}{
 					"task_id":   task.ID,
 					"tool":      tc.Name,
-					"title":     humanTitle(tc.Name, tc.InputString(), decision.Rule),
+					"title":     humanTitle(tc.Name, maskedInput, decision.Rule),
 					"reason":    result.Reason,
-					"command":   tc.InputString(),
+					"command":   maskedInput,
 					"timestamp": time.Now().UTC().Format(time.RFC3339),
 				})
 				// Fall through to the normal execute path. Action runs
@@ -1667,11 +1722,17 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 			}
 		}
 
+		// Build the card from the MASKED tool call: its Command field is
+		// shown to the user and persisted into the durable chat history,
+		// so it must not carry a plaintext secret the manager passed
+		// inline. pickFriction/humanTitle operate on the masked command,
+		// which is fine — device paths and system-tree targets are not
+		// secrets and survive masking unchanged.
 		var approvalForUser ApprovalPayload
 		if classifierVerdict == guardrails.VerdictDeny {
-			approvalForUser = buildSoftDenyApproval(tc, decision, classifierReason)
+			approvalForUser = buildSoftDenyApproval(tcMasked, decision, classifierReason)
 		} else {
-			approvalForUser = buildApproval(tc, decision)
+			approvalForUser = buildApproval(tcMasked, decision)
 		}
 		// JSON is the durable form — rehydrate parses it into structured
 		// fields on the client. Plain-text is the fallback for older
@@ -1697,7 +1758,6 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 		default:
 		}
 
-		e.tasks.SetWaitingForInput(task.ID, initialApprovalJSON)
 		// Persist the approval prompt as a conversation message so it
 		// survives page reloads and lives in the durable chat history,
 		// not just on the transient task.result field. Capture the id so
@@ -1715,13 +1775,14 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 			if err := e.tasks.UpdateMessageContent(approvalMsgID, approvalJSON); err != nil {
 				log.Printf("approval: failed to embed message_id for task %s: %v", task.ID, err)
 			}
-			// Mirror onto task.result so SSE replay paints the card with
-			// the up-to-date payload (including its id).
-			e.tasks.SetWaitingForInput(task.ID, approvalJSON)
 			e.mu.Lock()
 			e.pendingApprovalMsgs[task.ID] = pendingApprovalMsg{MessageID: approvalMsgID, Payload: approvalForUser}
 			e.mu.Unlock()
 		}
+		// Mirror onto task.result only after the durable card has been
+		// prepared. Tests and clients observe waiting_for_input as the
+		// signal that the corresponding event/card is ready.
+		e.tasks.SetWaitingForInput(task.ID, approvalJSON)
 		// Clean up the registry no matter how we exit so a future
 		// approval card for the same task doesn't read stale state.
 		defer func() {
@@ -1739,7 +1800,7 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 			Action:    "action_confirmation_requested",
 			Category:  "guardrail",
 			TaskID:    task.ID,
-			Details:   fmt.Sprintf("Requested confirmation for %s: %s. Reason: %s", tc.Name, tc.InputString(), decision.Reason),
+			Details:   fmt.Sprintf("Requested confirmation for %s: %s. Reason: %s", tc.Name, maskedInput, decision.Reason),
 			RiskLevel: "medium",
 		})
 
@@ -1803,7 +1864,7 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 				Action:    "action_confirmation_timeout",
 				Category:  "guardrail",
 				TaskID:    task.ID,
-				Details:   fmt.Sprintf("Confirmation timed out after %s for %s: %s", HumanWaitTimeout, tc.Name, tc.InputString()),
+				Details:   fmt.Sprintf("Confirmation timed out after %s for %s: %s", HumanWaitTimeout, tc.Name, maskedInput),
 				RiskLevel: "medium",
 			})
 			return managerclient.ToolResult{
@@ -1845,7 +1906,7 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 					Action:    "action_overridden_with_friction",
 					Category:  "guardrail",
 					TaskID:    task.ID,
-					Details:   fmt.Sprintf("Customer overrode soft-deny (friction=%s) for %s: %s. Classifier reason: %s", approvalForUser.Friction, tc.Name, tc.InputString(), approvalForUser.Reason),
+					Details:   fmt.Sprintf("Customer overrode soft-deny (friction=%s) for %s: %s. Classifier reason: %s", approvalForUser.Friction, tc.Name, maskedInput, approvalForUser.Reason),
 					RiskLevel: "high",
 				})
 			} else {
@@ -1853,7 +1914,7 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 					Action:    "action_approved",
 					Category:  "guardrail",
 					TaskID:    task.ID,
-					Details:   fmt.Sprintf("User approved %s: %s", tc.Name, tc.InputString()),
+					Details:   fmt.Sprintf("User approved %s: %s", tc.Name, maskedInput),
 					RiskLevel: "medium",
 				})
 			}
@@ -1866,7 +1927,7 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 				Action:    action,
 				Category:  "guardrail",
 				TaskID:    task.ID,
-				Details:   fmt.Sprintf("User declined %s: %s (input: %q)", tc.Name, tc.InputString(), userInput),
+				Details:   fmt.Sprintf("User declined %s: %s (input: %q)", tc.Name, maskedInput, userInput),
 				RiskLevel: "medium",
 			})
 			return managerclient.ToolResult{
@@ -1886,7 +1947,7 @@ autoApproved:
 		Action:   "tool_executed",
 		Category: "agent",
 		TaskID:   task.ID,
-		Details:  fmt.Sprintf("%s: %s", tc.Name, tc.InputString()),
+		Details:  fmt.Sprintf("%s: %s", tc.Name, maskedInput),
 	})
 
 	if execErr != nil {

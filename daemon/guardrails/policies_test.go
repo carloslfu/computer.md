@@ -326,6 +326,50 @@ func TestFileSystemPolicy_VibecraftDirectoryBypasses(t *testing.T) {
 	runPolicy(t, p, cases)
 }
 
+func TestFileSystemPolicy_CoversCanonicalEditorTool(t *testing.T) {
+	p := &FileSystemPolicy{}
+	cases := []policyCase{
+		{
+			name:    "canonical editor blocks manager key",
+			command: `{"command":"view","path":"/etc/vibecraft/openai.key"}`,
+			toolTyp: "str_replace_based_edit_tool",
+			want:    Block,
+		},
+		{
+			name:    "canonical editor blocks daemon db",
+			command: `{"command":"view","path":"/var/lib/vibecraft/vibecraft.db"}`,
+			toolTyp: "str_replace_based_edit_tool",
+			want:    Block,
+		},
+		{
+			name:    "canonical editor confirms sensitive system path",
+			command: `{"command":"view","path":"/etc/shadow"}`,
+			toolTyp: "str_replace_based_edit_tool",
+			want:    Confirm,
+		},
+	}
+	runPolicy(t, p, cases)
+}
+
+func TestCredentialAccessPolicy_CoversCanonicalEditorTool(t *testing.T) {
+	p := &CredentialAccessPolicy{}
+	cases := []policyCase{
+		{
+			name:    "canonical editor blocks vault",
+			command: `{"command":"view","path":"/var/lib/vibecraft/vault.enc"}`,
+			toolTyp: "str_replace_based_edit_tool",
+			want:    Block,
+		},
+		{
+			name:    "canonical editor blocks encryption key",
+			command: `{"command":"view","path":"/etc/vibecraft/encryption.key"}`,
+			toolTyp: "str_replace_based_edit_tool",
+			want:    Block,
+		},
+	}
+	runPolicy(t, p, cases)
+}
+
 func TestPackageInstallPolicy_AllowsStandardInstalls(t *testing.T) {
 	// Installing common packages from configured trusted sources should
 	// be Allow — it's the single biggest source of UX friction for
@@ -414,4 +458,75 @@ func TestEngine_Evaluate_AllowWhenNoPolicyMatches(t *testing.T) {
 	if d.Action != Allow {
 		t.Fatalf("expected Allow, got %s (reason=%s)", d.Action, d.Reason)
 	}
+}
+
+// TestCustomRulePolicy_MatchScopingAndFailClosed covers the two defects
+// in CustomRulePolicy.Evaluate: (1) the pattern used to leak across the
+// command/type boundary so a command-shaped rule could fire on the bare
+// type string, and (2) an uncompilable pattern silently failed OPEN. The
+// fix matches command and type as separate fields and Blocks on a compile
+// error.
+func TestCustomRulePolicy_MatchScopingAndFailClosed(t *testing.T) {
+	t.Run("matches on command", func(t *testing.T) {
+		p := &CustomRulePolicy{rule: Rule{
+			Name: "block-secret-cat", Pattern: `cat\s+/secret`,
+			Action: string(Block), Enabled: true,
+		}}
+		d := p.Evaluate(Action{Type: "bash", Command: "cat /secret/key"})
+		if d.Action != Block {
+			t.Fatalf("command match: want Block, got %s", d.Action)
+		}
+	})
+
+	t.Run("matches on type as a separate field", func(t *testing.T) {
+		p := &CustomRulePolicy{rule: Rule{
+			Name: "confirm-all-computer", Pattern: `^computer$`,
+			Action: string(Confirm), Enabled: true,
+		}}
+		d := p.Evaluate(Action{Type: "computer", Command: "screenshot"})
+		if d.Action != Confirm {
+			t.Fatalf("type match: want Confirm, got %s", d.Action)
+		}
+	})
+
+	t.Run("command-shaped pattern does not fire when neither field matches", func(t *testing.T) {
+		// "rm" appears in neither the command nor the type, so the rule
+		// must NOT fire. Under the old code a non-matching command fell
+		// through to a second test against the type string, widening the
+		// blast radius; here both fields are checked cleanly.
+		p := &CustomRulePolicy{rule: Rule{
+			Name: "block-rm", Pattern: `\brm\b`,
+			Action: string(Block), Enabled: true,
+		}}
+		d := p.Evaluate(Action{Type: "bash", Command: "ls -la"})
+		if d.Action != Allow {
+			t.Fatalf("no-match: want Allow, got %s (rule=%s)", d.Action, d.Rule)
+		}
+	})
+
+	t.Run("disabled rule always allows", func(t *testing.T) {
+		p := &CustomRulePolicy{rule: Rule{
+			Name: "disabled", Pattern: `.*`,
+			Action: string(Block), Enabled: false,
+		}}
+		d := p.Evaluate(Action{Type: "bash", Command: "anything"})
+		if d.Action != Allow {
+			t.Fatalf("disabled rule: want Allow, got %s", d.Action)
+		}
+	})
+
+	t.Run("invalid regex fails CLOSED (Block)", func(t *testing.T) {
+		// An unparseable pattern must not silently disable the rule.
+		p := &CustomRulePolicy{rule: Rule{
+			Name: "broken", Pattern: `a(b`, // unbalanced group → compile error
+			Action: string(Confirm), Enabled: true,
+		}}
+		d := p.Evaluate(Action{Type: "bash", Command: "whatever"})
+		if d.Action != Block {
+			t.Fatalf("invalid regex must fail closed with Block, got %s", d.Action)
+		}
+		if d.Rule != "broken" {
+			t.Errorf("fail-closed decision should name the offending rule, got %q", d.Rule)
+		}
+	})
 }

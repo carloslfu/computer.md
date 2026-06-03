@@ -218,8 +218,8 @@ func (p *DNSProxy) handle(ctx context.Context, req []byte, raddr *net.UDPAddr) {
 // --- minimal DNS wire format (A records, no compression on answer) ---
 
 const (
-	rcodeNoError  = 0
-	rcodeRefused  = 5
+	rcodeNoError = 0
+	rcodeRefused = 5
 )
 
 // parseQuestion extracts the first question's name + qtype from a DNS
@@ -259,8 +259,8 @@ func buildResponse(req []byte, name string, qtype uint16, ips []net.IP, rcode by
 	out := make([]byte, 0, 512)
 	// Header: copy ID, set QR=1, RD copied, RA=1, rcode.
 	out = append(out, req[0], req[1])
-	flags1 := byte(0x80) | (req[2] & 0x01) // QR=1 + RD bit
-	out = append(out, flags1, 0x80|rcode)  // RA=1 | rcode
+	flags1 := byte(0x80) | (req[2] & 0x01)      // QR=1 + RD bit
+	out = append(out, flags1, 0x80|rcode)       // RA=1 | rcode
 	out = binary.BigEndian.AppendUint16(out, 1) // QDCOUNT
 	an := uint16(0)
 	for range ips {
@@ -288,11 +288,11 @@ func buildResponse(req []byte, name string, qtype uint16, ips []net.IP, rcode by
 		if v4 == nil {
 			continue
 		}
-		out = append(out, 0xC0, 0x0C) // name ptr -> offset 12 (question)
-		out = binary.BigEndian.AppendUint16(out, 1)   // TYPE A
-		out = binary.BigEndian.AppendUint16(out, 1)   // CLASS IN
-		out = binary.BigEndian.AppendUint32(out, 30)  // TTL 30s (short)
-		out = binary.BigEndian.AppendUint16(out, 4)   // RDLENGTH
+		out = append(out, 0xC0, 0x0C)                // name ptr -> offset 12 (question)
+		out = binary.BigEndian.AppendUint16(out, 1)  // TYPE A
+		out = binary.BigEndian.AppendUint16(out, 1)  // CLASS IN
+		out = binary.BigEndian.AppendUint32(out, 30) // TTL 30s (short)
+		out = binary.BigEndian.AppendUint16(out, 4)  // RDLENGTH
 		out = append(out, v4...)
 	}
 	_ = qnameLen

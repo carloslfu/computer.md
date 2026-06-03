@@ -5,6 +5,8 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -146,7 +148,32 @@ func restoreSnapshot(name string) error {
 	if err != nil {
 		return err
 	}
-	src := dir + "/" + name
+
+	// Path-traversal guard. --file names a snapshot INSIDE the backups
+	// directory and nothing else. Without this, a crafted --file
+	// ("../../var/lib/vibecraft/vibecraft.db", an absolute path, or any
+	// name with a slash) would let the restore read an arbitrary file and
+	// copy it over the live daemon DB. Two independent checks:
+	//   1. the name must be a bare basename (no separators, no "."/"..")
+	//   2. the cleaned join must still resolve under dir
+	// Either alone closes the hole; together they're defense in depth and
+	// give a precise error for the common "passed a path" mistake.
+	if name != filepath.Base(name) || strings.ContainsRune(name, '/') || strings.ContainsRune(name, os.PathSeparator) {
+		return fmt.Errorf("--file must be a bare snapshot name inside the backups directory, not a path: %q", name)
+	}
+	if name == "" || name == "." || name == ".." {
+		return fmt.Errorf("--file is not a valid snapshot name: %q", name)
+	}
+
+	cleanDir := filepath.Clean(dir)
+	src := filepath.Join(cleanDir, name)
+	// Belt-and-suspenders: confirm the resolved path is a direct child of
+	// the backups directory even after Clean (catches anything the
+	// basename check above might miss on edge-case inputs).
+	if filepath.Dir(src) != cleanDir {
+		return fmt.Errorf("refusing to restore from outside the backups directory: %s", src)
+	}
+
 	info, err := os.Stat(src)
 	if err != nil {
 		return fmt.Errorf("snapshot not found: %s", src)

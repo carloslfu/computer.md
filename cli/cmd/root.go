@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -98,7 +99,7 @@ Run 'vibecraft docs' for the full agent-facing reference.`,
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&flagAPIKey, "api-key", "", "API key (overrides stored config)")
+	rootCmd.PersistentFlags().StringVar(&flagAPIKey, "api-key", "", "API key (overrides stored config). Prefer VIBECRAFT_API_KEY; or '-' to read from stdin, '@file' to read from a file. A literal value is visible via 'ps'.")
 	rootCmd.PersistentFlags().StringVar(&flagMachineURL, "machine-url", "", "Machine URL (overrides stored config)")
 	rootCmd.PersistentFlags().StringVar(&flagMachineID, "machine", "", "Machine ID to use (overrides active machine)")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "JSON output (default; explicit form accepted)")
@@ -306,7 +307,10 @@ func deleteConfig() error {
 func resolveConfig() (machineURL string, apiKey string, err error) {
 	// 1. Flags + env vars take priority — the fully-headless path.
 	machineURL = flagMachineURL
-	apiKey = flagAPIKey
+	apiKey, err = resolveAPIKeyFlag(flagAPIKey)
+	if err != nil {
+		return "", "", err
+	}
 	if machineURL == "" {
 		machineURL = os.Getenv("VIBECRAFT_MACHINE_URL")
 	}
@@ -352,6 +356,52 @@ func resolveConfig() (machineURL string, apiKey string, err error) {
 
 	// Cached daemon key, or lazily broker one via the account key.
 	return daemonCredsFor(cfg, targetID)
+}
+
+// resolveAPIKeyFlag normalizes the value of the global --api-key flag.
+//
+// Passing a secret as a literal flag value leaks it into argv, where any
+// other user on the box can read it via `ps`/`/proc/<pid>/cmdline` and
+// where it lands in shell history. The preferred channel is the
+// VIBECRAFT_API_KEY env var (resolved by the caller when this returns
+// ""). For the cases where a flag is still convenient, two indirections
+// keep the secret off argv:
+//
+//	--api-key -        read the key from stdin (trailing newline trimmed)
+//	--api-key @path    read the key from the file at path
+//
+// A literal value still works for backward compatibility, but emits a
+// one-line stderr warning so the operator knows it was exposed.
+func resolveAPIKeyFlag(raw string) (string, error) {
+	switch {
+	case raw == "":
+		return "", nil
+	case raw == "-":
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", schema.Newf(schema.CodeInternal, "reading --api-key from stdin: %s", err.Error())
+		}
+		return strings.TrimRight(string(b), "\r\n"), nil
+	case strings.HasPrefix(raw, "@"):
+		path := raw[1:]
+		if path == "" {
+			return "", schema.Newf(schema.CodeValidationError,
+				"--api-key @ requires a file path (e.g. --api-key @/run/secrets/key)")
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", schema.Newf(schema.CodeValidationError,
+				"reading --api-key from file: %s", err.Error())
+		}
+		return strings.TrimSpace(string(b)), nil
+	default:
+		// Literal key on argv. Honor it, but warn once: it is visible to
+		// every process on the machine via `ps`.
+		fmt.Fprintln(os.Stderr,
+			"warning: --api-key with a literal value is visible to other users via 'ps'. "+
+				"Prefer VIBECRAFT_API_KEY, '--api-key -' (stdin), or '--api-key @file'.")
+		return raw, nil
+	}
 }
 
 // daemonCredsFor returns (machineURL, daemonKey) for one machine. It
@@ -433,19 +483,20 @@ func newClient() (*client.Client, error) {
 		return nil, err
 	}
 
-	// Refuse plain HTTP for non-loopback hosts (G1).
+	// Refuse plain HTTP for non-loopback hosts (G1). Loopback (127.0.0.1 /
+	// localhost / ::1) is always allowed; any other host over http:// is
+	// refused unless the operator sets VIBECRAFT_ALLOW_HTTP=1 — the
+	// documented escape hatch the error hint points at.
 	if strings.HasPrefix(machineURL, "http://") {
 		host := strings.TrimPrefix(machineURL, "http://")
 		if idx := strings.IndexAny(host, ":/"); idx >= 0 {
 			host = host[:idx]
 		}
-		if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		isLoopback := host == "127.0.0.1" || host == "localhost" || host == "::1"
+		if !isLoopback && os.Getenv("VIBECRAFT_ALLOW_HTTP") != "1" {
 			return nil, schema.Newf(schema.CodeValidationError,
 				"refusing plain HTTP to non-loopback host %q", host).
 				WithHint("use https:// (or override at your own risk via VIBECRAFT_ALLOW_HTTP=1)")
-		}
-		if os.Getenv("VIBECRAFT_ALLOW_HTTP") != "1" && host != "127.0.0.1" && host != "localhost" && host != "::1" {
-			// Belt and suspenders; the loopback case already returns above.
 		}
 	}
 

@@ -159,6 +159,15 @@ func (p *DangerousCommandPolicy) Description() string {
 // FileSystemPolicy guards sensitive file system paths.
 type FileSystemPolicy struct{}
 
+func isShellOrEditorAction(actionType string) bool {
+	switch actionType {
+	case "bash", "text_editor", "str_replace_based_edit_tool", "str_replace_editor":
+		return true
+	default:
+		return false
+	}
+}
+
 var sensitivePathPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`/etc/shadow`),
 	regexp.MustCompile(`/etc/passwd`),
@@ -197,7 +206,7 @@ var blockedPathPatterns = []*regexp.Regexp{
 }
 
 func (p *FileSystemPolicy) Evaluate(action Action) Decision {
-	if action.Type != "bash" && action.Type != "text_editor" {
+	if !isShellOrEditorAction(action.Type) {
 		return Decision{Action: Allow}
 	}
 
@@ -546,7 +555,7 @@ func (p *PackageInstallPolicy) Description() string {
 type CredentialAccessPolicy struct{}
 
 func (p *CredentialAccessPolicy) Evaluate(action Action) Decision {
-	if action.Type != "bash" && action.Type != "text_editor" {
+	if !isShellOrEditorAction(action.Type) {
 		return Decision{Action: Allow}
 	}
 
@@ -605,13 +614,32 @@ func (p *CustomRulePolicy) Evaluate(action Action) Decision {
 		return Decision{Action: Allow}
 	}
 
-	matched, err := regexp.MatchString(p.rule.Pattern, action.Command)
-	if err != nil || !matched {
-		// Also check the action type.
-		matched2, _ := regexp.MatchString(p.rule.Pattern, action.Type)
-		if !matched2 {
-			return Decision{Action: Allow}
+	re, err := regexp.Compile(p.rule.Pattern)
+	if err != nil {
+		// Fail CLOSED. A custom rule whose pattern won't compile must not
+		// silently allow the action it was authored to guard — the old
+		// code swallowed the compile error and fell through to Allow,
+		// which means a single malformed rule disabled itself without any
+		// signal. Block instead and name the offending rule so it gets
+		// noticed and fixed.
+		return Decision{
+			Action: Block,
+			Reason: "guardrail rule has an invalid pattern and is failing closed",
+			Rule:   p.rule.Name,
 		}
+	}
+
+	// Match the command and the action type as SEPARATE fields. The old
+	// code matched the pattern against the command and, on miss/error,
+	// re-tested the same pattern against action.Type — so a command-shaped
+	// pattern could fire on the bare type string (e.g. a rule meant for a
+	// shell command leaking onto every "text_editor" action) and an error
+	// on the command match was discarded. Evaluating each field on its own
+	// keeps the intent explicit: a rule matches when its pattern hits the
+	// command OR the action type, with no cross-contamination from a
+	// swallowed error.
+	if !re.MatchString(action.Command) && !re.MatchString(action.Type) {
+		return Decision{Action: Allow}
 	}
 
 	return Decision{

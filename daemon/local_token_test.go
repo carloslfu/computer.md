@@ -4,9 +4,12 @@ package main
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/carloslfu/computer.md/daemon/routes"
+	"github.com/carloslfu/computer.md/daemon/sandbox"
 )
 
 // Phase 0b: localhost-only data-plane endpoints require the per-machine
@@ -45,6 +48,35 @@ func TestLocalToken_DaemonTaskEnforced(t *testing.T) {
 	t.Run("non-loopback is rejected regardless of token", func(t *testing.T) {
 		w := ts.doRaw(t, "POST", "/daemon/task", "192.0.2.5:5000", body,
 			map[string]string{"Authorization": "Bearer the-local-token-abc123"})
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+func TestLocalToken_SandboxSocketPrivilegeIsAgentShellOnly(t *testing.T) {
+	ts := newTestServer(t)
+	body := `{"instruction":"task from sandbox socket"}`
+
+	doSandbox := func(id string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/daemon/task", strings.NewReader(body))
+		req.RemoteAddr = "unix"
+		req.Header.Set("Content-Type", "application/json")
+		req = req.WithContext(sandbox.ContextWithSandboxID(req.Context(), id))
+		w := httptest.NewRecorder()
+		ts.mux.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("agent shell socket remains authorized", func(t *testing.T) {
+		w := doSandbox(sandbox.AgentShellID)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("system sandbox socket is not a local token bypass", func(t *testing.T) {
+		w := doSandbox("system-invoice-triage")
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
 		}

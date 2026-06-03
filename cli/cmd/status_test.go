@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/carloslfu/computer.md/cli/client"
 	"github.com/carloslfu/computer.md/cli/output"
+	"github.com/carloslfu/computer.md/cli/schema"
 )
 
 // fakeDaemon returns an httptest.Server that answers GET /api/status with
@@ -150,5 +152,25 @@ func TestStatus_Maps5xxToServerError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "server_error") {
 		t.Errorf("expected server_error, got: %v", err)
+	}
+}
+
+func TestMapDaemonError_404UsesCallContext(t *testing.T) {
+	err := mapDaemonError(&client.APIError{StatusCode: http.StatusNotFound, Message: "missing"}, "reading file")
+	se, ok := err.(*schema.Error)
+	if !ok || se.Code != schema.CodePathNotFound {
+		t.Fatalf("file 404: got %T %v, want %s", err, err, schema.CodePathNotFound)
+	}
+
+	err = mapDaemonError(&client.APIError{StatusCode: http.StatusNotFound, Message: "missing"}, "fetching task")
+	se, ok = err.(*schema.Error)
+	if !ok || se.Code != schema.CodeValidationError {
+		t.Fatalf("task 404: got %T %v, want %s", err, err, schema.CodeValidationError)
+	}
+
+	err = mapDaemonError(&client.APIError{StatusCode: http.StatusNotFound, Message: "missing"}, "machine unreachable")
+	se, ok = err.(*schema.Error)
+	if !ok || se.Code != schema.CodeMachineNotFound {
+		t.Fatalf("machine 404: got %T %v, want %s", err, err, schema.CodeMachineNotFound)
 	}
 }

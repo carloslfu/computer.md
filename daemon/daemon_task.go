@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/google/uuid"
 	"github.com/carloslfu/computer.md/daemon/audit"
+	"github.com/google/uuid"
 )
 
 // handleDaemonTask is the localhost-only "inbox" for systems the manager
