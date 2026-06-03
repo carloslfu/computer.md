@@ -72,6 +72,30 @@ func TestUploadRejectsMissingAuth(t *testing.T) {
 	}
 }
 
+func TestUploadRejectsViewJWT(t *testing.T) {
+	ts := newTestServer(t)
+	jwt := ts.signJWTWithAccess(t, "viewer-1", "view")
+	body, ct := buildMultipart(t, "abc", map[string][]byte{"a.txt": []byte("hi")}, nil)
+	w := uploadRequest(t, ts, "Bearer "+jwt, body, ct)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUploadRejectsViewCookie(t *testing.T) {
+	ts := newTestServer(t)
+	sess := ts.handshakeCookie(t, "viewer-cookie", "Viewer", "viewer@example.com", "view", "nonce-upload-view")
+	body, ct := buildMultipart(t, "abc", map[string][]byte{"a.txt": []byte("hi")}, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/upload", body)
+	req.AddCookie(sess)
+	req.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	ts.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestUploadRejectsMissingConversationID(t *testing.T) {
 	ts := newTestServer(t)
 	jwt := ts.signJWT(t, "user-1")

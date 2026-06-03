@@ -284,19 +284,23 @@ if [ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]; then
   exit 1
 fi
 
-# Phase 6 signed releases: verify Ed25519 signature before install.
-# Present-but-invalid is fatal; absent (older manifest) → SHA256-only.
+# Signed releases: verify Ed25519 signature before install. The daemon
+# manifest must carry a signature; SHA-256 alone is not enough provenance
+# for a root-owned binary.
 SIG_URL=$(echo "$MANIFEST" | jq -r '.daemon.sig // empty')
-if [ -n "$SIG_URL" ]; then
-  curl -sfL "$SIG_URL" -o /tmp/vibecraft-daemon.sig
-  if ! openssl pkeyutl -verify -pubin -inkey /etc/vibecraft/release_pub.pem \
-       -rawin -in /tmp/vibecraft-daemon -sigfile /tmp/vibecraft-daemon.sig >/dev/null; then
-    echo "Error: Daemon release signature invalid"
-    rm -f /tmp/vibecraft-daemon /tmp/vibecraft-daemon.sig
-    exit 1
-  fi
-  rm -f /tmp/vibecraft-daemon.sig
+if [ -z "$SIG_URL" ]; then
+  echo "Error: Daemon release signature missing"
+  rm -f /tmp/vibecraft-daemon
+  exit 1
 fi
+curl -sfL "$SIG_URL" -o /tmp/vibecraft-daemon.sig
+if ! openssl pkeyutl -verify -pubin -inkey /etc/vibecraft/release_pub.pem \
+     -rawin -in /tmp/vibecraft-daemon -sigfile /tmp/vibecraft-daemon.sig >/dev/null; then
+  echo "Error: Daemon release signature invalid"
+  rm -f /tmp/vibecraft-daemon /tmp/vibecraft-daemon.sig
+  exit 1
+fi
+rm -f /tmp/vibecraft-daemon.sig
 
 mv /tmp/vibecraft-daemon /usr/local/bin/vibecraft-daemon
 chmod +x /usr/local/bin/vibecraft-daemon
@@ -444,11 +448,10 @@ if [ "$CURRENT" != "$LATEST" ]; then
     if [ "$EXPECTED" != "$ACTUAL" ]; then
         rm -f /tmp/vibecraft-daemon
     else
-        # Phase 6 signed releases: verify before swap. SHA256 stays the
-        # hard gate; signature engages only when the manifest carries
-        # `.daemon.sig` (older manifests → SHA256-only, non-bricking).
+        # Signed releases: verify before swap. SHA256 stays the
+        # integrity gate, but an absent signature now refuses the swap.
         SIG_URL=$(echo "$MANIFEST" | jq -r '.daemon.sig // empty')
-        SIG_OK=1
+        SIG_OK=0
         if [ -n "$SIG_URL" ]; then
             if curl -sfL "$SIG_URL" -o /tmp/vibecraft-daemon.sig \
                && openssl pkeyutl -verify -pubin \

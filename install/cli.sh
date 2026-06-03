@@ -80,6 +80,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+case "$PINNED_VERSION" in
+  *[!A-Za-z0-9._-]*) die "invalid version: ${PINNED_VERSION}" ;;
+esac
+
 # ---- detect platform ----
 
 uname_s="$(uname -s)"
@@ -114,6 +118,9 @@ mkdir -p "$dest_dir" 2>/dev/null || die "cannot create ${dest_dir} (try --system
 # ---- fetch manifest ----
 
 manifest_url="${INSTALL_BASE_URL}/manifest.json"
+if [ -n "$PINNED_VERSION" ]; then
+  manifest_url="${manifest_url}?version=${PINNED_VERSION}"
+fi
 note "Fetching manifest from ${manifest_url}"
 
 if command -v curl >/dev/null 2>&1; then
@@ -125,41 +132,33 @@ else
 fi
 
 manifest="$(fetch "$manifest_url")" || die "could not fetch manifest"
+manifest_compact="$(printf '%s' "$manifest" | tr -d '\n')"
 
-# ---- parse manifest (POSIX shell + python or jq fallback) ----
+# ---- parse manifest (jq if present; POSIX shell fallback) ----
 
 binary_url=""
 binary_sha=""
 version="$PINNED_VERSION"
 
-extract_field() {
-  field="$1"
-  # First try jq if available (more robust).
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$manifest" | jq -r "${field} // empty"
-    return
-  fi
-  # Fallback: grep + cut on the flat per-target object.
-  # Works because the manifest is single-line JSON for each target's url/sha.
-  # If your environment has neither jq nor a permissive grep, install jq.
-  printf '%s' "$manifest" | grep -oE "\"${field##*.}\":\s*\"[^\"]+\"" | head -1 | sed 's/.*: *"\([^"]*\)"/\1/'
-}
-
 if [ -z "$version" ]; then
   if command -v jq >/dev/null 2>&1; then
     version="$(printf '%s' "$manifest" | jq -r '.version // empty')"
   else
-    version="$(printf '%s' "$manifest" | grep -oE '"version":[^,]+' | head -1 | sed 's/.*"version":[[:space:]]*"\?\([^",]*\)"\?/\1/')"
+    version="$(printf '%s' "$manifest_compact" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
   fi
 fi
 
 if command -v jq >/dev/null 2>&1; then
   binary_url="$(printf '%s' "$manifest" | jq -r ".binaries.\"${target}\".url // empty")"
   binary_sha="$(printf '%s' "$manifest" | jq -r ".binaries.\"${target}\".sha256 // empty")"
+else
+  target_object="$(printf '%s' "$manifest_compact" | sed -n "s/.*\"${target}\"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p")"
+  binary_url="$(printf '%s' "$target_object" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  binary_sha="$(printf '%s' "$target_object" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 fi
 
 if [ -z "$binary_url" ] || [ -z "$binary_sha" ]; then
-  die "manifest missing entry for ${target}; install jq (brew install jq, apt-get install jq) and re-run"
+  die "manifest missing entry for ${target}"
 fi
 
 note "Version:  ${version}"
@@ -206,10 +205,15 @@ fi
 # without cosign therefore lose the signed-provenance proof.
 if command -v cosign >/dev/null 2>&1; then
   note "Verifying Cosign signature"
-  base="${binary_url%vibecraft-*}"
+  binary_url_no_query="${binary_url%%\?*}"
+  query=""
+  case "$binary_url" in
+    *\?*) query="?${binary_url#*\?}" ;;
+  esac
+  base="${binary_url_no_query%vibecraft-*}"
   asset_name="vibecraft-${target}"
-  sig_url="${base}${asset_name}.sig"
-  pem_url="${base}${asset_name}.pem"
+  sig_url="${base}${asset_name}.sig${query}"
+  pem_url="${base}${asset_name}.pem${query}"
   sig_tmp="${tmpdir}/cosign.sig"
   pem_tmp="${tmpdir}/cosign.pem"
   if command -v curl >/dev/null 2>&1; then

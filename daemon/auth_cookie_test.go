@@ -32,6 +32,7 @@ func (ts *testServer) signGrant(t *testing.T, sub, name, email, access, nonce st
 		"access":  access,
 		"machine": ts.machineID,
 		"nonce":   nonce,
+		"purpose": "grant",
 		"iss":     "vibecraft.so",
 		"iat":     time.Now().Unix(),
 		"exp":     time.Now().Add(30 * time.Second).Unix(),
@@ -310,6 +311,19 @@ func TestCookieOrBearer_BearerPathReadOnly(t *testing.T) {
 	ts.mux.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("bearer path: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCookieOrBearer_BearerRejectsGrantCode(t *testing.T) {
+	ts := newTestServer(t)
+	grant := ts.signGrant(t, "user-grant", "Grant User", "grant@example.com", "control", "nonce-bearer-grant")
+
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	req.Header.Set("Authorization", "Bearer "+grant)
+	w := httptest.NewRecorder()
+	ts.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("grant bearer: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

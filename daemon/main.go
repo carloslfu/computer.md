@@ -927,6 +927,12 @@ func (s *Server) validateJWTAndServe(w http.ResponseWriter, r *http.Request, tok
 		return
 	}
 
+	purpose, _ := claims["purpose"].(string)
+	if purpose == "grant" || stringClaim(claims, "nonce") != "" {
+		jsonError(w, "grant code cannot authenticate data-plane requests", http.StatusUnauthorized)
+		return
+	}
+
 	// Store the sub/access claims in the request context for downstream handlers.
 	sub, _ := claims["sub"].(string)
 	access, _ := claims["access"].(string)

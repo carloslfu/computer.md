@@ -75,6 +75,35 @@ func testEngine(t *testing.T, db *persistence.DB, manager ManagerAPI) *Engine {
 
 // --- Tests ---
 
+func TestReferencesKnownVaultSecret(t *testing.T) {
+	db := testDB(t)
+	engine := testEngine(t, db, &mockManager{fn: func(context.Context, string, []managerclient.Message) (*managerclient.Response, error) {
+		return nil, context.Canceled
+	}})
+	if err := engine.vault.Set("LOGIN_PASSWORD", "super-secret", "Login password"); err != nil {
+		t.Fatalf("vault set: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{name: "dollar name", text: "$LOGIN_PASSWORD", want: true},
+		{name: "braced name", text: "${LOGIN_PASSWORD}", want: true},
+		{name: "ordinary shell variable", text: "$HOME", want: false},
+		{name: "plain text", text: "LOGIN_PASSWORD", want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := engine.referencesKnownVaultSecret(tc.text); got != tc.want {
+				t.Fatalf("referencesKnownVaultSecret(%q) = %v, want %v", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestZombieTaskCleanupOnStart(t *testing.T) {
 	db := testDB(t)
 	tasks := NewTaskStore(db)

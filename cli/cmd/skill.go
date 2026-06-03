@@ -130,7 +130,7 @@ func doClaudeCodeSkill(uninstall bool) error {
 		return schema.Newf(schema.CodeInternal, "creating skill directory: %s", err.Error())
 	}
 
-	body := claudeCodeSkillBody()
+	body := skillBody()
 	if err := os.WriteFile(skillFile, []byte(body), 0644); err != nil {
 		return schema.Newf(schema.CodeInternal, "writing skill: %s", err.Error())
 	}
@@ -150,11 +150,12 @@ func doCodexSkill(uninstall bool) error {
 	if err != nil {
 		return schema.Newf(schema.CodeInternal, "finding home directory: %s", err.Error())
 	}
-	// Codex convention is in flux; we drop a markdown file at the most
-	// commonly-cited path. The file's content is consumed by Codex's
-	// instructions-on-startup mechanism.
-	skillDir := filepath.Join(home, ".codex", "instructions")
-	skillFile := filepath.Join(skillDir, "vibecraft.md")
+	// Codex reads the same open Agent Skills format as Claude Code:
+	// `~/.codex/skills/<name>/SKILL.md` with name/description frontmatter,
+	// discovered on startup. Same skill folder shape as the Claude Code path.
+	skillDir := filepath.Join(home, ".codex", "skills", "vibecraft")
+	skillFile := filepath.Join(skillDir, "SKILL.md")
+	llmsFile := filepath.Join(skillDir, "llms.txt")
 
 	if uninstall {
 		if _, err := os.Stat(skillFile); os.IsNotExist(err) {
@@ -164,7 +165,7 @@ func doCodexSkill(uninstall bool) error {
 				Action: "noop",
 			})
 		}
-		if err := os.Remove(skillFile); err != nil {
+		if err := os.RemoveAll(skillDir); err != nil {
 			return schema.Newf(schema.CodeInternal, "removing skill: %s", err.Error())
 		}
 		return output.Emit(schema.InstallSkillData{
@@ -178,9 +179,12 @@ func doCodexSkill(uninstall bool) error {
 		return schema.Newf(schema.CodeInternal, "creating skill directory: %s", err.Error())
 	}
 
-	body := codexSkillBody()
+	body := skillBody()
 	if err := os.WriteFile(skillFile, []byte(body), 0644); err != nil {
 		return schema.Newf(schema.CodeInternal, "writing skill: %s", err.Error())
+	}
+	if err := os.WriteFile(llmsFile, []byte(llmsTxt), 0644); err != nil {
+		return schema.Newf(schema.CodeInternal, "writing skill reference: %s", err.Error())
 	}
 
 	return output.Emit(schema.InstallSkillData{
@@ -190,7 +194,11 @@ func doCodexSkill(uninstall bool) error {
 	})
 }
 
-func claudeCodeSkillBody() string {
+// skillBody is the one cross-agent Agent Skill body — the open SKILL.md format
+// (name/description frontmatter + markdown), identical for Claude Code and Codex.
+// It is a thin pointer at `vibecraft docs` / the llms.txt sidecar, never an
+// inlined copy, so it cannot drift from the CLI's own reference.
+func skillBody() string {
 	return fmt.Sprintf(`---
 name: vibecraft
 description: Drive a VibeCraft agentic computer via its CLI. Run 'vibecraft docs' for the full reference, or read https://www.vibecraft.so/llms.txt.
@@ -209,8 +217,8 @@ strings; exit codes signal task outcome (0/1/2/3/4).
 vibecraft docs
 %[2]s
 
-The reference lives at %[1]s/Users/<you>/.claude/skills/vibecraft/llms.txt%[1]s and
-%[1]shttps://www.vibecraft.so/llms.txt%[1]s — same content, two locations.
+The reference lives in %[1]sllms.txt%[1]s next to this skill, and at
+%[1]shttps://www.vibecraft.so/llms.txt%[1]s — same content.
 
 ## Cheat sheet (most common moves)
 
@@ -268,30 +276,4 @@ surface to the human:
 > "I tried %[1]svibecraft <cmd>%[1]s on %[1]s<machine>%[1]s and got %[1]s<error_code>%[1]s. Suggested next step:
 > %[1]s<hint>%[1]s. Should I %[1]s<hint>%[1]s or do you want to handle it?"
 `, "`", "```")
-}
-
-func codexSkillBody() string {
-	return fmt.Sprintf(`# VibeCraft CLI (Codex tool reference)
-
-You have the %[1]svibecraft%[1]s binary on PATH. It is the agent-native interface to
-a customer's VibeCraft computer.
-
-Run %[1]svibecraft docs%[1]s to see the full reference. Same content lives at
-https://www.vibecraft.so/llms.txt.
-
-Quick orientation:
-
-- JSON envelope on stdout; %[1]s{"v":1,"ok":true,"data":{...}}%[1]s.
-- Errors on stderr with stable %[1]scode%[1]s strings.
-- Streams emit JSON Lines.
-- Exit codes: 0 ok, 1 CLI error, 2 task failed, 3 task needs input, 4 cancelled.
-- Auth: run %[1]svibecraft auth login%[1]s once (one browser approval authorizes
-  every machine on the account). Headless: set %[1]sVIBECRAFT_ACCOUNT_KEY%[1]s, or a
-  single machine's %[1]sVIBECRAFT_MACHINE_URL%[1]s + %[1]sVIBECRAFT_API_KEY%[1]s.
-- %[1]svibecraft machine list%[1]s shows every machine; %[1]s--machine <id>%[1]s targets one,
-  %[1]s--machine all%[1]s fans out.
-
-Most common commands: %[1]stask submit / respond / wait / get / messages / stream%[1]s,
-%[1]sstatus%[1]s, %[1]smachine list%[1]s, %[1]sauth login%[1]s.
-`, "`")
 }

@@ -2313,11 +2313,20 @@ func (e *Engine) executeComputerTool(ctx context.Context, tc managerclient.ToolC
 
 	case "type":
 		text, _ := tc.Input["text"]
-		// Resolve vault references.
-		resolved := e.vault.ResolveReferences(text)
+		// Resolve vault references. If a real vault entry was injected,
+		// do not return the automatic post-type screenshot: pixels cannot be
+		// vault-masked, and the target field might visibly contain the secret.
+		typedVaultSecret := e.referencesKnownVaultSecret(text)
+		resolved := text
+		if e.vault != nil {
+			resolved = e.vault.ResolveReferences(text)
+		}
 		err := e.computer.TypeText(resolved)
 		if err != nil {
 			return nil, err
+		}
+		if typedVaultSecret {
+			return &ToolExecResult{Content: "Text typed. Automatic screenshot suppressed because the typed text included a vault secret reference."}, nil
 		}
 		time.Sleep(200 * time.Millisecond)
 		imgData, _ := e.screenshot.CaptureBase64(ctx)
@@ -2364,6 +2373,18 @@ func (e *Engine) executeComputerTool(ctx context.Context, tc managerclient.ToolC
 	default:
 		return nil, fmt.Errorf("unknown computer action: %s", action)
 	}
+}
+
+func (e *Engine) referencesKnownVaultSecret(text string) bool {
+	if e.vault == nil {
+		return false
+	}
+	for _, name := range vault.ExtractReferences(text) {
+		if _, ok := e.vault.Get(name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // SetAgentShell installs the long-lived agent-shell sandbox as the

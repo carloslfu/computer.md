@@ -107,6 +107,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireControl(w, r) {
+		return
+	}
 
 	// Cap the body up front so a rogue client can't exhaust memory by
 	// streaming gigabytes — Go's multipart reader won't help here because
