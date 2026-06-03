@@ -39,6 +39,8 @@ const releasePublicKeyPEM = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA+Lcb8IpwuZjZHh6FddfgliKbupMfUSXv4PKCSjBn5mw=
 -----END PUBLIC KEY-----`
 
+var releasePublicKeyPEMForVerification = releasePublicKeyPEM
+
 // releaseSignatureURL returns the URL of a binary's detached Ed25519
 // signature. release.yml uploads it next to every binary as
 // vibecraft-<target>.ed25519.sig — the .exe suffix (Windows) is dropped
@@ -76,7 +78,7 @@ func verifyReleaseSignature(binaryPath, binaryURL string) error {
 
 // parseReleasePublicKey decodes the pinned Ed25519 public key.
 func parseReleasePublicKey() (ed25519.PublicKey, error) {
-	block, _ := pem.Decode([]byte(releasePublicKeyPEM))
+	block, _ := pem.Decode([]byte(releasePublicKeyPEMForVerification))
 	if block == nil {
 		return nil, schema.Newf(schema.CodeInternal, "pinned release key is not valid PEM")
 	}
@@ -97,7 +99,7 @@ func fetchReleaseSignature(sigURL string) ([]byte, error) {
 		return nil, schema.Newf(schema.CodeValidationError,
 			"refusing non-HTTPS signature URL: %s", sigURL)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := updateHTTPClient(30 * time.Second)
 	req, err := http.NewRequest("GET", sigURL, nil)
 	if err != nil {
 		return nil, schema.Newf(schema.CodeInternal, "creating request: %s", err.Error())

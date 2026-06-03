@@ -54,6 +54,22 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# The current Connected/BYOM machine image is Linux amd64 only. The
+# daemon updater manifest serves a linux-amd64 binary, supercronic is
+# pinned to linux-amd64, and Google Chrome's Linux repo used below only
+# provides the browser shape this stack depends on for amd64 hosts.
+# Fail early on arm64/other hosts instead of installing a half-working
+# machine that cannot run the released daemon/browser stack.
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64|amd64) ;;
+  *)
+    echo "Error: Connected/BYOM install currently supports Linux x86_64/amd64 only (detected: $ARCH)." >&2
+    echo "The released daemon/browser stack is amd64-only; use an x86_64 Ubuntu host for now." >&2
+    exit 1
+    ;;
+esac
+
 # Check Ubuntu version
 if command -v lsb_release &>/dev/null; then
   DISTRO=$(lsb_release -is 2>/dev/null || echo "unknown")
@@ -226,7 +242,7 @@ chmod 700 /etc/vibecraft
 # updater to verify the daemon's Ed25519 signature before any swap.
 cat > /etc/vibecraft/release_pub.pem << 'PUBEOF'
 -----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA+Lcb8IpwuZjZHh6FddfgliKbupMfUSXv4PKCSjBn5mw=
+MCowBQYDK2VwAyEAhteWVbSpt50y4gcb79L8gU1F+uWld3CO1JM91nCfLB0=
 -----END PUBLIC KEY-----
 PUBEOF
 chmod 644 /etc/vibecraft/release_pub.pem

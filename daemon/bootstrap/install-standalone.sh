@@ -106,12 +106,16 @@ chmod 0644 /etc/vibecraft/manager_model
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64)  GOARCH=amd64 ;;
-  aarch64) GOARCH=arm64 ;;
-  *)       echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
+  amd64)   GOARCH=amd64 ;;
+  *)
+    echo "install-standalone.sh: Linux x86_64/amd64 only for now (detected: $ARCH)" >&2
+    echo "The current release publishes vibecraft-daemon-linux-amd64 only." >&2
+    exit 1
+    ;;
 esac
 
 if [ "$DAEMON_VERSION" = "latest" ]; then
-  echo "Pinning to a specific tag — set --version cli-vX.Y.Z to override."
+  echo "Pinning to a specific tag — set --version vX.Y.Z to override."
   DAEMON_VERSION="$(curl -fsSL https://api.github.com/repos/carloslfu/computer.md/releases/latest | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
 fi
 
@@ -154,5 +158,5 @@ echo ""
 echo "Next steps:"
 echo "  - Visit http://${BIND_ADDR}:${DAEMON_PORT} to authenticate (first-run token)"
 echo "  - Install xterm + chromium + xdotool + xvfb if you want browser tooling"
-echo "  - Update: sudo $0 --version cli-vX.Y.Z"
+echo "  - Update: sudo $0 --version vX.Y.Z"
 echo "  - Logs:   journalctl -u vibecraft-daemon -f"

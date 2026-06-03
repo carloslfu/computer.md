@@ -164,8 +164,14 @@ func TestMapDaemonError_404UsesCallContext(t *testing.T) {
 
 	err = mapDaemonError(&client.APIError{StatusCode: http.StatusNotFound, Message: "missing"}, "fetching task")
 	se, ok = err.(*schema.Error)
-	if !ok || se.Code != schema.CodeValidationError {
-		t.Fatalf("task 404: got %T %v, want %s", err, err, schema.CodeValidationError)
+	if !ok || se.Code != schema.CodeTaskNotFound {
+		t.Fatalf("task 404: got %T %v, want %s", err, err, schema.CodeTaskNotFound)
+	}
+
+	err = mapDaemonError(&client.APIError{StatusCode: http.StatusBadRequest, Message: "task not found"}, "responding to task")
+	se, ok = err.(*schema.Error)
+	if !ok || se.Code != schema.CodeTaskNotFound {
+		t.Fatalf("task 400 not found: got %T %v, want %s", err, err, schema.CodeTaskNotFound)
 	}
 
 	err = mapDaemonError(&client.APIError{StatusCode: http.StatusNotFound, Message: "missing"}, "machine unreachable")

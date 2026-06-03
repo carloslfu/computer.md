@@ -21,6 +21,12 @@ var (
 	flagFilesCat    bool
 )
 
+const (
+	filesJSONCatLimit = 64 << 20
+	filesPullLimit    = 64 << 20
+	filesUploadLimit  = 25 << 20
+)
+
 var filesCmd = &cobra.Command{
 	Use:   "files",
 	Short: "Move files between your machine and the local box",
@@ -129,10 +135,11 @@ func runFilesCat(cmd *cobra.Command, args []string) error {
 		_, err := io.Copy(os.Stdout, body)
 		return err
 	}
-	buf := &bytes.Buffer{}
-	if _, err := io.Copy(buf, io.LimitReader(body, 64<<20)); err != nil {
-		return schema.Newf(schema.CodeInternal, "reading body: %s", err.Error())
+	b, err := readAllWithLimit(body, filesJSONCatLimit)
+	if err != nil {
+		return err
 	}
+	buf := bytes.NewBuffer(b)
 	return output.Emit(map[string]any{
 		"path":     args[0],
 		"size":     buf.Len(),
@@ -171,9 +178,11 @@ func runFilesPull(cmd *cobra.Command, args []string) error {
 		return schema.Newf(schema.CodeInternal, "opening %s: %s", abs, err.Error())
 	}
 	defer f.Close()
-	written, err := io.Copy(f, io.LimitReader(body, 64<<20))
+	written, err := copyWithLimit(f, body, filesPullLimit)
 	if err != nil {
-		return schema.Newf(schema.CodeInternal, "writing file: %s", err.Error())
+		_ = f.Close()
+		_ = os.Remove(abs)
+		return err
 	}
 	return output.Emit(schema.FilesPullData{
 		RemotePath: remote,
@@ -209,9 +218,9 @@ func runFilesPush(cmd *cobra.Command, args []string) error {
 			return schema.Newf(schema.CodeValidationError,
 				"with stdin push, remote must include a filename, not just a directory")
 		}
-		b, err := io.ReadAll(io.LimitReader(os.Stdin, 64<<20))
+		b, err := readAllWithLimit(os.Stdin, filesUploadLimit)
 		if err != nil {
-			return schema.Newf(schema.CodeInternal, "reading stdin: %s", err.Error())
+			return err
 		}
 		content = bytes.NewReader(b)
 		size = int64(len(b))
@@ -231,10 +240,9 @@ func runFilesPush(cmd *cobra.Command, args []string) error {
 				"directory upload not supported yet").
 				WithHint("tar | vibecraft files push - is the workaround")
 		}
-		const maxLocal = 25 << 20
-		if info.Size() > maxLocal {
+		if info.Size() > filesUploadLimit {
 			return schema.Newf(schema.CodeFileTooLarge,
-				"file exceeds %d byte cap (daemon /api/upload limit)", maxLocal)
+				"file exceeds %d byte cap (daemon /api/upload limit)", filesUploadLimit)
 		}
 		content = f
 		size = info.Size()
@@ -261,6 +269,32 @@ func runFilesPush(cmd *cobra.Command, args []string) error {
 		Bytes:      size,
 		Original:   name,
 	})
+}
+
+func readAllWithLimit(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, schema.Newf(schema.CodeInternal, "reading body: %s", err.Error())
+	}
+	if int64(len(b)) > limit {
+		return nil, schema.Newf(schema.CodeFileTooLarge,
+			"input exceeds %d byte cap", limit).
+			WithHint("use a smaller file or split the transfer")
+	}
+	return b, nil
+}
+
+func copyWithLimit(dst io.Writer, src io.Reader, limit int64) (int64, error) {
+	written, err := io.Copy(dst, io.LimitReader(src, limit+1))
+	if err != nil {
+		return written, schema.Newf(schema.CodeInternal, "writing file: %s", err.Error())
+	}
+	if written > limit {
+		return written, schema.Newf(schema.CodeFileTooLarge,
+			"download exceeds %d byte cap", limit).
+			WithHint("use a smaller file or split the transfer")
+	}
+	return written, nil
 }
 
 func validateInboxPushRemote(localArg, remote string) error {

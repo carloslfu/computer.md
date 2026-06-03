@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/hex"
 	"os"
 	"strings"
 	"testing"
@@ -43,5 +44,25 @@ func TestResolveAPIKeyInputWarnsOnLiteralFlag(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "visible in shell history") {
 		t.Fatalf("stderr missing warning: %q", stderr)
+	}
+}
+
+func TestNewAuthCallbackStateIsRandomHex(t *testing.T) {
+	a, err := newAuthCallbackState()
+	if err != nil {
+		t.Fatalf("newAuthCallbackState: %v", err)
+	}
+	b, err := newAuthCallbackState()
+	if err != nil {
+		t.Fatalf("newAuthCallbackState: %v", err)
+	}
+	if len(a) != 32 || len(b) != 32 {
+		t.Fatalf("state lengths = %d/%d, want 32/32", len(a), len(b))
+	}
+	if _, err := hex.DecodeString(a); err != nil {
+		t.Fatalf("state is not hex: %v", err)
+	}
+	if a == b {
+		t.Fatalf("two auth callback states matched: %s", a)
 	}
 }

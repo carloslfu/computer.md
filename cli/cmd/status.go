@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -77,9 +78,11 @@ func mapDaemonError(err error, defaultMessage string) error {
 	if errors.As(err, &apiErr) {
 		switch apiErr.StatusCode {
 		case 400, 409, 422:
+			if isTaskNotFoundContext(defaultMessage, apiErr.Message, apiErr.StatusCode) {
+				return schema.Newf(schema.CodeTaskNotFound, "%s", apiErr.Error())
+			}
 			// The daemon rejected the request as malformed / not
-			// applicable (bad body, unknown task id — several daemon
-			// handlers 400 for "task not found", a stale state, etc.).
+			// applicable (bad body, stale state, etc.).
 			// That's a caller error: validation_error, not internal_error.
 			return schema.Newf(schema.CodeValidationError, "%s", apiErr.Error())
 		case 401:
@@ -90,6 +93,9 @@ func mapDaemonError(err error, defaultMessage string) error {
 		case 404:
 			if isPathNotFoundContext(defaultMessage) {
 				return schema.Newf(schema.CodePathNotFound, "%s", apiErr.Error())
+			}
+			if isTaskNotFoundContext(defaultMessage, apiErr.Message, apiErr.StatusCode) {
+				return schema.Newf(schema.CodeTaskNotFound, "%s", apiErr.Error())
 			}
 			if defaultMessage != "machine unreachable" && defaultMessage != "version probe" {
 				return schema.Newf(schema.CodeValidationError, "%s", apiErr.Error())
@@ -114,4 +120,13 @@ func isPathNotFoundContext(defaultMessage string) bool {
 		}
 	}
 	return false
+}
+
+func isTaskNotFoundContext(defaultMessage, apiMessage string, statusCode int) bool {
+	ctx := strings.ToLower(defaultMessage)
+	if statusCode == http.StatusNotFound && strings.Contains(ctx, "task") {
+		return true
+	}
+	msg := strings.ToLower(defaultMessage + " " + apiMessage)
+	return strings.Contains(msg, "task") && strings.Contains(msg, "not found")
 }

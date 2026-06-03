@@ -4,6 +4,8 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -179,16 +181,24 @@ func runAuthLoginBrowser(cmd *cobra.Command, args []string) error {
 		return schema.Newf(schema.CodeInternal, "starting local server: %s", err.Error())
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
+	state, err := newAuthCallbackState()
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
 
 	resultCh := make(chan string, 1) // the account key
 	errCh := make(chan error, 1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("state"); got != state {
+			http.Error(w, "Invalid callback state", http.StatusBadRequest)
+			return
+		}
 		accountKey := r.URL.Query().Get("account_key")
 		if accountKey == "" {
 			http.Error(w, "Missing account_key", http.StatusBadRequest)
-			errCh <- schema.Newf(schema.CodeInternal, "callback missing account_key")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html")
@@ -203,7 +213,7 @@ func runAuthLoginBrowser(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	browserURL := fmt.Sprintf("%s/cli-auth?port=%d&mode=account", platformBase(), port)
+	browserURL := fmt.Sprintf("%s/cli-auth?port=%d&mode=account&state=%s", platformBase(), port, state)
 
 	if output.CurrentMode() == output.ModeText {
 		fmt.Fprintf(os.Stderr, "Opening browser to authenticate your VibeCraft account...\n")
@@ -268,6 +278,14 @@ func runAuthLoginBrowser(cmd *cobra.Command, args []string) error {
 	}
 
 	return output.Emit(out)
+}
+
+func newAuthCallbackState() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", schema.Newf(schema.CodeInternal, "creating auth callback state: %s", err.Error())
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func runAuthLogout(cmd *cobra.Command, args []string) error {

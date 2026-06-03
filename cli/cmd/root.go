@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/carloslfu/computer.md/cli/client"
 	"github.com/carloslfu/computer.md/cli/output"
 	"github.com/carloslfu/computer.md/cli/schema"
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -306,6 +306,9 @@ func deleteConfig() error {
 //     single `auth login` reach every machine — no per-machine login.
 func resolveConfig() (machineURL string, apiKey string, err error) {
 	// 1. Flags + env vars take priority — the fully-headless path.
+	machineURLProvided := flagMachineURL != "" || os.Getenv("VIBECRAFT_MACHINE_URL") != ""
+	apiKeyProvided := flagAPIKey != "" || os.Getenv("VIBECRAFT_API_KEY") != ""
+
 	machineURL = flagMachineURL
 	apiKey, err = resolveAPIKeyFlag(flagAPIKey)
 	if err != nil {
@@ -319,6 +322,11 @@ func resolveConfig() (machineURL string, apiKey string, err error) {
 	}
 	if machineURL != "" && apiKey != "" {
 		return machineURL, apiKey, nil
+	}
+	if machineURLProvided || apiKeyProvided {
+		return "", "", schema.Newf(schema.CodeValidationError,
+			"partial explicit credentials: machine URL and API key must be provided together").
+			WithHint("set both VIBECRAFT_MACHINE_URL and VIBECRAFT_API_KEY, or pass both --machine-url and --api-key")
 	}
 
 	cfg, loadErr := loadConfig()
@@ -533,7 +541,11 @@ func versionHandshake(c *client.Client) error {
 		return versionHandshakeErr
 	}
 	versionHandshakeDone = true
+	versionHandshakeErr = checkClientVersion(c)
+	return versionHandshakeErr
+}
 
+func checkClientVersion(c *client.Client) error {
 	v, err := c.GetVersion()
 	if err != nil {
 		// Pre-handshake daemon returns 404; treat that as "speaks v1
@@ -545,7 +557,6 @@ func versionHandshake(c *client.Client) error {
 		}
 		// Network errors at this point mean the machine itself is
 		// unreachable — surface cleanly.
-		versionHandshakeErr = err
 		return mapDaemonError(err, "version probe")
 	}
 	for _, sv := range v.SchemaVersions {
@@ -553,11 +564,10 @@ func versionHandshake(c *client.Client) error {
 			return nil
 		}
 	}
-	versionHandshakeErr = schema.Newf(
+	return schema.Newf(
 		schema.CodeSchemaUnsupported,
 		"daemon speaks schema_versions=%v but CLI requires %d", v.SchemaVersions, schema.Version,
 	).WithHint("run 'vibecraft update' to get a compatible CLI")
-	return versionHandshakeErr
 }
 
 // maskKey returns a masked version of the API key for display.

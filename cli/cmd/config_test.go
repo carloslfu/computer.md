@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/carloslfu/computer.md/cli/schema"
 )
 
 // TestConfigLegacyMigration verifies the single-machine legacy config
@@ -117,6 +119,34 @@ func TestValidateAPIKey(t *testing.T) {
 				t.Errorf("validateAPIKey(%q) = nil, want err", tc.key)
 			}
 		})
+	}
+}
+
+func TestResolveConfigRejectsPartialExplicitCredentials(t *testing.T) {
+	oldMachineURL := flagMachineURL
+	oldAPIKey := flagAPIKey
+	t.Cleanup(func() {
+		flagMachineURL = oldMachineURL
+		flagAPIKey = oldAPIKey
+	})
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("VIBECRAFT_MACHINE_URL", "")
+	t.Setenv("VIBECRAFT_API_KEY", "vc_machine_env_only_key_12345")
+	flagMachineURL = ""
+	flagAPIKey = ""
+
+	_, _, err := resolveConfig()
+	se, ok := err.(*schema.Error)
+	if !ok || se.Code != schema.CodeValidationError {
+		t.Fatalf("resolveConfig with api key only: got %T %v, want %s", err, err, schema.CodeValidationError)
+	}
+
+	t.Setenv("VIBECRAFT_MACHINE_URL", "https://vc-test.vc.vibecraft.so")
+	t.Setenv("VIBECRAFT_API_KEY", "")
+	_, _, err = resolveConfig()
+	se, ok = err.(*schema.Error)
+	if !ok || se.Code != schema.CodeValidationError {
+		t.Fatalf("resolveConfig with machine url only: got %T %v, want %s", err, err, schema.CodeValidationError)
 	}
 }
 

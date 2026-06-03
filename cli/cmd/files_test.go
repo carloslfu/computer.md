@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -84,5 +85,22 @@ func TestValidateInboxPushRemote(t *testing.T) {
 				t.Fatalf("error: got %T %v, want code %s", err, err, tt.wantCode)
 			}
 		})
+	}
+}
+
+func TestReadAllWithLimitRejectsOverflow(t *testing.T) {
+	_, err := readAllWithLimit(strings.NewReader("abcd"), 3)
+	se, ok := err.(*schema.Error)
+	if !ok || se.Code != schema.CodeFileTooLarge {
+		t.Fatalf("readAllWithLimit overflow: got %T %v, want %s", err, err, schema.CodeFileTooLarge)
+	}
+}
+
+func TestCopyWithLimitRejectsOverflow(t *testing.T) {
+	var dst bytes.Buffer
+	_, err := copyWithLimit(&dst, strings.NewReader("abcd"), 3)
+	se, ok := err.(*schema.Error)
+	if !ok || se.Code != schema.CodeFileTooLarge {
+		t.Fatalf("copyWithLimit overflow: got %T %v, want %s", err, err, schema.CodeFileTooLarge)
 	}
 }

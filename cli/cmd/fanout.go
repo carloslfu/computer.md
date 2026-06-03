@@ -33,9 +33,9 @@ import (
 // parallel processes. If demand surfaces, add the streaming form here.
 
 var (
-	flagFanoutMaxConc     int
-	flagFanoutPerMachine  time.Duration
-	flagFanoutOrdered     bool
+	flagFanoutMaxConc    int
+	flagFanoutPerMachine time.Duration
+	flagFanoutOrdered    bool
 )
 
 // matchMachines returns the set of machines that match the --machine
@@ -217,6 +217,19 @@ func runFanout(machines []string, workFn fanoutCallable) error {
 				// Per-machine timeout.
 				if flagFanoutPerMachine > 0 {
 					c.HTTPClient.Timeout = flagFanoutPerMachine
+				}
+				if err := checkClientVersion(c); err != nil {
+					var se *schema.Error
+					if errors.As(err, &se) {
+						results <- result{Machine: id, Err: se, Code: exit.CLIError}
+					} else {
+						results <- result{
+							Machine: id,
+							Err:     schema.Newf(schema.CodeInternal, "%s", err.Error()),
+							Code:    exit.CLIError,
+						}
+					}
+					continue
 				}
 				data, code, err := workFn(id, c)
 				r := result{Machine: id, Data: data, Code: code}

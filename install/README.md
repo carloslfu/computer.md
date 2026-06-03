@@ -29,6 +29,8 @@ Self-update path: `vibecraft self-update`.
 Installs the `vibecraft-daemon` on a customer-owned machine that
 registers with the VibeCraft platform (shape 2: Connected). Uses a
 one-time registration token + machine id minted by the platform.
+Current support is Linux x86_64/amd64 only; the installer exits early
+on other architectures until the daemon/browser stack is released there.
 
 ```bash
 # The platform's BYOM "Add machine" flow generates this command for you:
@@ -43,6 +45,8 @@ curl -fsSL https://www.vibecraft.so/install.sh | sudo bash -s -- \
 Installs the `vibecraft-daemon` for shape 1 (pure self-host, no
 platform integration). No registration token, no machine id, no
 auto-update timer, no platform calls.
+Current support is Linux x86_64/amd64 only, matching the released
+`vibecraft-daemon-linux-amd64` binary.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/carloslfu/computer.md/main/daemon/bootstrap/install-standalone.sh \

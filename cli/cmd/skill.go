@@ -106,6 +106,7 @@ func doClaudeCodeSkill(uninstall bool) error {
 	}
 	skillDir := filepath.Join(home, ".claude", "skills", "vibecraft")
 	skillFile := filepath.Join(skillDir, "SKILL.md")
+	llmsFile := filepath.Join(skillDir, "llms.txt")
 
 	if uninstall {
 		if _, err := os.Stat(skillFile); os.IsNotExist(err) {
@@ -132,6 +133,9 @@ func doClaudeCodeSkill(uninstall bool) error {
 	body := claudeCodeSkillBody()
 	if err := os.WriteFile(skillFile, []byte(body), 0644); err != nil {
 		return schema.Newf(schema.CodeInternal, "writing skill: %s", err.Error())
+	}
+	if err := os.WriteFile(llmsFile, []byte(llmsTxt), 0644); err != nil {
+		return schema.Newf(schema.CodeInternal, "writing skill reference: %s", err.Error())
 	}
 
 	return output.Emit(schema.InstallSkillData{

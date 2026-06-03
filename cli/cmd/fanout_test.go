@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/carloslfu/computer.md/cli/output"
+	"github.com/carloslfu/computer.md/cli/schema"
 )
 
 // TestMatchMachines covers the --machine selector grammar (A12).
@@ -24,17 +25,17 @@ func TestMatchMachines(t *testing.T) {
 	cfg := &Config{
 		ActiveMachine: "vc-a",
 		Machines: map[string]MachineConfig{
-			"vc-a":    {URL: "https://vc-a.vc.vibecraft.so", APIKey: "vc_machine_a_test_a_a_a"},
-			"vc-b":    {URL: "https://vc-b.vc.vibecraft.so", APIKey: "vc_machine_b_test_b_b_b"},
-			"prod-x":  {URL: "https://prod-x.vc.vibecraft.so", APIKey: "vc_machine_x_test_x_x_x"},
+			"vc-a":   {URL: "https://vc-a.vc.vibecraft.so", APIKey: "vc_machine_a_test_a_a_a"},
+			"vc-b":   {URL: "https://vc-b.vc.vibecraft.so", APIKey: "vc_machine_b_test_b_b_b"},
+			"prod-x": {URL: "https://prod-x.vc.vibecraft.so", APIKey: "vc_machine_x_test_x_x_x"},
 		},
 	}
 
 	cases := []struct {
-		name   string
-		sel    string
-		want   []string
-		err    bool
+		name string
+		sel  string
+		want []string
+		err  bool
 	}{
 		{"empty → active", "", []string{"vc-a"}, false},
 		{"single id", "vc-b", []string{"vc-b"}, false},
@@ -102,11 +103,20 @@ func TestMatchMachinesEnvVarAccountKey(t *testing.T) {
 func TestFanoutStatusLive(t *testing.T) {
 	srvOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/version" {
+			fmt.Fprintf(w, `{"schema_versions":[%d]}`, schema.Version)
+			return
+		}
 		fmt.Fprint(w, `{"status":"healthy","machine_id":"vc-ok","uptime":1}`)
 	}))
 	defer srvOK.Close()
 	var failHits int32
 	srvFail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/version" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"schema_versions":[%d]}`, schema.Version)
+			return
+		}
 		atomic.AddInt32(&failHits, 1)
 		http.Error(w, `{"error":"oops"}`, http.StatusInternalServerError)
 	}))
@@ -150,5 +160,44 @@ func TestFanoutStatusLive(t *testing.T) {
 	// error, so the worst is exit.CLIError=1).
 	if runErr == nil {
 		t.Errorf("expected error from worst-machine; got nil")
+	}
+}
+
+func TestFanoutStatusRefusesUnsupportedDaemonSchema(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/version" {
+			fmt.Fprint(w, `{"schema_versions":[999]}`)
+			return
+		}
+		fmt.Fprint(w, `{"status":"healthy","machine_id":"vc-old","uptime":1}`)
+	}))
+	defer srv.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".config", "vibecraft")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgJSON := fmt.Sprintf(`{"active_machine":"vc-old","machines":{
+		"vc-old": {"url":"%s","api_key":"vc_machine_old_test_old_old"}
+	}}`, srv.URL)
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	withOutputMode(t, output.ModeJSON)
+	prev := flagMachineID
+	flagMachineID = "all"
+	t.Cleanup(func() { flagMachineID = prev })
+
+	got, runErr := captureStdout(t, func() error { return runStatus(statusCmd, nil) })
+	if runErr == nil {
+		t.Fatalf("expected fanout schema error, got nil")
+	}
+	if !strings.Contains(got, schema.CodeSchemaUnsupported) {
+		t.Fatalf("output missing schema_unsupported:\n%s", got)
 	}
 }

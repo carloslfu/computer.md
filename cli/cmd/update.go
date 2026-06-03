@@ -27,6 +27,18 @@ var (
 	flagUpdateCheck   bool
 )
 
+var updateHTTPClient = func(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout}
+}
+
+var (
+	updateExecutablePath = os.Executable
+	updateEvalSymlinks   = filepath.EvalSymlinks
+	updateChmod          = os.Chmod
+	updateRename         = os.Rename
+	updateWriteFile      = os.WriteFile
+)
+
 // defaultUpdateBaseURL is the manifest base used both by the `update`
 // command (the --base-url default) and the background auto-updater.
 const defaultUpdateBaseURL = "https://www.vibecraft.so/install"
@@ -123,11 +135,11 @@ func selfUpdate(baseURL string, check bool) (schema.UpdateData, error) {
 		}, nil
 	}
 
-	currentBin, err := os.Executable()
+	currentBin, err := updateExecutablePath()
 	if err != nil {
 		return schema.UpdateData{}, schema.Newf(schema.CodeInternal, "finding own path: %s", err.Error())
 	}
-	currentBin, err = filepath.EvalSymlinks(currentBin)
+	currentBin, err = updateEvalSymlinks(currentBin)
 	if err != nil {
 		return schema.UpdateData{}, schema.Newf(schema.CodeInternal, "resolving own path: %s", err.Error())
 	}
@@ -148,14 +160,14 @@ func selfUpdate(baseURL string, check bool) (schema.UpdateData, error) {
 		return schema.UpdateData{}, err
 	}
 
-	if err := os.Chmod(tmpBin, 0755); err != nil {
+	if err := updateChmod(tmpBin, 0755); err != nil {
 		_ = os.Remove(tmpBin)
 		return schema.UpdateData{}, schema.Newf(schema.CodeInternal, "chmod new binary: %s", err.Error())
 	}
 
 	if runtime.GOOS == "windows" {
 		sentinel := currentBin + ".pending-update"
-		if err := os.WriteFile(sentinel, []byte(manifest.Version), 0644); err != nil {
+		if err := updateWriteFile(sentinel, []byte(manifest.Version), 0644); err != nil {
 			_ = os.Remove(tmpBin)
 			return schema.UpdateData{}, schema.Newf(schema.CodeInternal, "writing sentinel: %s", err.Error())
 		}
@@ -167,7 +179,7 @@ func selfUpdate(baseURL string, check bool) (schema.UpdateData, error) {
 		}, nil
 	}
 
-	if err := os.Rename(tmpBin, currentBin); err != nil {
+	if err := updateRename(tmpBin, currentBin); err != nil {
 		_ = os.Remove(tmpBin)
 		return schema.UpdateData{}, schema.Newf(schema.CodeInternal, "swapping binary: %s", err.Error())
 	}
@@ -181,7 +193,7 @@ func selfUpdate(baseURL string, check bool) (schema.UpdateData, error) {
 }
 
 func fetchManifest(manifestURL string) (*cliManifest, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := updateHTTPClient(15 * time.Second)
 	req, err := http.NewRequest("GET", manifestURL, nil)
 	if err != nil {
 		return nil, schema.Newf(schema.CodeInternal, "creating request: %s", err.Error())
@@ -214,7 +226,7 @@ func downloadAndVerify(downloadURL, expectedSHA, destPath string) error {
 			"refusing non-HTTPS download URL: %s", downloadURL)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := updateHTTPClient(5 * time.Minute)
 	req, err := http.NewRequest("GET", downloadURL, nil)
 	if err != nil {
 		return schema.Newf(schema.CodeInternal, "creating request: %s", err.Error())
