@@ -7,9 +7,10 @@
 # standard library. This is the gate that turns "Dependabot alert after merge"
 # into "fail the PR" for Go (the Rust equivalent is db.md's audit.yml).
 #
-# Scanned with `go-version: stable` on purpose: standard-library advisories are
-# resolved by building with a current Go toolchain, so using the latest release
-# keeps the gate self-healing as Go ships security patches.
+# Scanned with the same patched Go toolchain used by release.yml. Do not use
+# `stable` here: if GitHub resolves it to a just-behind patch release with a
+# known standard-library CVE, the scanner fails unrelated code even though the
+# release build toolchain is clean.
 #
 # Runs on Go source / module changes AND on a daily schedule, so a newly
 # published advisory against unchanged code is caught with no commit.
@@ -50,7 +51,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: stable
+          go-version: "1.25.11"
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       # The daemon links SQLCipher via cgo (github.com/mutecomm/go-sqlcipher);
