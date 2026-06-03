@@ -2,21 +2,25 @@
 
 **The open agentic computer.**
 
-A computer you direct in plain language. A capable model runs the real machine for you: terminal, browser, filesystem. You say what you want; it does the work.
+A `COMPUTER.md` file at the root of a machine says what that computer
+is for, who it works for, its standing rules, and its tools. A capable
+model reads it at the start of every turn and runs the real machine for
+you — terminal, browser, filesystem. You direct the machine in plain
+language; `COMPUTER.md` is how it knows itself.
 
-`computer.md` is two things in one repo:
+That file is the whole idea. `computer.md` (this repo) is the spec for
+it plus a reference runtime that reads it:
 
-1. **A spec** — [`SPEC.md`](spec/SPEC.md) defines the customer-authored `COMPUTER.md`
-   file: who the computer is for, what its standing rules are, what
-   tools it has access to.
-2. **A reference runtime** — the `daemon/`, `cli/`, and `daemon/web/`
-   that ship the agent loop, the command surface, and the per-machine
-   UI. Apache-2.0. Runs on Linux. The same binary VibeCraft ships in
-   its hosted product.
+1. **The spec** — [`SPEC.md`](spec/SPEC.md) defines the `COMPUTER.md`
+   file: its recognized sections, its read/write contract, its format.
+2. **The reference runtime** — the `daemon/`, `cli/`, and `daemon/web/`
+   that read `COMPUTER.md` and run the agent loop, the command surface,
+   and the per-machine UI. Apache-2.0. Runs on Linux. The same binary
+   VibeCraft ships in its hosted product.
 
-A `COMPUTER.md` file is the first **open, customer-owned,
-machine-level, portable state primitive** for the agentic-computer
-era. The format is plain markdown — anyone can read it, edit it, or
+`COMPUTER.md` is the first **open, customer-owned, machine-level,
+portable** config for the agentic-computer era: plain markdown,
+human-readable, model-read every turn. Anyone can read it, edit it, or
 build a runtime that understands it.
 
 ## The bet
@@ -45,6 +49,14 @@ computer-md validate
 The spec, the parser, and the example role files live in [`spec/`](spec/SPEC.md).
 The current spec is **v0.1** (tagged [`v0.1`](https://github.com/carloslfu/computer.md/releases/tag/v0.1); additive changes only — see [SPEC.md § Versioning](spec/SPEC.md)).
 The Go daemon lives in [`daemon/`](daemon/). The CLI lives in [`cli/`](cli/).
+
+**Point your coding agent at the computer.** The `vibecraft` CLI is software for your agent: install a skill once and Claude Code or Codex can drive your machine(s) — submit tasks, stream results, read the screen — over the CLI.
+
+```bash
+vibecraft install-skill                   # drops a skill into Claude Code / Codex
+```
+
+The skill is a thin pointer at `vibecraft docs` (and `vibecraft.so/llms.txt`); your agent reads it on its next session and operates the computer from there.
 
 ## The four deployment shapes
 
