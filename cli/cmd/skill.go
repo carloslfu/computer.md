@@ -17,9 +17,12 @@ var flagSkillTarget string
 
 var installSkillCmd = &cobra.Command{
 	Use:   "install-skill",
-	Short: "Install a coding-agent skill that teaches your agent this CLI",
-	Long: `Drop a skill / tool manifest into your local Claude Code or Codex install
-so the agent learns how to use the VibeCraft CLI on its next session.
+	Short: "Optional convenience: save a coding-agent skill that points at this CLI",
+	Long: `OPTIONAL CONVENIENCE. Drop a skill into your local Claude Code or Codex
+install so the agent picks up the VibeCraft CLI on its next session. This is
+sugar, not the mechanism: any harness can use the CLI just by reading
+'vibecraft docs' (or https://www.vibecraft.so/llms.txt) — drop the same skill in
+its own skills directory, or load 'vibecraft docs' into the system prompt.
 
 Default target = autodetect (Claude Code is preferred when both are present).
 
@@ -29,8 +32,10 @@ Default target = autodetect (Claude Code is preferred when both are present).
 
 Remove it later with 'vibecraft uninstall-skill'.
 
-The skill body is a thin pointer at 'vibecraft docs' + https://www.vibecraft.so/llms.txt.
-The full doc is NOT inlined into the skill file (single source of truth).`,
+The skill is written in the open Agent Skills format (SKILL.md with
+name/description frontmatter). Its body is a thin pointer at 'vibecraft docs' +
+https://www.vibecraft.so/llms.txt; the full doc is NOT inlined into the skill
+file (single source of truth, so it cannot drift).`,
 	RunE: func(cmd *cobra.Command, args []string) error { return runSkill(false) },
 }
 

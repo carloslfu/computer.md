@@ -6,6 +6,8 @@ VibeCraft is an agentic computer for business. The customer owns a Linux box wit
 
 Three layers: **computer** (the box) → **manager** (the on-box AI you direct) → **workers** (Claude Code / Codex, spawned by the manager). You talk to the manager. The manager drives the computer.
 
+**The installer is text.** You set up this CLI by reading plain markdown and acting on it — this file (or `vibecraft docs`) is all you need. `vibecraft install-skill` is optional convenience, not the mechanism: any harness works by dropping the skill in its own skills directory, or by loading `vibecraft docs` into the system prompt.
+
 ---
 
 ## 1. The contract
@@ -398,8 +400,8 @@ ask it in chat. `tools deploy` operates on tools that already exist.
 | `docs` | Print this document. `--json` emits it wrapped in an envelope. |
 | `version` | CLI version. |
 | `update` | Pull the latest CLI binary from the platform manifest, verify SHA-256, atomic swap. Unix only. |
-| `install-skill [--target=claude-code\|codex]` | Drop a skill manifest that teaches your coding agent about this CLI. |
-| `uninstall-skill [--target=claude-code\|codex]` | Remove the coding-agent skill installed by `install-skill`; does not uninstall the CLI. |
+| `install-skill [--target=claude-code\|codex]` | OPTIONAL convenience. Save an Agent Skills `SKILL.md` (a thin pointer at `vibecraft docs`) for Claude Code / Codex so they pick up this CLI. Sugar, not required — any harness can use the CLI by reading `vibecraft docs` (this doc) directly. |
+| `uninstall-skill [--target=claude-code\|codex]` | Remove the skill `install-skill` wrote; does not uninstall the CLI. |
 | `uninstall` | Reverse the install: delete the local config (`~/.config/vibecraft/`) and the `vibecraft` binary. Local teardown only — does NOT revoke the key server-side; do that from the dashboard (Settings → CLI). |
 | `screenshot [-o path]` | PNG snapshot of the machine's desktop. |
 

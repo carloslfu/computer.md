@@ -50,13 +50,34 @@ The spec, the parser, and the example role files live in [`spec/`](spec/SPEC.md)
 The current spec is **v0.1** (tagged [`v0.1`](https://github.com/carloslfu/computer.md/releases/tag/v0.1); additive changes only — see [SPEC.md § Versioning](spec/SPEC.md)).
 The Go daemon lives in [`daemon/`](daemon/). The CLI lives in [`cli/`](cli/).
 
-**Point your coding agent at the computer.** The `vibecraft` CLI is software for your agent: install a skill once and Claude Code or Codex can drive your machine(s) — submit tasks, stream results, read the screen — over the CLI.
+**Point your coding agent at the computer. The installer is text.** The
+`vibecraft` CLI is software for your agent, and a capable agent installs and
+wires it up by reading markdown and acting on it — there is no per-harness
+machinery to depend on. Two layers of reachability:
+
+1. **Before the binary exists** — point your agent at the agent-readable entry
+   text: [`llms.txt`](llms.txt) in this repo (also served at
+   [`vibecraft.so/llms.txt`](https://www.vibecraft.so/llms.txt)). It says what
+   VibeCraft is, how to install the CLI, and how to integrate.
+2. **After the binary exists** — run `vibecraft docs` (or `vibecraft docs
+   --json`). It prints the same reference — the single source of truth — and the
+   agent drives your machine(s) from there: submit tasks, stream results, read
+   the screen.
+
+To make it stick across sessions, save a skill where your harness reads skills —
+the open [Agent Skills](https://www.anthropic.com/news/skills) format
+(`vibecraft/SKILL.md` with `name`/`description` frontmatter). The skill body is a
+thin pointer at `vibecraft docs`, never a copy, so it cannot drift. Any harness
+works: drop the file in its skills directory (Claude Code `~/.claude/skills/`,
+Codex `~/.codex/skills/`, or any other harness's equivalent), or just load
+`vibecraft docs` into the system prompt.
 
 ```bash
-vibecraft install-skill                   # drops a skill into Claude Code / Codex
+vibecraft install-skill   # OPTIONAL convenience: writes that skill for Claude Code / Codex
 ```
 
-The skill is a thin pointer at `vibecraft docs` (and `vibecraft.so/llms.txt`); your agent reads it on its next session and operates the computer from there.
+`install-skill` is sugar that does the save step for those two harnesses — not
+the mechanism, not required. The mechanism is generic text plus a smart model.
 
 ## The four deployment shapes
 
@@ -100,6 +121,7 @@ computer.md/
 │   ├── sandbox/         Low-level bwrap capability (invoked ad-hoc, not by default)
 │   └── bootstrap/       Daemon installers (install.sh)
 ├── cli/                 The `vibecraft` CLI (task, chat, screenshot, auth)
+├── llms.txt             Agent-readable entry text — the CLI reference an agent reads to install + integrate (served at vibecraft.so/llms.txt; printed by `vibecraft docs`)
 ├── install/cli.sh       CLI installer (the script vibecraft.so/install/cli.sh serves)
 └── HomebrewFormula/     Homebrew tap template for `brew install carloslfu/tap/vibecraft`
 ```
