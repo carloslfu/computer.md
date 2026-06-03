@@ -13,10 +13,7 @@ import (
 	"github.com/carloslfu/computer.md/cli/schema"
 )
 
-var (
-	flagSkillTarget    string
-	flagSkillUninstall bool
-)
+var flagSkillTarget string
 
 var installSkillCmd = &cobra.Command{
 	Use:   "install-skill",
@@ -29,20 +26,39 @@ Default target = autodetect (Claude Code is preferred when both are present).
   vibecraft install-skill                            # autodetect
   vibecraft install-skill --target=claude-code       # explicit
   vibecraft install-skill --target=codex             # explicit
-  vibecraft install-skill --uninstall                # remove what we installed
+
+Remove it later with 'vibecraft uninstall-skill'.
 
 The skill body is a thin pointer at 'vibecraft docs' + https://www.vibecraft.so/llms.txt.
 The full doc is NOT inlined into the skill file (single source of truth).`,
-	RunE: runInstallSkill,
+	RunE: func(cmd *cobra.Command, args []string) error { return runSkill(false) },
+}
+
+var uninstallSkillCmd = &cobra.Command{
+	Use:   "uninstall-skill",
+	Short: "Remove the coding-agent skill that install-skill installed",
+	Long: `Remove the VibeCraft skill that 'vibecraft install-skill' wrote from your
+local Claude Code or Codex install. Scoped: only deletes what we installed.
+
+  vibecraft uninstall-skill                          # autodetect
+  vibecraft uninstall-skill --target=claude-code     # explicit
+  vibecraft uninstall-skill --target=codex           # explicit
+
+(This removes the agent skill only. To remove the CLI itself, use
+'vibecraft uninstall'.)`,
+	RunE: func(cmd *cobra.Command, args []string) error { return runSkill(true) },
 }
 
 func init() {
 	installSkillCmd.Flags().StringVar(&flagSkillTarget, "target", "", "claude-code | codex (default: autodetect)")
-	installSkillCmd.Flags().BoolVar(&flagSkillUninstall, "uninstall", false, "Remove the skill instead of installing")
+	uninstallSkillCmd.Flags().StringVar(&flagSkillTarget, "target", "", "claude-code | codex (default: autodetect)")
 	rootCmd.AddCommand(installSkillCmd)
+	rootCmd.AddCommand(uninstallSkillCmd)
 }
 
-func runInstallSkill(cmd *cobra.Command, args []string) error {
+// runSkill installs the skill (uninstall=false) or removes it (uninstall=true)
+// for the resolved target. The two commands share everything but this flag.
+func runSkill(uninstall bool) error {
 	target := flagSkillTarget
 	if target == "" {
 		t, err := autodetectSkillTarget()
@@ -54,9 +70,9 @@ func runInstallSkill(cmd *cobra.Command, args []string) error {
 
 	switch target {
 	case "claude-code":
-		return doClaudeCodeSkill()
+		return doClaudeCodeSkill(uninstall)
 	case "codex":
-		return doCodexSkill()
+		return doCodexSkill(uninstall)
 	default:
 		return schema.Newf(schema.CodeValidationError,
 			"unknown --target %q", target).
@@ -83,7 +99,7 @@ func autodetectSkillTarget() (string, error) {
 	return "claude-code", nil
 }
 
-func doClaudeCodeSkill() error {
+func doClaudeCodeSkill(uninstall bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return schema.Newf(schema.CodeInternal, "finding home directory: %s", err.Error())
@@ -91,7 +107,7 @@ func doClaudeCodeSkill() error {
 	skillDir := filepath.Join(home, ".claude", "skills", "vibecraft")
 	skillFile := filepath.Join(skillDir, "SKILL.md")
 
-	if flagSkillUninstall {
+	if uninstall {
 		if _, err := os.Stat(skillFile); os.IsNotExist(err) {
 			return output.Emit(schema.InstallSkillData{
 				Target: "claude-code",
@@ -125,7 +141,7 @@ func doClaudeCodeSkill() error {
 	})
 }
 
-func doCodexSkill() error {
+func doCodexSkill(uninstall bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return schema.Newf(schema.CodeInternal, "finding home directory: %s", err.Error())
@@ -136,7 +152,7 @@ func doCodexSkill() error {
 	skillDir := filepath.Join(home, ".codex", "instructions")
 	skillFile := filepath.Join(skillDir, "vibecraft.md")
 
-	if flagSkillUninstall {
+	if uninstall {
 		if _, err := os.Stat(skillFile); os.IsNotExist(err) {
 			return output.Emit(schema.InstallSkillData{
 				Target: "codex",
