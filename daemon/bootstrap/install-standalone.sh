@@ -13,6 +13,7 @@
 # Requirements:
 #   - Linux (Ubuntu/Debian preferred)
 #   - sudo
+#   - curl, openssl, sha256sum
 #   - An OpenAI API key for the manager loop
 #
 # What this installs:
@@ -101,6 +102,16 @@ chmod 0644 /etc/vibecraft/manager_key_mode
 printf '%s\n' "$MANAGER_MODEL" > /etc/vibecraft/manager_model
 chmod 0644 /etc/vibecraft/manager_model
 
+# Pinned computer.md release-signing public key. Pure self-host installs
+# download directly from the public computer.md release, so they verify
+# against computer.md's key, not the private platform daemon-update key.
+cat > /etc/vibecraft/release_pub.pem << 'PUBEOF'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA+Lcb8IpwuZjZHh6FddfgliKbupMfUSXv4PKCSjBn5mw=
+-----END PUBLIC KEY-----
+PUBEOF
+chmod 0644 /etc/vibecraft/release_pub.pem
+
 # ─── binary ──────────────────────────────────────────────────────────
 
 ARCH="$(uname -m)"
@@ -119,11 +130,31 @@ if [ "$DAEMON_VERSION" = "latest" ]; then
   DAEMON_VERSION="$(curl -fsSL https://api.github.com/repos/carloslfu/computer.md/releases/latest | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
 fi
 
-DAEMON_URL="https://github.com/carloslfu/computer.md/releases/download/${DAEMON_VERSION}/vibecraft-daemon-linux-${GOARCH}"
+DAEMON_NAME="vibecraft-daemon-linux-${GOARCH}"
+DAEMON_URL="https://github.com/carloslfu/computer.md/releases/download/${DAEMON_VERSION}/${DAEMON_NAME}"
 
 echo "Downloading ${DAEMON_URL}..."
-curl -fsSL -o /usr/local/bin/vibecraft-daemon "$DAEMON_URL"
-chmod 0755 /usr/local/bin/vibecraft-daemon
+TMP_BIN="/tmp/${DAEMON_NAME}.$$"
+TMP_SHA="${TMP_BIN}.sha256"
+TMP_SIG="${TMP_BIN}.sig"
+curl -fsSL -o "$TMP_BIN" "$DAEMON_URL"
+curl -fsSL -o "$TMP_SHA" "${DAEMON_URL}.sha256"
+curl -fsSL -o "$TMP_SIG" "${DAEMON_URL}.sig"
+EXPECTED_SHA="$(awk '{print $1}' "$TMP_SHA")"
+ACTUAL_SHA="$(sha256sum "$TMP_BIN" | awk '{print $1}')"
+if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+  echo "install-standalone.sh: daemon SHA-256 mismatch" >&2
+  rm -f "$TMP_BIN" "$TMP_SHA" "$TMP_SIG"
+  exit 1
+fi
+if ! openssl pkeyutl -verify -pubin -inkey /etc/vibecraft/release_pub.pem \
+     -rawin -in "$TMP_BIN" -sigfile "$TMP_SIG" >/dev/null; then
+  echo "install-standalone.sh: daemon release signature invalid" >&2
+  rm -f "$TMP_BIN" "$TMP_SHA" "$TMP_SIG"
+  exit 1
+fi
+install -m 0755 "$TMP_BIN" /usr/local/bin/vibecraft-daemon
+rm -f "$TMP_BIN" "$TMP_SHA" "$TMP_SIG"
 
 # ─── systemd unit ────────────────────────────────────────────────────
 
