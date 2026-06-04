@@ -10,13 +10,19 @@ customer's VibeCraft computer. Every command returns a JSON envelope on
 stdout (or JSON Lines for streams); errors go to stderr with stable `code`
 strings; exit codes signal task outcome (0/1/2/3/4).
 
-**Before doing anything else: read the reference once per session.**
+## How to use this CLI — three moves, in order
+
+1. **You're here.** This skill is the doorway to a VibeCraft computer; it carries
+   no reference of its own.
+2. **Reference.** Run `vibecraft docs` once this session — the full command
+   surface, JSON envelopes, and exit codes (the single source of truth; same
+   content at `https://www.vibecraft.so/llms.txt`).
+3. **Drive.** Direct the machine's manager: `vibecraft task submit/stream/wait`,
+   `status`, `machine list` (cheat sheet below). `--json` on everything.
 
 ```
-vibecraft docs
+vibecraft docs       # step 2 — the reference, the single source of truth
 ```
-
-Same content is served at `https://www.vibecraft.so/llms.txt`.
 
 ## Cheat sheet (most common moves)
 

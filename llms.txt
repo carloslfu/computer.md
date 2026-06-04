@@ -8,6 +8,8 @@ Three layers: **computer** (the box) → **manager** (the on-box AI you direct) 
 
 **The installer is text.** You set up this CLI by reading plain markdown and acting on it — this file (or `vibecraft docs`) is all you need. There is no install command: any harness works by dropping the open-format skill (`skills/vibecraft/SKILL.md`) in its own skills directory, using the harness's own skill installer, or loading `vibecraft docs` into the system prompt.
 
+**The agent's path:** discover the CLI → run `vibecraft docs` for the reference (this file) → drive the machine with `vibecraft task …`. `vibecraft docs` is the single source of truth.
+
 ---
 
 ## 1. The contract
