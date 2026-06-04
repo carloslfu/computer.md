@@ -149,13 +149,6 @@ type DocsData struct {
 	Content string `json:"content"`
 }
 
-// InstallSkillData is emitted by `vibecraft install-skill`.
-type InstallSkillData struct {
-	Target string `json:"target"`
-	Path   string `json:"path"`
-	Action string `json:"action"` // "installed" or "uninstalled" or "noop"
-}
-
 // UninstallData is emitted by `vibecraft uninstall`. It reports the local
 // teardown only — removing credentials here does not revoke them
 // server-side (a separate dashboard action).

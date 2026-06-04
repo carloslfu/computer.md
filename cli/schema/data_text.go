@@ -495,19 +495,6 @@ func (u UpdateData) TextFormat() string {
 	return fmt.Sprintf("Update status: %s", u.Status)
 }
 
-// TextFormat renders InstallSkillData.
-func (i InstallSkillData) TextFormat() string {
-	switch i.Action {
-	case "installed":
-		return fmt.Sprintf("Installed %s skill at %s", i.Target, i.Path)
-	case "uninstalled":
-		return fmt.Sprintf("Uninstalled %s skill at %s", i.Target, i.Path)
-	case "noop":
-		return fmt.Sprintf("No %s skill found at %s", i.Target, i.Path)
-	}
-	return fmt.Sprintf("%s skill: %s (%s)", i.Target, i.Action, i.Path)
-}
-
 // TextFormat renders UninstallData.
 func (u UninstallData) TextFormat() string {
 	var sb strings.Builder

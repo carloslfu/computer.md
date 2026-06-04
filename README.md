@@ -64,20 +64,15 @@ machinery to depend on. Two layers of reachability:
    agent drives your machine(s) from there: submit tasks, stream results, read
    the screen.
 
-To make it stick across sessions, save a skill where your harness reads skills —
-the open [Agent Skills](https://www.anthropic.com/news/skills) format
-(`vibecraft/SKILL.md` with `name`/`description` frontmatter). The skill body is a
-thin pointer at `vibecraft docs`, never a copy, so it cannot drift. Any harness
-works: drop the file in its skills directory (Claude Code `~/.claude/skills/`,
-Codex `~/.codex/skills/`, or any other harness's equivalent), or just load
-`vibecraft docs` into the system prompt.
-
-```bash
-vibecraft install-skill   # OPTIONAL convenience: writes that skill for Claude Code / Codex
-```
-
-`install-skill` is sugar that does the save step for those two harnesses — not
-the mechanism, not required. The mechanism is generic text plus a smart model.
+To make it stick across sessions, place a skill where your harness reads skills —
+the open [Agent Skills](https://www.anthropic.com/news/skills) format. The
+canonical file ships in this repo at [`skills/vibecraft/SKILL.md`](skills/vibecraft/SKILL.md)
+(`name`/`description` frontmatter; a thin pointer at `vibecraft docs`, never a
+copy, so it cannot drift). Placing it is generic file work: copy it into your
+harness's skills dir (Claude Code `~/.claude/skills/`, Codex `~/.codex/skills/`,
+or any other harness's equivalent), use the harness's own skill installer, or
+just load `vibecraft docs` into the system prompt. There is no `vibecraft
+install-skill` command — the mechanism is generic text plus a smart model.
 
 ## The four deployment shapes
 
