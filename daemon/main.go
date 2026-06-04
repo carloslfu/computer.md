@@ -175,6 +175,12 @@ func main() {
 		}
 	})
 	engine.SetUsageRecorder(budgetTracker)
+	// Enforce pause-at-zero at the engine consumer too (defense in depth):
+	// stop claiming new tasks when the AI budget is exhausted.
+	engine.SetBudgetGate(func() bool {
+		st, err := budgetTracker.State()
+		return err == nil && st.Paused
+	})
 	compactor.SetUsageRecorder(budgetTracker)
 	summarizer.SetUsageRecorder(budgetTracker)
 

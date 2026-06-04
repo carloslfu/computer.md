@@ -188,6 +188,13 @@ type Engine struct {
 	// cross-conversation redirect) can stamp it expired symmetrically
 	// with credential cards.
 	pendingApprovalMsgs map[string]pendingApprovalMsg
+
+	// budgetGate, when set, reports whether the AI budget is exhausted
+	// (paused). loop() consults it before claiming a NEW task so pause-at-zero
+	// is enforced at the consumer, not only at submission — even if a task
+	// reached the queue by some other path. The box and any in-flight task
+	// keep running; only new claims are withheld. Nil in tests.
+	budgetGate func() bool
 }
 
 // EventBroker is the interface the engine uses to emit SSE events.
@@ -251,6 +258,14 @@ func NewEngine(
 // startup wiring. Nil is acceptable (summaries are simply skipped).
 func (e *Engine) SetSummarizer(s *Summarizer) {
 	e.summarizer = s
+}
+
+// SetBudgetGate wires an optional predicate reporting whether the AI budget is
+// exhausted. When it returns true, loop() stops claiming NEW tasks (the box and
+// any in-flight task keep running, and it resumes automatically when credits
+// return). Nil disables the check (tests run without it).
+func (e *Engine) SetBudgetGate(paused func() bool) {
+	e.budgetGate = paused
 }
 
 // UsageRecorder accumulates manager API token consumption for the
@@ -852,6 +867,20 @@ func (e *Engine) loop(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-time.After(DiskRetryBackoff):
+			}
+			continue
+		}
+
+		// AI budget pause-at-zero (defense in depth). When the budget is
+		// exhausted, don't claim a NEW task — let any in-flight task finish,
+		// keep the box and cron running, and resume automatically once credits
+		// return. The submission gates (/task, /daemon/task) are the primary
+		// enforcement; this guards any task that reached the queue another way.
+		if e.budgetGate != nil && e.budgetGate() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Second):
 			}
 			continue
 		}

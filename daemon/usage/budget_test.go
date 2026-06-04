@@ -233,6 +233,29 @@ func TestBudget_EnforcesWhenSpendExceedsBudget(t *testing.T) {
 	}
 }
 
+// TestBudget_DrainedPoolZeroPauses — a fetched budget of exactly 0 (a fully
+// drained multi-machine pool, which the platform clamps to 0.0) must pause.
+// Regression for the old `budget > 0` guard that let a drained pool keep
+// spending on the remaining sibling machines past zero.
+func TestBudget_DrainedPoolZeroPauses(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	fb := newFakeBudget(t)
+	fb.set(0)
+	bt := trackerFor(store, fb)
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	seedSpend(t, store, "c1", 0.01) // any spend at all against a $0 pool
+	st, _ := bt.State()
+	if !st.Enforced {
+		t.Errorf("a fetched budget of 0 is a KNOWN budget → must enforce; got %+v", st)
+	}
+	if !st.Paused {
+		t.Errorf("a drained $0 pool must pause; got %+v", st)
+	}
+}
+
 // TestBudget_NotPausedUnderBudget — fetched budget, spend below it.
 func TestBudget_NotPausedUnderBudget(t *testing.T) {
 	store := NewStore(openTestDB(t))

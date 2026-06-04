@@ -446,6 +446,11 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 
 	st.SpentUSD = summary.TotalCostUSD
 	st.Enforced = true
-	st.Paused = budget > 0 && summary.TotalCostUSD >= budget
+	// budget >= 0 here (the budget < 0 unmetered/Enterprise case returned
+	// above). A budget of exactly 0 is a fully-drained pool — the platform
+	// clamps a drained multi-machine pool to 0.0 — so it must pause too. The
+	// old `budget > 0` guard let a drained pool keep spending past zero on the
+	// remaining sibling machines.
+	st.Paused = summary.TotalCostUSD >= budget
 	return st, nil
 }

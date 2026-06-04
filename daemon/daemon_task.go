@@ -72,6 +72,37 @@ func (s *Server) handleDaemonTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Budget gate: same pause-at-zero rule as the human-facing /task. When the
+	// AI budget is exhausted, do NOT enqueue autonomous/system work — otherwise
+	// standing systems (cron, watchers, sub-agents) keep spending past zero,
+	// which is exactly the unattended path where "no surprise bills" matters
+	// most. The box, supercronic, and the system files keep running; only this
+	// AI turn is withheld, so the system resumes cleanly when credits return.
+	if s.budgetTracker != nil {
+		if state, err := s.budgetTracker.State(); err == nil && state.Paused {
+			msg := fmt.Sprintf(
+				"AI budget exhausted ($%.0f/mo). This system's task is held until the billing cycle renews on %s. The computer and your systems keep running; work resumes automatically when credits return.",
+				state.BudgetUSD, state.ResetsOn,
+			)
+			_ = s.taskStore.EnsureConversation(req.ConversationID, req.Instruction)
+			_ = s.taskStore.AddMessage(req.ConversationID, "user", req.Instruction)
+			_ = s.taskStore.AddMessage(req.ConversationID, "assistant", msg)
+			s.auditLog.Log(audit.Entry{
+				Action:    "daemon_task_budget_blocked",
+				Category:  "task",
+				Details:   fmt.Sprintf("system=%s instruction=%s", req.System, req.Instruction),
+				RiskLevel: "low",
+			})
+			jsonResponse(w, http.StatusOK, map[string]interface{}{
+				"budget_blocked":  true,
+				"message":         msg,
+				"resets_on":       state.ResetsOn,
+				"conversation_id": req.ConversationID,
+			})
+			return
+		}
+	}
+
 	task, err := s.taskStore.CreateTask(req.ConversationID, req.Instruction)
 	if err != nil {
 		jsonError(w, fmt.Sprintf("failed to create task: %v", err), http.StatusInternalServerError)
