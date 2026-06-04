@@ -40,6 +40,34 @@ export function groupRenderUnits(messages: ChatMessageType[]): RenderUnit[] {
   return units;
 }
 
+// First-run starters. Tapping one fills the composer (it never auto-sends).
+// Ordered to show the breadth in one glance: it watches, remembers, connects,
+// automates, and runs work in parallel — not just a chat box.
+const STARTERS: Array<{ tag: string; prompt: string }> = [
+  {
+    tag: "Watch it work",
+    prompt:
+      "Pull today's top Hacker News headlines and summarize each in one line.",
+  },
+  {
+    tag: "Build memory",
+    prompt:
+      "Interview me about my business, then start a knowledge base for my company.",
+  },
+  {
+    tag: "Connect a tool",
+    prompt: "Open Gmail in the browser and walk me through connecting it.",
+  },
+  {
+    tag: "Automate it",
+    prompt: "Every weekday at 8am, send me a brief of what needs my attention.",
+  },
+  {
+    tag: "Go parallel",
+    prompt: "Spawn five workers to research my top competitors at once.",
+  },
+];
+
 export function ChatThread({
   messages,
   onApproval,
@@ -51,6 +79,7 @@ export function ChatThread({
   onOpenBlocker,
   onStopBlocker,
   blockerStopping,
+  onPickPrompt,
 }: {
   messages: ChatMessageType[];
   onApproval: (messageId: string, action: string) => void;
@@ -73,6 +102,9 @@ export function ChatThread({
   // Mirrors the header's stop-button stopping flag so the queued panel's
   // Stop button shows the same disabled-spinning state.
   blockerStopping?: boolean;
+  // When set (control access only), the empty-state starters become tappable
+  // and fill the composer through this callback. Omitted for view-only.
+  onPickPrompt?: (text: string) => void;
 }) {
   const { containerRef, contentRef, isPinned, newMessageCount, jumpToBottom } =
     useChatScroll({ messages, resetKey: conversationId });
@@ -140,30 +172,47 @@ export function ChatThread({
           )}
 
           {!loading && messages.length === 0 && (
-            <div className="py-20 text-center">
+            <div className="py-16 text-center">
               <p className="font-poppins text-lg font-semibold text-slate-950">
-                Tell your manager what to set up.
+                Your computer is ready.
               </p>
               <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-slate-500">
-                The manager handles one-shots and builds persistent systems on
-                your computer. It can spawn worker agents when a job needs
-                parallel work.
+                Tell the manager what to do in plain language. It runs one-shot
+                jobs, builds systems that run on their own, and spawns worker
+                agents when a job needs parallel hands. Pick a starting point or
+                just type.
               </p>
-              <ul className="mx-auto mt-8 max-w-md space-y-2 text-left text-sm text-slate-500">
-                {[
-                  "Every Monday at 9am, send me new-customer summaries from Stripe.",
-                  "Process the invoices in my inbox folder and write a summary.",
-                  "Watch this dashboard and ping me when the conversion drops.",
-                  "Spawn five workers to research these competitors in parallel.",
-                ].map((example) => (
-                  <li
-                    key={example}
-                    className="rounded-xl border border-slate-200/60 bg-white/50 px-4 py-2.5 text-slate-600"
-                  >
-                    {example}
-                  </li>
-                ))}
-              </ul>
+              <div className="mx-auto mt-8 grid max-w-md gap-2 text-left">
+                {STARTERS.map((s) =>
+                  onPickPrompt ? (
+                    <button
+                      key={s.prompt}
+                      type="button"
+                      onClick={() => onPickPrompt(s.prompt)}
+                      className="rounded-xl border border-slate-200/60 bg-white/50 px-4 py-2.5 transition hover:-translate-y-0.5 hover:border-slate-300 hover:bg-white hover:shadow-sm"
+                    >
+                      <span className="block text-[11px] font-medium uppercase tracking-wider text-slate-400">
+                        {s.tag}
+                      </span>
+                      <span className="mt-0.5 block text-sm text-slate-600">
+                        {s.prompt}
+                      </span>
+                    </button>
+                  ) : (
+                    <div
+                      key={s.prompt}
+                      className="rounded-xl border border-slate-200/60 bg-white/50 px-4 py-2.5"
+                    >
+                      <span className="block text-[11px] font-medium uppercase tracking-wider text-slate-400">
+                        {s.tag}
+                      </span>
+                      <span className="mt-0.5 block text-sm text-slate-600">
+                        {s.prompt}
+                      </span>
+                    </div>
+                  ),
+                )}
+              </div>
             </div>
           )}
 

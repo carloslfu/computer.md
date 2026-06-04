@@ -83,6 +83,11 @@ export function ChatLayout({
   >(null);
   const [stopping, setStopping] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // A starter prompt tapped in the empty state, handed to the composer to
+  // fill (not send). The bumped nonce refills even when the text repeats.
+  const [composerPrefill, setComposerPrefill] = useState<
+    { text: string; nonce: number } | undefined
+  >(undefined);
   const [vaultNames, setVaultNames] = useState<string[]>([]);
   // Live presence of users connected to this machine's SSE stream.
   // Populated by the daemon's `presence` event after every sub/unsub
@@ -1061,6 +1066,15 @@ export function ChatLayout({
                 : undefined
             }
             blockerStopping={stopping}
+            onPickPrompt={
+              !isViewOnly
+                ? (text) =>
+                    setComposerPrefill((p) => ({
+                      text,
+                      nonce: (p?.nonce ?? 0) + 1,
+                    }))
+                : undefined
+            }
           />
 
           {!isViewOnly && (
@@ -1076,6 +1090,7 @@ export function ChatLayout({
               stopping={stopping}
               conversationId={activeConversation}
               ensureConversationId={ensureConversationId}
+              prefill={composerPrefill}
             />
           )}
         </div>

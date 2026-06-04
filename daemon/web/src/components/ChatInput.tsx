@@ -28,6 +28,7 @@ export function ChatInput({
   stopping,
   conversationId,
   ensureConversationId,
+  prefill,
 }: {
   onSend: (message: string, attachments: Attachment[]) => void;
   onStop?: () => void;
@@ -36,6 +37,10 @@ export function ChatInput({
   stopping?: boolean;
   conversationId: string | null;
   ensureConversationId: () => string;
+  // A starter prompt the user tapped in the empty state. Bumping `nonce`
+  // refills the composer (and refocuses) even when the text repeats. Tapping
+  // a starter never sends — the user reviews and hits send themselves.
+  prefill?: { text: string; nonce: number };
 }) {
   const [message, setMessage] = useState("");
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
@@ -242,6 +247,20 @@ export function ChatInput({
       textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 160)}px`;
     }
   }, [message]);
+
+  // Fill (don't send) the composer when a starter prompt is tapped, then
+  // focus and drop the cursor at the end so it's ready to edit or send.
+  useEffect(() => {
+    if (!prefill?.text) return;
+    setMessage(prefill.text);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+      }
+    });
+  }, [prefill]);
 
   useEffect(() => {
     if (!canStop) return;
