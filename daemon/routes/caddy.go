@@ -72,10 +72,28 @@ func writeTempCaddyfileForValidation(content string) (string, error) {
 	return tmpPath, nil
 }
 
+// caddyfileCmd builds `caddy <sub> --adapter caddyfile --config <path>`.
+//
+// The `--adapter caddyfile` flag is required and must be explicit: `caddy
+// validate/reload --config <file>` only auto-detects the Caddyfile format when
+// the file is literally named "Caddyfile". Our validation temp files
+// (".Caddyfile.*.validate") are not, so without the adapter Caddy parses them as
+// JSON and fails with "config is not valid JSON ... did you mean the --adapter
+// flag?" — which silently broke every validate-before-apply (and thus every
+// hosted-tool route change that goes through safeWriteAndReload).
+//
+// HOME is set so Caddy can resolve its user-config dir; the daemon's process
+// environment may define neither $HOME nor $XDG_CONFIG_HOME, which otherwise
+// makes Caddy warn and fall back to writing in the current directory.
+func caddyfileCmd(sub, configPath string) *exec.Cmd {
+	cmd := exec.Command("caddy", sub, "--adapter", "caddyfile", "--config", configPath)
+	cmd.Env = append(os.Environ(), "HOME="+os.TempDir())
+	return cmd
+}
+
 // validateCaddy validates the given Caddy configuration path.
 func validateCaddy(path string) error {
-	validate := exec.Command("caddy", "validate", "--config", path)
-	if out, err := validate.CombinedOutput(); err != nil {
+	if out, err := caddyfileCmd("validate", path).CombinedOutput(); err != nil {
 		return fmt.Errorf("Caddyfile validation failed: %s", string(out))
 	}
 	return nil
@@ -83,8 +101,7 @@ func validateCaddy(path string) error {
 
 // reloadCaddy reloads the already-written Caddy configuration.
 func reloadCaddy() error {
-	reload := exec.Command("caddy", "reload", "--config", caddyfilePath)
-	if out, err := reload.CombinedOutput(); err != nil {
+	if out, err := caddyfileCmd("reload", caddyfilePath).CombinedOutput(); err != nil {
 		return fmt.Errorf("caddy reload failed: %s", string(out))
 	}
 	return nil
@@ -118,7 +135,7 @@ func safeWriteAndReload(content string) error {
 				log.Printf("CRITICAL: failed to restore Caddyfile after reload failure: %v", writeErr)
 			} else {
 				// Try to reload with the old config (best-effort).
-				exec.Command("caddy", "reload", "--config", caddyfilePath).Run()
+				_ = caddyfileCmd("reload", caddyfilePath).Run()
 			}
 		}
 		return err
