@@ -66,6 +66,17 @@ jobs:
           CGO_ENABLED: "1"
         run: go test ./... -timeout=5m -count=1
 
+      # Race detector pass. The daemon's concurrency fixes (Engine.diskPaused
+      # and the other shared-state tests) only fail the build under -race; the
+      # plain `go test` above never exercises the detector. CGO is already on
+      # (-race requires it), so this is a cheap dedicated gate over the same
+      # packages.
+      - name: Test daemon (race detector)
+        working-directory: daemon
+        env:
+          CGO_ENABLED: "1"
+        run: go test ./... -race -timeout=10m -count=1
+
       - name: Test CLI
         working-directory: cli
         env:

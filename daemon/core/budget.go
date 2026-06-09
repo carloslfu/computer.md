@@ -135,3 +135,27 @@ func (b *taskBudget) Exhausted() bool {
 	defer b.mu.Unlock()
 	return b.exhausted
 }
+
+// Stop tears down the budget's watchdog goroutine and any live timer the
+// moment the task is done, instead of letting them linger until the (up to
+// DefaultTaskTimeout = 2h) timer finally fires.
+//
+// Why this is needed: newTaskBudget runs `go b.run(budgetCtx)` where
+// budgetCtx is derived from the engine-lifetime parent context, which is
+// shared across every task and is NOT cancelled between tasks. processTask
+// stores only the cancel of a CHILD context (context.WithCancel of the
+// budget's ctx); cancelling that child does not cancel budgetCtx, so
+// b.run keeps blocking in its `time.NewTimer(remaining)` select — holding a
+// goroutine and a multi-hour timer — until the timer fires on its own. On a
+// long-lived daemon processing many short tasks that backlog grows with
+// throughput. Stop cancels budgetCtx directly (the same cancel b.run invokes
+// on exhaustion), so the select returns at once and the timer is Stopped in
+// b.run's `<-ctx.Done()` arm.
+//
+// Idempotent: cancelling an already-cancelled context is a no-op, and the
+// task is terminal by the time Stop runs, so cancelling the task context has
+// no further effect. Does NOT set exhausted — a Stop on the normal path must
+// not be mistaken for a budget timeout by Exhausted().
+func (b *taskBudget) Stop() {
+	b.cancel()
+}

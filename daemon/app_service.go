@@ -1262,14 +1262,21 @@ func (s *Server) deployHostedAppService(ctx context.Context, name string, env []
 		return result, http.StatusBadRequest
 	}
 
-	// Merge stored env (minus VibeCraft-injected) with provided overrides,
-	// then resolve $SECRET references against the machine vault.
-	merged := mergeEnv(stripReservedInjectedEnv(pu.Environment), env)
+	// Resolve $SECRET references in the CALLER-PROVIDED overrides ONLY, then
+	// overlay them on the stored env. The stored values were already
+	// vault-resolved at install time and are literal secret values — running
+	// the resolver over them again would silently rewrite any stored literal
+	// that happens to contain a `$NAME` token colliding with a vault secret
+	// name (e.g. a signing key like `xK$SESSION9f...` when a SESSION secret
+	// exists), corrupting the running app's config with no error surfaced.
+	// Resolve overrides first, merge second, so stored literals pass through
+	// verbatim.
 	resolver := vault.NewResolver(s.vaultStore)
-	resolved := make([]string, 0, len(merged))
-	for _, kv := range merged {
-		resolved = append(resolved, resolver.ResolveEnvLine(kv))
+	resolvedOverride := make([]string, 0, len(env))
+	for _, kv := range env {
+		resolvedOverride = append(resolvedOverride, resolver.ResolveEnvLine(kv))
 	}
+	resolved := mergeEnv(stripReservedInjectedEnv(pu.Environment), resolvedOverride)
 
 	port := route.Port
 	if portOverride != nil {

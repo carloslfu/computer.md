@@ -229,9 +229,17 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	w.Header().Set("Content-Type", ctype)
+	// The agent writes files all over /home/vibecraft, and a prompt-injected
+	// or malicious worker can plant attacker-controlled HTML/SVG there. This
+	// endpoint serves them from the SAME origin as the authenticated SPA, so
+	// a top-level navigation to /api/files/<that>.html would otherwise run
+	// the attacker's JS under the victim's vc_session. The CLI consumes the
+	// raw body (it doesn't render), so forcing nosniff + attachment +
+	// neutral content-type for non-image types breaks nothing on the CLI
+	// side while closing the browser stored-XSS path. Shared with handleInbox.
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	w.Header().Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
+	setDownloadSecurityHeaders(w.Header(), filepath.Base(real), ctype)
 	if r.Method == http.MethodHead {
 		return
 	}

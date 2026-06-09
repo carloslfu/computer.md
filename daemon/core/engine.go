@@ -315,9 +315,25 @@ func (e *Engine) SetNotifier(n Notifier) {
 // paused state. Read-only; used by /metrics (Workstream K) to surface
 // fleet-wide pause rate to the platform's health dashboard.
 func (e *Engine) IsPaused() bool {
+	return e.getDiskPaused()
+}
+
+// getDiskPaused / setDiskPaused are the synchronised accessors for the
+// diskPaused flag. The writer in checkDiskHealthy runs on the loop()
+// goroutine while IsPaused() reads from the /metrics HTTP goroutine; without
+// the lock on BOTH sides the field is a data race (the writer previously
+// mutated it bare). They take e.mu — the same lock IsPaused() reads under —
+// so the flag is always observed consistently.
+func (e *Engine) getDiskPaused() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.diskPaused
+}
+
+func (e *Engine) setDiskPaused(v bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.diskPaused = v
 }
 
 func (e *Engine) SetDiskFreeRatio(f func() (float64, error)) {
@@ -340,10 +356,17 @@ func (e *Engine) checkDiskHealthy() bool {
 		return true
 	}
 
-	if e.diskPaused {
+	// diskPaused is read concurrently by IsPaused() on the /metrics HTTP
+	// goroutine, so every read/write of it goes through the locked
+	// accessors. checkDiskHealthy itself only runs in the single loop()
+	// goroutine, so the read-modify-write across these calls is not racing
+	// with another writer — only the field accesses need synchronisation.
+	// We deliberately do NOT hold e.mu across audit.Log / notifier.Notify
+	// (those do I/O and could block or re-enter).
+	if e.getDiskPaused() {
 		// Currently paused. Only resume above the hysteresis ceiling.
 		if ratio >= DiskResumeRatio {
-			e.diskPaused = false
+			e.setDiskPaused(false)
 			pct := int(ratio * 100)
 			log.Printf("disk: free=%d%% — resuming engine loop", pct)
 			e.audit.Log(audit.Entry{
@@ -360,12 +383,12 @@ func (e *Engine) checkDiskHealthy() bool {
 				)
 			}
 		}
-		return !e.diskPaused
+		return !e.getDiskPaused()
 	}
 
 	// Currently healthy. Pause if we cross the low threshold.
 	if ratio < DiskPauseRatio {
-		e.diskPaused = true
+		e.setDiskPaused(true)
 		pct := int(ratio * 100)
 		log.Printf("disk: free=%d%% — pausing engine loop (threshold=%d%%)", pct, int(DiskPauseRatio*100))
 		e.audit.Log(audit.Entry{
@@ -998,6 +1021,14 @@ func (e *Engine) processTask(parentCtx context.Context, task *Task) {
 
 	defer func() {
 		cancel()
+		// Tear down the budget's watchdog goroutine + timer now that the task
+		// is terminal. Without this, b.run keeps blocking on its multi-hour
+		// timer (cancel() above only cancels the child context, not the
+		// budget's own context derived from the shared engine-lifetime
+		// parent), leaking a goroutine + timer per completed task until the
+		// timer eventually fires. Stop is idempotent and does not affect
+		// Exhausted().
+		budget.Stop()
 		e.mu.Lock()
 		e.currentTaskID = ""
 		e.currentTaskConvID = ""
@@ -1626,6 +1657,46 @@ func (e *Engine) maskToolCall(tc managerclient.ToolCall) managerclient.ToolCall 
 	return tc
 }
 
+// guardrailCommand renders the command string the guardrail engine and the
+// risk classifier pattern-match against. For most tools this is just
+// ToolCall.InputString(). For the editor tool family
+// (str_replace_based_edit_tool / text_editor / str_replace_editor),
+// InputString() returns ONLY the verb (Input["command"] = "create" /
+// "view" / "str_replace" / "insert") — the target file PATH lives in
+// Input["path"] and would never reach the path-matching policies
+// (FileSystemPolicy / CredentialAccessPolicy). That bypassed the entire
+// sensitive-file guardrail for the whole editor surface, letting the
+// manager silently overwrite ~/.ssh/authorized_keys or read private keys
+// with no approval card. Splicing the path into the command string is what
+// lets those policies match (their regexes already run for editor actions;
+// they just had nothing to match against). The verb is kept up front so the
+// classifier prompt and any "verb path" reasoning still read naturally.
+func guardrailCommand(tc managerclient.ToolCall) string {
+	if isEditorToolName(tc.Name) {
+		verb := tc.Input["command"]
+		path := tc.Input["path"]
+		switch {
+		case verb != "" && path != "":
+			return verb + " " + path
+		case path != "":
+			return path
+		}
+	}
+	return tc.InputString()
+}
+
+// isEditorToolName reports whether the tool name is one of the editor
+// variants the engine routes to executeTextEditorTool. Mirrors the dispatch
+// in executeTool and the guardrails.isShellOrEditorAction allowlist.
+func isEditorToolName(name string) bool {
+	switch name {
+	case "str_replace_based_edit_tool", "text_editor", "str_replace_editor":
+		return true
+	default:
+		return false
+	}
+}
+
 // runToolBlock handles guardrails, optional user confirmation, and tool
 // execution for a single tool_use block. Returns a ToolResult ready to send
 // back to the manager on the next turn. The skip return is true only when the
@@ -1666,11 +1737,22 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 	// safety, and they neither persist nor transmit it. executeTool also
 	// uses the real tc so the resolved secret reaches the child process.
 	tcMasked := e.maskToolCall(tc)
-	maskedInput := tcMasked.InputString()
+	// guardrailCommand (not InputString) so the editor tool's target PATH is
+	// included for audit/approval rendering — otherwise the audit Details for
+	// a `text_editor create ~/.ssh/authorized_keys` would read only
+	// "text_editor: create" and the operator could not see which file was
+	// touched. Built from the MASKED copy so an inline secret in the path or
+	// file_text never lands in the audit log / approval card.
+	maskedInput := guardrailCommand(tcMasked)
 
+	// guardrailCommand splices the editor tool's PATH into the command string
+	// the policies pattern-match against. tc.InputString() alone returns only
+	// the verb for editor tools, so FileSystemPolicy / CredentialAccessPolicy
+	// would see "create" and never match ~/.ssh/* etc. — the guardrail was
+	// fully bypassed for the editor surface.
 	decision := e.guardrails.Evaluate(guardrails.Action{
 		Type:    tc.Name,
-		Command: tc.InputString(),
+		Command: guardrailCommand(tc),
 		TaskID:  task.ID,
 	})
 
@@ -1713,7 +1795,7 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 			chatCtx := e.recentChatForClassifier(task.ConversationID, 12)
 			result := e.classifier.Classify(ctx, guardrails.Action{
 				Type:    tc.Name,
-				Command: tc.InputString(),
+				Command: guardrailCommand(tc),
 				TaskID:  task.ID,
 			}, decision, task.Instruction, chatCtx)
 			classifierVerdict = result.Verdict

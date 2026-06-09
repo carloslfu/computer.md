@@ -1,3 +1,5 @@
 vibecraft-daemon-linux-amd64
 vibecraft-daemon-linux-amd64.sha256
 manifest.json
+# local `go build`/`make build` output
+daemon

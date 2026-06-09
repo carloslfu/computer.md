@@ -50,6 +50,14 @@ type Client struct {
 	fetched time.Time
 	lastTry time.Time
 
+	// bootstrap holds the genuinely-immutable kids pre-loaded at
+	// construction (the on-disk PEM). These are the ONLY entries
+	// re-added across a successful refresh — every other kid is rebuilt
+	// from the freshly-fetched JWKS so a kid the platform removed
+	// (e.g. a compromised key) is actually dropped, not re-added
+	// forever. Never mutated after NewClient, so reads need no lock.
+	bootstrap map[string]*rsa.PublicKey
+
 	// Observability counters (Workstream K). Bumped atomically; read by
 	// /metrics. Kept inside the client so callers don't need to wrap
 	// every call site with an instrumentation shim.
@@ -89,15 +97,17 @@ func WithLogger(l *log.Logger) Option {
 // before the first successful platform refresh.
 func NewClient(url string, bootstrapKid string, bootstrapKey *rsa.PublicKey, opts ...Option) *Client {
 	c := &Client{
-		url:     url,
-		httpc:   &http.Client{Timeout: 10 * time.Second},
-		logger:  log.Default(),
-		ttl:     24 * time.Hour,
-		minWait: time.Minute,
-		cache:   make(map[string]*rsa.PublicKey),
+		url:       url,
+		httpc:     &http.Client{Timeout: 10 * time.Second},
+		logger:    log.Default(),
+		ttl:       24 * time.Hour,
+		minWait:   time.Minute,
+		cache:     make(map[string]*rsa.PublicKey),
+		bootstrap: make(map[string]*rsa.PublicKey),
 	}
 	if bootstrapKey != nil {
 		c.cache[bootstrapKid] = bootstrapKey
+		c.bootstrap[bootstrapKid] = bootstrapKey
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -147,10 +157,14 @@ func (c *Client) tryRefresh() {
 	c.refresh()
 }
 
-// refresh fetches the JWKS document and replaces the cache. Bootstrap
-// keys that aren't in the upstream document are preserved so a daemon
-// can continue to verify legacy tokens while the platform retires the
-// old kid.
+// refresh fetches the JWKS document and rebuilds the live cache from
+// it. The freshly-fetched key set is the authority: a kid the platform
+// removed (e.g. a compromised key being revoked fleet-wide) is dropped,
+// not carried over. Only the genuinely-immutable bootstrap kids (the
+// on-disk PEM) are unioned back in so a daemon can still verify legacy
+// tokens while the platform retires that one kid. On any fetch failure
+// the existing cache is left untouched (see the early returns below),
+// so a transient network error never bricks verification.
 func (c *Client) refresh() {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, c.url, nil)
 	if err != nil {
@@ -194,16 +208,21 @@ func (c *Client) refresh() {
 		newCache[k.Kid] = pub
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Preserve bootstrap entries (e.g. the on-disk PEM kid) so a daemon
-	// can still verify legacy tokens while the platform retires the kid.
-	for kid, key := range c.cache {
+	// Union ONLY the immutable bootstrap kids back in — never the rest
+	// of the previous live cache. This is what makes revocation real:
+	// a kid the freshly-fetched JWKS no longer lists is absent from
+	// newCache and stays absent, so a compromised key removed by the
+	// platform stops verifying after this refresh. Bootstrap is set
+	// once at construction and never mutated, so reading it without the
+	// lock is safe.
+	for kid, key := range c.bootstrap {
 		if _, ok := newCache[kid]; !ok {
 			newCache[kid] = key
 		}
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.cache = newCache
 	c.fetched = time.Now()
 	c.mRefreshOK.Add(1)

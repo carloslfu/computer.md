@@ -250,6 +250,62 @@ func TestKeyFor_BootstrapSurvivesRefresh(t *testing.T) {
 	}
 }
 
+// TestKeyFor_RevokedKidDropped is the fleet-wide revocation drill: a
+// non-bootstrap kid the daemon learned from the platform must STOP
+// verifying once the platform removes it from the JWKS document and the
+// daemon refreshes. Pre-fix, refresh() re-added every previously-cached
+// kid forever, so the revoked kid kept verifying indefinitely (a
+// compromised signing key could never be revoked). Post-fix, the live
+// cache is rebuilt from the freshly-fetched JWKS (union only the
+// immutable bootstrap kids), so the removed kid is dropped.
+func TestKeyFor_RevokedKidDropped(t *testing.T) {
+	keyA := mustGenKey(t) // stays in the JWKS the whole time
+	keyB := mustGenKey(t) // will be revoked (removed from JWKS)
+
+	srv := newJwksServer(
+		pubJWK(t, &keyA.PublicKey, "test-1"),
+		pubJWK(t, &keyB.PublicKey, "compromised-2"),
+	)
+	defer srv.close()
+
+	c := NewClient(srv.server.URL, "vibecraft-1", nil,
+		WithTTL(time.Hour),
+		WithMinWait(time.Millisecond), // allow rapid refresh in tests
+		WithLogger(silentLogger(t)),
+	)
+
+	// First refresh learns both kids.
+	got, err := c.KeyFor("compromised-2")
+	if err != nil {
+		t.Fatalf("initial lookup of compromised-2: %v", err)
+	}
+	if got.N.Cmp(keyB.PublicKey.N) != 0 {
+		t.Fatalf("wrong key for compromised-2 before revocation")
+	}
+
+	// Platform revokes the compromised kid: it is removed from the JWKS
+	// document. test-1 remains.
+	srv.setKeys(pubJWK(t, &keyA.PublicKey, "test-1"))
+
+	// Trigger a successful refresh that picks up the new document. A
+	// stale-TTL/unknown-kid lookup runs refresh(); ForceRefresh keeps
+	// this independent of the rate limiter timing.
+	if err := c.ForceRefresh(); err != nil {
+		t.Fatalf("force refresh after revocation: %v", err)
+	}
+
+	// The non-revoked kid must still verify.
+	if _, err := c.KeyFor("test-1"); err != nil {
+		t.Fatalf("non-revoked kid lost after refresh: %v", err)
+	}
+
+	// The revoked kid must NO LONGER verify. Pre-fix this returns the
+	// cached key (bug); post-fix it is an unknown-kid error.
+	if _, err := c.KeyFor("compromised-2"); err == nil {
+		t.Fatalf("revoked kid still verifies after refresh: revocation is a no-op")
+	}
+}
+
 func TestForceRefresh(t *testing.T) {
 	keyA := mustGenKey(t)
 	srv := newJwksServer(pubJWK(t, &keyA.PublicKey, "test-1"))

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -175,6 +176,16 @@ func (c *Client) do(req *http.Request, result interface{}) error {
 	// only retry on 429 (since the daemon explicitly told us to back
 	// off — the request never executed against business state) and on
 	// pre-flight network errors (the request never landed).
+	//
+	// "Pre-flight" must mean exactly that: a network error is only safe
+	// to retry on a non-idempotent method if the request body was never
+	// written to the wire. A client timeout or a connection drop that
+	// happens AFTER the body has been sent (e.g. while awaiting/reading
+	// the response of a slow daemon) is NOT retryable for POST/PUT/etc —
+	// the daemon may already have processed it, and a replay would
+	// double-apply the side effect. We detect this by wrapping each
+	// attempt's body in a reader that records whether the transport read
+	// any of it: bytes read == the request reached the wire.
 	const maxAttempts = 3
 
 	idempotent := req.Method == http.MethodGet || req.Method == http.MethodHead
@@ -201,6 +212,15 @@ func (c *Client) do(req *http.Request, result interface{}) error {
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
+		// Track whether this attempt's body actually reached the wire.
+		// A bodyless request (GET) is considered "sent" the moment the
+		// transport returns an error, so we only need the sentinel for
+		// non-idempotent methods that carry a body.
+		sent := &sentinelReader{}
+		if !idempotent && req.Body != nil {
+			req.Body = sent.wrap(req.Body)
+		}
+
 		err := c.doOnce(req, result)
 		if err == nil {
 			return nil
@@ -212,8 +232,14 @@ func (c *Client) do(req *http.Request, result interface{}) error {
 		canRetry := false
 		var sleepFor time.Duration
 		if isNetErr(err) {
-			canRetry = true
-			sleepFor = backoff(attempt)
+			// Idempotent methods retry any transport error. Non-idempotent
+			// methods retry ONLY when the request was provably never sent
+			// (body untouched by the transport) — otherwise we risk a
+			// duplicate side effect.
+			if idempotent || !sent.read() {
+				canRetry = true
+				sleepFor = backoff(attempt)
+			}
 		} else if errorsAs(err, &apiErr) {
 			switch {
 			case apiErr.StatusCode == 429:
@@ -235,6 +261,45 @@ func (c *Client) do(req *http.Request, result interface{}) error {
 	}
 	return lastErr
 }
+
+// sentinelReader wraps a request body and records whether the HTTP
+// transport read any bytes from it. If the transport read nothing, the
+// request never reached the wire (a pre-flight failure such as DNS or
+// connection-refused) and is safe to retry even for non-idempotent
+// methods. If any bytes were read, the request was at least partially
+// sent and must not be replayed for non-idempotent methods.
+//
+// The flag is read after doOnce returns, by which point the transport's
+// own goroutines have finished with the body, so a plain bool guarded by
+// the surrounding sequential control flow is sufficient — but the
+// transport may read the body from a separate goroutine, so we use an
+// atomic to be race-free under `go test -race`.
+type sentinelReader struct {
+	sawRead int32
+}
+
+func (s *sentinelReader) wrap(body io.ReadCloser) io.ReadCloser {
+	return &sentinelBody{s: s, inner: body}
+}
+
+func (s *sentinelReader) read() bool {
+	return atomic.LoadInt32(&s.sawRead) != 0
+}
+
+type sentinelBody struct {
+	s     *sentinelReader
+	inner io.ReadCloser
+}
+
+func (b *sentinelBody) Read(p []byte) (int, error) {
+	n, err := b.inner.Read(p)
+	if n > 0 {
+		atomic.StoreInt32(&b.s.sawRead, 1)
+	}
+	return n, err
+}
+
+func (b *sentinelBody) Close() error { return b.inner.Close() }
 
 // doOnce is the single-attempt HTTP call without any retry logic.
 func (c *Client) doOnce(req *http.Request, result interface{}) error {

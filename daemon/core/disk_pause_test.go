@@ -3,7 +3,9 @@
 package core
 
 import (
+	"math"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -102,3 +104,59 @@ type boomErr struct{}
 func (boomErr) Error() string { return "boom" }
 
 var errBoom = boomErr{}
+
+// TestCheckDiskHealthy_NoRaceWithIsPaused drives the disk-health writer
+// (checkDiskHealthy, on its own goroutine, flapping the free-space ratio
+// across the pause/resume thresholds) concurrently with the IsPaused()
+// reader (the /metrics surface). Run under `go test -race`, this fails on
+// the unsynchronised-field version of the code where checkDiskHealthy
+// mutated e.diskPaused without holding e.mu while IsPaused read it under the
+// lock. With the locked accessors both sides agree on the lock and the race
+// detector stays quiet.
+func TestCheckDiskHealthy_NoRaceWithIsPaused(t *testing.T) {
+	db := testDB(t)
+	e := testEngine(t, db, nil)
+
+	// Ratio flaps below the pause floor and above the resume ceiling so the
+	// writer keeps flipping diskPaused on real transitions, not a constant.
+	var ratioBits uint64 // float64 bits, swapped atomically by the flapper
+	storeRatio := func(f float64) { atomic.StoreUint64(&ratioBits, math.Float64bits(f)) }
+	storeRatio(0.20)
+	e.SetDiskFreeRatio(func() (float64, error) {
+		return math.Float64frombits(atomic.LoadUint64(&ratioBits)), nil
+	})
+
+	const iters = 2000
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// Flapper: alternate the free-space ratio across the thresholds.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if i%2 == 0 {
+				storeRatio(0.05) // below pause floor
+			} else {
+				storeRatio(0.20) // above resume ceiling
+			}
+		}
+	}()
+
+	// Writer: the engine's disk-health check (mutates diskPaused).
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			e.checkDiskHealthy()
+		}
+	}()
+
+	// Reader: the /metrics observer.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			_ = e.IsPaused()
+		}
+	}()
+
+	wg.Wait()
+}

@@ -123,6 +123,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, fmt.Sprintf("parsing multipart form: %v", err), http.StatusBadRequest)
 		return
 	}
+	// Go does not auto-remove the temp files ParseMultipartForm spills to
+	// $TMPDIR for parts beyond the in-memory budget. Remove them on every
+	// exit path once the form has parsed successfully.
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
 
 	convID := r.FormValue("conversation_id")
 	if convID == "" {
@@ -350,9 +356,71 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	w.Header().Set("Content-Type", ctype)
+	// Harden against stored XSS. Inbox files are uploaded by control-tier
+	// principals (team members, agents) and served from the SAME origin as
+	// the authenticated SPA, sharing the vc_session cookie. An uploaded
+	// evil.html / evil.svg would otherwise execute in the machineHost origin
+	// on a top-level navigation. Force a benign content type, stop sniffing,
+	// and serve as a download so the browser never renders it as active
+	// content. See setDownloadSecurityHeaders.
 	w.Header().Set("Cache-Control", "private, max-age=3600")
+	setDownloadSecurityHeaders(w.Header(), name, ctype)
 	http.ServeContent(w, r, name, info.ModTime(), f)
+}
+
+// downloadSafeContentTypes is the allowlist of types we still serve with
+// their real Content-Type (for in-app <img>/preview rendering). Everything
+// else is forced to application/octet-stream so an attacker-supplied .html
+// or .svg can never be rendered as active content on the SPA origin. SVG is
+// deliberately NOT here — it can carry inline <script>.
+var downloadSafeContentTypes = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+	"image/webp": true,
+	"image/avif": true,
+}
+
+// setDownloadSecurityHeaders kills the stored-XSS path for files served from
+// the authenticated machine origin (inbox uploads, agent-written files).
+// It always sets X-Content-Type-Options: nosniff and Content-Disposition:
+// attachment, and downgrades any non-allowlisted content type to
+// application/octet-stream so the browser cannot execute it as HTML/JS/SVG.
+// The caller's Content-Type is only honored for the known-safe raster image
+// types in downloadSafeContentTypes.
+func setDownloadSecurityHeaders(h http.Header, filename, ctype string) {
+	bare := ctype
+	if i := strings.Index(bare, ";"); i >= 0 {
+		bare = bare[:i]
+	}
+	bare = strings.TrimSpace(strings.ToLower(bare))
+	if !downloadSafeContentTypes[bare] {
+		ctype = "application/octet-stream"
+	}
+	h.Set("Content-Type", ctype)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Disposition", "attachment; filename=\""+sanitizeContentDispositionFilename(filename)+"\"")
+}
+
+// sanitizeContentDispositionFilename strips characters that could break out
+// of the quoted Content-Disposition filename token (quotes, backslashes,
+// control chars). Inbox/agent names are already path-segment-validated, but
+// the header value is a separate trust boundary.
+func sanitizeContentDispositionFilename(name string) string {
+	name = filepath.Base(name)
+	var b strings.Builder
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f || r == '"' || r == '\\' {
+			b.WriteByte('_')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := b.String()
+	if out == "" {
+		return "download"
+	}
+	return out
 }
 
 func ensureInboxConversationDir(inboxRoot, convID string) (string, error) {

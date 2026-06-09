@@ -5,12 +5,36 @@ package core
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/carloslfu/computer.md/daemon/computer"
 	managerclient "github.com/carloslfu/computer.md/daemon/manager"
 )
+
+// promptCapture is a race-safe holder for the system prompt the engine passes
+// to the mock manager. The mock's callback runs on the engine's background
+// agent-loop goroutine while the test body polls + asserts from the test
+// goroutine; a bare `var s string` shared across the two is a data race the
+// -race detector flags (and CI now runs -race). Guard the handoff with a
+// mutex so the gate stays green and the test reflects real synchronization.
+type promptCapture struct {
+	mu  sync.Mutex
+	val string
+}
+
+func (p *promptCapture) set(s string) {
+	p.mu.Lock()
+	p.val = s
+	p.mu.Unlock()
+}
+
+func (p *promptCapture) get() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.val
+}
 
 // fakeScreenshotter returns canned base64 data so engine tests can exercise
 // the screenshot flow without a real X display.
@@ -502,9 +526,9 @@ func TestActivityInjectedIntoContext(t *testing.T) {
 		"",
 	)
 
-	var capturedSystemPrompt string
+	var captured promptCapture
 	manager := &mockManager{fn: func(_ context.Context, systemPrompt string, _ []managerclient.Message) (*managerclient.Response, error) {
-		capturedSystemPrompt = systemPrompt
+		captured.set(systemPrompt)
 		return &managerclient.Response{
 			StopReason:  "end_turn",
 			TextContent: "ok",
@@ -527,7 +551,7 @@ func TestActivityInjectedIntoContext(t *testing.T) {
 	// Wait for the task to run.
 	deadline := time.After(5 * time.Second)
 	for {
-		if capturedSystemPrompt != "" {
+		if captured.get() != "" {
 			break
 		}
 		select {
@@ -538,6 +562,7 @@ func TestActivityInjectedIntoContext(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	capturedSystemPrompt := captured.get()
 	if !strings.Contains(capturedSystemPrompt, "What you've done recently") {
 		t.Errorf("system prompt missing activity section header; got:\n%s", capturedSystemPrompt)
 	}
@@ -557,9 +582,9 @@ func TestActivityExcludedFromMemorySearch(t *testing.T) {
 	db := testDB(t)
 	tasks := NewTaskStore(db)
 
-	var capturedSystemPrompt string
+	var captured promptCapture
 	manager := &mockManager{fn: func(_ context.Context, systemPrompt string, _ []managerclient.Message) (*managerclient.Response, error) {
-		capturedSystemPrompt = systemPrompt
+		captured.set(systemPrompt)
 		return &managerclient.Response{
 			StopReason:  "end_turn",
 			TextContent: "ok",
@@ -588,7 +613,7 @@ func TestActivityExcludedFromMemorySearch(t *testing.T) {
 
 	deadline := time.After(5 * time.Second)
 	for {
-		if capturedSystemPrompt != "" {
+		if captured.get() != "" {
 			break
 		}
 		select {
@@ -599,6 +624,7 @@ func TestActivityExcludedFromMemorySearch(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	capturedSystemPrompt := captured.get()
 	// The preference should be present in the memory section.
 	if !strings.Contains(capturedSystemPrompt, "production api on Vercel") {
 		t.Errorf("preference memory not present in system prompt")

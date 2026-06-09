@@ -3,8 +3,13 @@
 package routes
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -20,6 +25,68 @@ const (
 	maxPort       = 65535
 	maxRoutes     = 50
 )
+
+// vibecraftUser is the local user that owns hosted-app systemd-user
+// units. Mirrors the constant in app_service.go (package main); the
+// daemon's whole model is one customer per machine, one service
+// identity for everything the manager runs.
+const vibecraftUser = "vibecraft"
+
+// systemdUserDir is the per-user systemd unit directory that
+// install-app-service writes hosted-app units (<name>.service) and
+// their 0600 secret sidecars (<name>.env) into. Kept in lockstep with
+// app_service.go's systemdUserDir. A var (not const) only so tests can
+// redirect it at a temp dir — production never reassigns it.
+var systemdUserDir = "/home/vibecraft/.config/systemd/user"
+
+// Teardown seam. Hosted-app teardown shells out exactly the way
+// install-app-service does (sudo -u vibecraft systemctl --user ...),
+// but the routes package can't reach package main's runner helpers, so
+// it carries equivalents here behind function variables. Tests redirect
+// them to record invocations without touching a real systemd/host.
+var (
+	// runUserSystemctlFn runs `systemctl --user <args...>` as the
+	// vibecraft user with XDG_RUNTIME_DIR set, returning combined
+	// output. Mirrors app_service.go runAsVibecraftUser.
+	runUserSystemctlFn = runUserSystemctl
+	// removeFileFn removes a single on-disk path. Indirected so the
+	// teardown test can assert the unit + env files are removed
+	// without a real filesystem.
+	removeFileFn = func(path string) error {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	// regenReload indirects the Caddyfile regenerate+reload so the
+	// teardown test can exercise Unregister without a real /etc/caddy or
+	// caddy binary. Production never reassigns it.
+	regenReload = (*Manager).regenerateAndReload
+)
+
+// runUserSystemctl runs a `systemctl --user` subcommand as the
+// vibecraft user. Uses sudo (daemon runs as root; root→uid sudo never
+// prompts) and sets XDG_RUNTIME_DIR so `--user` can reach the user
+// manager — the same mechanism app_service.go uses for install.
+func runUserSystemctl(ctx context.Context, args ...string) (string, error) {
+	u, err := user.Lookup(vibecraftUser)
+	if err != nil {
+		return "", fmt.Errorf("looking up %s user: %w", vibecraftUser, err)
+	}
+	runtimeDir := "/run/user/" + u.Uid
+
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	full := append([]string{
+		"-u", vibecraftUser,
+		"--preserve-env=XDG_RUNTIME_DIR",
+		"systemctl", "--user",
+	}, args...)
+	cmd := exec.CommandContext(cctx, "sudo", full...)
+	cmd.Env = append(os.Environ(), "XDG_RUNTIME_DIR="+runtimeDir)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
 
 var validName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
@@ -107,7 +174,17 @@ func (m *Manager) Register(name string, port int) error {
 	return nil
 }
 
-// Unregister removes a route and reloads Caddy.
+// Unregister removes a route, reloads Caddy, and tears down the route's
+// hosted-app systemd-user service if one exists.
+//
+// Removing only the Caddy route used to leave the backend process
+// running (the unit carries Restart=on-failure and the user has linger
+// enabled) and left the 0600 <name>.env sidecar — which holds resolved
+// vault secrets plus the injected VIBECRAFT_AI_CREDITS_TOKEN — on disk
+// indefinitely. The operator believed the tool was gone; it was a
+// zombie service with a live on-disk secret remnant. Teardown closes
+// that gap: stop+disable the unit, then remove the unit file and its
+// secret sidecar.
 func (m *Manager) Unregister(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -116,12 +193,57 @@ func (m *Manager) Unregister(name string) error {
 		return err
 	}
 
-	if err := m.regenerateAndReload(); err != nil {
+	// Tear down the hosted-app service (best-effort). A route may have
+	// no backing systemd unit (a plain port route with no
+	// install-app-service), so a missing unit/file is not an error.
+	teardownAppService(name)
+
+	if err := regenReload(m); err != nil {
 		log.Printf("warning: route %q deleted but Caddy reload failed: %v", name, err)
 		return fmt.Errorf("route deleted but Caddy reload failed: %w", err)
 	}
 
 	return nil
+}
+
+// teardownAppService stops+disables the hosted-app systemd-user unit
+// for name and deletes its unit file and 0600 secret sidecar, then
+// reloads the user manager. Best-effort and idempotent: a route with no
+// backing unit (a plain port route) leaves nothing to clean up, so
+// every step tolerates "not found." Side-effects are logged, never
+// fatal — the Caddy route removal is what the caller most needs to
+// succeed, and a stuck systemctl must not block it.
+func teardownAppService(name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	unitName := name + ".service"
+	unitPath := filepath.Join(systemdUserDir, name+".service")
+	envPath := filepath.Join(systemdUserDir, name+".env")
+
+	// `disable --now` stops the running process AND removes the
+	// enablement symlink in one call. Tolerate failure: the unit may
+	// not exist (plain port route) or the user manager may be down.
+	if out, err := runUserSystemctlFn(ctx, "disable", "--now", unitName); err != nil {
+		log.Printf("teardown: systemctl --user disable --now %s: %v (out=%s)", unitName, err, strings.TrimSpace(out))
+	}
+
+	// Remove the unit file and its secret sidecar. The env file holds
+	// resolved live secrets + the AI-credits token at mode 0600 — this
+	// is the leak the finding flagged, so its removal is the point.
+	if err := removeFileFn(unitPath); err != nil {
+		log.Printf("teardown: removing unit file %s: %v", unitPath, err)
+	}
+	if err := removeFileFn(envPath); err != nil {
+		log.Printf("teardown: removing env file %s: %v", envPath, err)
+	}
+
+	// Reload so the user manager forgets the now-deleted unit. Without
+	// this, `systemctl --user` keeps the stale unit in its in-memory
+	// view until the next reload.
+	if out, err := runUserSystemctlFn(ctx, "daemon-reload"); err != nil {
+		log.Printf("teardown: systemctl --user daemon-reload after removing %s: %v (out=%s)", unitName, err, strings.TrimSpace(out))
+	}
 }
 
 // List returns all registered routes.

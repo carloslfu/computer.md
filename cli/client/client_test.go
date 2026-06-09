@@ -5,8 +5,10 @@ package client
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -148,6 +150,98 @@ func TestDo_DoesNotRetry5xxOnPOST(t *testing.T) {
 		t.Errorf("POST should not retry 5xx; hits=%d", got)
 	}
 }
+
+// TestDo_DoesNotRetryPOSTAfterPostSendTimeout pins the at-most-once
+// contract for non-idempotent methods: once the request body has been
+// sent (the daemon received and may have processed it), a transport
+// failure while awaiting/reading the response must NOT trigger a retry,
+// or the side effect is applied twice. We simulate the common case of a
+// slow daemon: the handler fully reads the request body (so the request
+// landed) then stalls past the client's short timeout, surfacing as a
+// post-send "sending request" error inside doOnce.
+func TestDo_DoesNotRetryPOSTAfterPostSendTimeout(t *testing.T) {
+	var hits int32
+	srv, mux := fakeServer(t)
+	mux.HandleFunc("/api/task/task-1/respond", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		// Drain the body so the request provably landed server-side.
+		_, _ = io.Copy(io.Discard, r.Body)
+		// Stall past the client timeout: the request is done, only the
+		// response is missing — exactly the post-send failure window.
+		time.Sleep(750 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"input received"}`)
+	})
+
+	c := New(srv.URL, "vc_machine_test_abc")
+	c.HTTPClient.Timeout = 200 * time.Millisecond
+
+	err := c.RespondToTask("task-1", "yes")
+	if err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	// The body must have been delivered exactly once. A retry here would
+	// double-apply the user's reply to a waiting_for_input task.
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("post-send timeout on POST must not retry; handler hit %d times, want 1", got)
+	}
+}
+
+// TestDo_RetriesPOSTOnPreSendNetworkError confirms the safe half of the
+// contract still holds: a pre-send connection failure (request never
+// written) is retryable even for non-idempotent methods, because no side
+// effect could have been applied yet.
+func TestDo_RetriesPOSTOnPreSendNetworkError(t *testing.T) {
+	var hits int32
+	srv, mux := fakeServer(t)
+	mux.HandleFunc("/api/task/task-1/respond", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"input received"}`)
+	})
+
+	c := New(srv.URL, "vc_machine_test_abc")
+	c.HTTPClient.Timeout = 2 * time.Second
+	// First attempt fails pre-send (connection refused on a dead port),
+	// then we repoint at the live server to prove the retry happened.
+	c.BaseURL = "http://127.0.0.1:1"
+	var attempts int32
+	c.HTTPClient.Transport = preSendThenLive(srv.URL, &attempts)
+
+	if err := c.RespondToTask("task-1", "yes"); err != nil {
+		t.Fatalf("pre-send network error on POST should retry and then succeed: %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got < 2 {
+		t.Errorf("expected a retry after pre-send failure; transport attempts=%d", got)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("server should have been hit exactly once after retry; hits=%d", got)
+	}
+}
+
+// preSendThenLive returns a RoundTripper whose first call fails before the
+// request reaches any server (simulating connection-refused / DNS), and
+// whose subsequent calls are routed to liveURL. It never reads the request
+// body on the failing call, mirroring a real pre-flight transport error.
+func preSendThenLive(liveURL string, attempts *int32) http.RoundTripper {
+	live := http.DefaultTransport.(*http.Transport).Clone()
+	parsed, _ := neturl.Parse(liveURL)
+	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		n := atomic.AddInt32(attempts, 1)
+		if n == 1 {
+			return nil, &neturl.Error{Op: "Post", URL: req.URL.String(), Err: errConnRefused}
+		}
+		req.URL.Scheme = parsed.Scheme
+		req.URL.Host = parsed.Host
+		return live.RoundTrip(req)
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+var errConnRefused = errors.New("connect: connection refused")
 
 func TestDo_Retries429WithRetryAfter(t *testing.T) {
 	var hits int32

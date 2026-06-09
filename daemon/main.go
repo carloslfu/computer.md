@@ -589,8 +589,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// (the CLI calls it first to decide whether to keep going). The probe
 	// returns only the daemon's version string and schema versions —
 	// nothing customer-specific.
-	dual("/files/", s.withCookieOrBearer(s.handleFiles))
-	dual("/files-ls", s.withCookieOrBearer(s.handleFilesLs))
+	// Control-tier gate even for reads: these endpoints serve raw bytes
+	// from anywhere under /home/vibecraft, which includes worker
+	// subscription credentials (~/.codex/auth.json, ~/.claude/
+	// .credentials.json) and the entire db.md company store. A view-tier
+	// (read-only) principal must NOT be able to exfiltrate those, so we
+	// mirror /keys' requireControlTier discipline here. CLI/API-key
+	// callers always carry control tier, so this does not break them.
+	dual("/files/", s.withCookieOrBearer(s.withControlTier(s.handleFiles)))
+	dual("/files-ls", s.withCookieOrBearer(s.withControlTier(s.handleFilesLs)))
 
 	dual("/stream", s.withCookieOrBearer(s.handleStream))
 
@@ -708,6 +715,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// platform-compromise threat these endpoints exist to answer.
 	dual("/management/refresh-jwks", s.withHealthAuth(s.handleManagementRefreshJWKS))
 	dual("/management/revoke-sessions", s.withHealthAuth(s.handleManagementRevokeSessions))
+	// Revoke every brokered vc_machine_* daemon key owned by a userId.
+	// Same HEALTH-token auth as refresh-jwks/revoke-sessions: the platform
+	// calls this on control-access revoke / team-member removal so the
+	// long-lived, never-expiring CLI key the daemon mints locally can't
+	// outlive the control grant that authorized it. The daemon token is
+	// machine-local and never reaches the platform, so it can't gate a
+	// platform→daemon call here (same reasoning as the JWKS/session
+	// incident-response handlers above).
+	dual("/management/revoke-keys", s.withHealthAuth(s.handleManagementRevokeKeys))
 	// Push-to-user bridge (localhost only — the manager calls this via
 	// curl from bash, exactly like /daemon/task and /routes: only
 	// processes on this machine reach loopback; Caddy sets
@@ -1576,6 +1592,52 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]interface{}{"tasks": tasks})
 }
 
+// idempotencyKeyLocks serializes concurrent submissions that carry the
+// same idempotency key. The lookup→create→store sequence in handleTask
+// is otherwise a TOCTOU window: idempotencyLookup and idempotencyStoreSet
+// each take idempotencyMu independently and release it between, so two
+// near-simultaneous (or retried) POSTs with the same key both miss the
+// lookup and both call CreateTask, producing duplicate tasks — double
+// side-effects and double manager billing. Holding a per-key lock across
+// the whole sequence makes the claim atomic: the second caller blocks
+// until the first stores its task id, then its lookup hits and it returns
+// the SAME task. Keyed locks (not the global idempotencyMu) so unrelated
+// keys never serialize against each other.
+var (
+	idempotencyKeyLocksMu sync.Mutex
+	idempotencyKeyLocks   = map[string]*idempotencyKeyLock{}
+)
+
+type idempotencyKeyLock struct {
+	mu  sync.Mutex
+	ref int
+}
+
+// acquireIdempotencyKeyLock returns a locked per-key mutex and a release
+// function. The release unlocks and drops the lock from the registry once
+// no waiters remain, so the map stays bounded by in-flight keys only.
+func acquireIdempotencyKeyLock(key string) func() {
+	idempotencyKeyLocksMu.Lock()
+	l, ok := idempotencyKeyLocks[key]
+	if !ok {
+		l = &idempotencyKeyLock{}
+		idempotencyKeyLocks[key] = l
+	}
+	l.ref++
+	idempotencyKeyLocksMu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		idempotencyKeyLocksMu.Lock()
+		l.ref--
+		if l.ref == 0 {
+			delete(idempotencyKeyLocks, key)
+		}
+		idempotencyKeyLocksMu.Unlock()
+	}
+}
+
 // handleTask dispatches POST /task (create) and GET /task (unsupported).
 func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1605,7 +1667,17 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// same task", letting agents safely retry without bookkeeping. If
 	// agents need conflict-on-different-body they can hash the body
 	// themselves.
+	//
+	// Hold a per-key lock across the entire lookup→create→store sequence
+	// so two concurrent (or retried) submissions with the same key can't
+	// both miss the lookup and both create a task. The second caller
+	// blocks here until the first has stored its task id, then its lookup
+	// below hits and returns the same task. Released via defer at the end
+	// of the handler.
 	if req.IdempotencyKey != "" {
+		release := acquireIdempotencyKeyLock(req.IdempotencyKey)
+		defer release()
+
 		if existing, ok := idempotencyLookup(req.IdempotencyKey); ok {
 			task, err := s.taskStore.GetTask(existing)
 			if err == nil {
@@ -2759,6 +2831,65 @@ func (s *Server) handleManagementRevokeSessions(w http.ResponseWriter, r *http.R
 	})
 }
 
+// handleManagementRevokeKeys revokes every brokered vc_machine_* daemon
+// key owned by the given userId. The platform calls this (best-effort) on
+// any control-access revoke / team-member removal so a removed user can't
+// keep driving the machine via a cached CLI key. The vc_machine_* keys
+// live only in the daemon's local SQLite (the platform never stores
+// them), are validated purely locally with no expiry, and unconditionally
+// grant control tier — so without this endpoint the only revoke path was
+// the daemon's own JWT-gated DELETE /keys/{id}, which the platform can't
+// reach. Body: {"userId":"<workos user id>"}. Returns {"revoked":<int>}.
+func (s *Server) handleManagementRevokeKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		UserID string `json:"userId"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.UserID) == "" {
+		jsonError(w, "userId is required", http.StatusBadRequest)
+		return
+	}
+
+	// ListAPIKeys returns only non-revoked keys with their id + created_by
+	// (owner). Revoke each one owned by the target user. Both helpers are
+	// the same ones the daemon's own key management uses, so the local
+	// store stays the single source of truth.
+	keys, err := s.db.ListAPIKeys()
+	if err != nil {
+		jsonError(w, fmt.Sprintf("list keys: %v", err), http.StatusInternalServerError)
+		return
+	}
+	revoked := 0
+	for _, k := range keys {
+		if k.CreatedBy != req.UserID {
+			continue
+		}
+		if err := s.db.RevokeAPIKey(k.ID); err != nil {
+			// A concurrent revoke (already gone) is fine; only log real
+			// errors and keep going so one bad row can't strand the rest.
+			log.Printf("management/revoke-keys: revoke %s: %v", k.ID, err)
+			continue
+		}
+		revoked++
+	}
+
+	s.auditLog.Log(audit.Entry{
+		Action:    "api_keys_revoked_for_user",
+		Category:  "security",
+		UserID:    req.UserID,
+		Details:   fmt.Sprintf("revoked=%d", revoked),
+		RiskLevel: "high",
+	})
+	jsonResponse(w, http.StatusOK, map[string]any{"revoked": revoked})
+}
+
 // --- CORS middleware ---
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -2939,6 +3070,22 @@ func (s *Server) requireControlTier(w http.ResponseWriter, r *http.Request) bool
 	}
 	jsonError(w, "Control access required", http.StatusForbidden)
 	return false
+}
+
+// withControlTier wraps a handler so that even read methods require the
+// control access tier. It is the middleware form of requireControlTier,
+// used at registration time to gate endpoints (like the file-read
+// surface) whose authenticated middleware records the caller's tier in
+// context but does not itself enforce it. Must be applied INSIDE the
+// auth middleware (e.g. withCookieOrBearer(withControlTier(h))) so the
+// tier is already on the context when this runs.
+func (s *Server) withControlTier(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireControlTier(w, r) {
+			return
+		}
+		next(w, r)
+	}
 }
 
 // presenceUserFromCtx builds a PresenceUser from the request context.

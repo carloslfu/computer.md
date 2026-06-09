@@ -46,7 +46,19 @@ func WildcardFQDNs(pol EgressPolicy) []string {
 // ResolveFQDNs eagerly resolves the concrete (non-wildcard) names to a
 // sorted, de-duplicated IPv4 list. Used for static pre-population; the
 // live path is the DNSProxy.
-func ResolveFQDNs(ctx context.Context, fqdns []string) []string {
+//
+// Resolved addresses are run through the same SSRF / DNS-rebinding guard
+// as the live path (allowSetIPAllowed): an internal/metadata IP a name
+// happens to resolve to is dropped here too, so pre-population can't seed
+// the allow set with the IMDS endpoint or an RFC1918 service. The
+// optional pol carries the operator's static AllowCIDRs escape hatch;
+// callers that don't thread a policy filter against an empty one (no
+// escape hatch), preserving the existing call signature.
+func ResolveFQDNs(ctx context.Context, fqdns []string, pol ...EgressPolicy) []string {
+	var p EgressPolicy
+	if len(pol) > 0 {
+		p = pol[0]
+	}
 	r := &net.Resolver{}
 	seen := map[string]bool{}
 	var ips []string
@@ -59,10 +71,12 @@ func ResolveFQDNs(ctx context.Context, fqdns []string) []string {
 			continue
 		}
 		for _, a := range addrs {
-			if s := a.String(); !seen[s] {
-				seen[s] = true
-				ips = append(ips, s)
+			s := a.String()
+			if seen[s] || !allowSetIPAllowed(s, p) {
+				continue
 			}
+			seen[s] = true
+			ips = append(ips, s)
 		}
 	}
 	sort.Strings(ips)
@@ -193,6 +207,24 @@ func (p *DNSProxy) handle(ctx context.Context, req []byte, raddr *net.UDPAddr) {
 	if addrs, err := p.res.LookupIP(rctx, "ip4", name); err == nil {
 		ipsv4 = addrs
 	}
+	// SSRF / DNS-rebinding guard: drop any resolved address that targets
+	// the host, the cloud IMDS endpoint (169.254.169.254), an RFC1918/
+	// link-local internal service, or the sandbox /30 mesh BEFORE it can
+	// reach the allow set or the answer. Allowlisting a NAME must not
+	// implicitly allowlist whatever internal IP it resolves to at request
+	// time (see allowSetIPAllowed). Operator-declared static AllowCIDRs
+	// are the one explicit escape hatch. A name that resolves ONLY to
+	// filtered addresses is answered empty NOERROR — a rebinding answer
+	// can't smuggle an internal target in.
+	safe := ipsv4[:0:0]
+	for _, ip := range ipsv4 {
+		if allowSetIPAllowed(ip.String(), p.pol) {
+			safe = append(safe, ip)
+		} else {
+			log.Printf("egress-dns-filter sandbox=%s fqdn=%s ip=%s (dropped: internal/metadata address)", p.id, name, ip.String())
+		}
+	}
+	ipsv4 = safe
 	if len(ipsv4) == 0 {
 		p.conn.WriteToUDP(buildResponse(req, name, qtype, nil, rcodeNoError), raddr)
 		return

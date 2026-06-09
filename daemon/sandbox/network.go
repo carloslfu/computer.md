@@ -5,10 +5,88 @@ package sandbox
 import (
 	"fmt"
 	"hash/fnv"
+	"net"
 	"regexp"
 	"sort"
 	"strings"
 )
+
+// sandboxIPRange is the /16 carved up into per-sandbox /30s
+// (SetupNetwork: idx selects 10.77.<idx>.0/30). The DNS proxy must never
+// fold an address from this range into the allow set — that would let an
+// allowlisted name pointed at a peer sandbox's gateway/host IP smuggle
+// lateral access past enforce-mode default-deny.
+var sandboxIPRange = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("10.77.0.0/16")
+	return n
+}()
+
+// cgnatRange is RFC6598 carrier-grade NAT space (100.64.0.0/10). Go's
+// net.IP.IsPrivate covers only RFC1918 + RFC4193, NOT RFC6598, yet CGNAT
+// is internal/host-routable on some cloud and carrier networks, so the
+// allow-set guard rejects it explicitly.
+var cgnatRange = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("100.64.0.0/10")
+	return n
+}()
+
+// allowSetIPAllowed reports whether a resolved address is safe to add to
+// a sandbox's runtime nft allow set. It is the SSRF / DNS-rebinding guard
+// on the DNS-proxy hot path: allowlisting a NAME must not implicitly
+// allowlist whatever IP that name happens to resolve to at request time,
+// so any address that targets the host, the cloud instance-metadata
+// endpoint (IMDS, 169.254.169.254), an RFC1918/CGNAT internal service,
+// or the sandbox /30 mesh is rejected here regardless of the FQDN match.
+//
+// The one escape hatch: an address the operator EXPLICITLY allowlisted as
+// an exact static CIDR via EgressPolicy.AllowCIDRs is permitted, because
+// that is a deliberate, reviewed choice (and such CIDRs are emitted as
+// their own `ip daddr <cidr> accept` lines anyway). ipStr is a bare IPv4
+// literal as produced by net.IP.String().
+func allowSetIPAllowed(ipStr string, pol EgressPolicy) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if staticCIDRAllows(ip, pol) {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() || ip.IsPrivate() ||
+		sandboxIPRange.Contains(ip) || cgnatRange.Contains(ip) {
+		return false
+	}
+	return true
+}
+
+// staticCIDRAllows reports whether ip falls inside a CIDR the operator
+// explicitly listed in EgressPolicy.AllowCIDRs. Malformed CIDRs are
+// skipped (RenderForwardNftables already rejects the ruleset on those).
+func staticCIDRAllows(ip net.IP, pol EgressPolicy) bool {
+	for _, c := range pol.AllowCIDRs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			continue
+		}
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterAllowSetIPs keeps only the addresses safe to push to the nft
+// allow set (see allowSetIPAllowed). Order is preserved; the caller dedups.
+func filterAllowSetIPs(ips []string, pol EgressPolicy) []string {
+	out := ips[:0:0]
+	for _, ip := range ips {
+		if allowSetIPAllowed(ip, pol) {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
 
 // This file is the PURE-LOGIC half of the Phase 1 network story:
 // deterministic name derivation + nftables ruleset *rendering*. It does

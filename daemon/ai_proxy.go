@@ -249,11 +249,31 @@ type aiLedger struct {
 // charge / check operations go through it so the mutex is the only
 // concurrency boundary.
 type budgetService struct {
-	mu          sync.Mutex
-	ledger      aiLedger
+	mu     sync.Mutex
+	ledger aiLedger
+
+	// reservedCents is the sum of worst-case costs for calls that have
+	// passed the gate but whose upstream response (and therefore real
+	// cost) hasn't landed yet. Counting it against the cap is what makes
+	// the budget hold under concurrency: N parallel calls can no longer
+	// each see "room for one more" while the others are still in flight.
+	// Reset to 0 on month rollover (in-flight calls reconcile to the new
+	// month's tally via settle()).
+	reservedCents int
+
 	monthlyCap  int          // cents
 	persistFunc func() error // override for tests
 }
+
+// reserveCents is the worst-case cost we hold against the budget for a
+// single in-flight call before its real usage is known. Sized so a
+// pathological large reasoning response can't blow the cap while admitted:
+// 200k input + 200k output at the Opus-level fallback rate
+// ($15/$75 per Mtok) ≈ $18 → 1800c. allow() admits a call only when the
+// committed + already-reserved spend leaves room for one more reservation,
+// so the worst-case overshoot is bounded by this single reservation rather
+// than (concurrent calls) × (per-call cost).
+const reserveCents = 1800
 
 func newBudgetService() *budgetService {
 	bs := &budgetService{
@@ -322,19 +342,23 @@ func (bs *budgetService) rollOverIfNewMonth() {
 	now := utcMonth(time.Now())
 	if bs.ledger.Month != now {
 		bs.ledger = aiLedger{Month: now}
+		// In-flight reservations from the prior month still settle (their
+		// real cost lands in the new month's tally). Drop the prior month's
+		// reservation total so it doesn't suppress the fresh budget.
+		bs.reservedCents = 0
 	}
 }
 
 // allow returns nil if the budget has headroom, or an error describing
-// why the call should be rejected. The amount-to-deduct is calculated
-// after the upstream response (we don't know in advance how many
-// tokens a request will produce), so this is a "is there ANY room
-// left" gate. A near-zero remaining budget still admits one call.
+// why the call should be rejected. It accounts for BOTH committed spend
+// and in-flight reservations, so a request is rejected once committed +
+// reserved spend has reached the cap. This is a read-only gate (it does
+// not reserve); reserve() is the atomic admit-and-hold the handler uses.
 func (bs *budgetService) allow() error {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 	bs.rollOverIfNewMonth()
-	if bs.ledger.SpentCents >= bs.monthlyCap {
+	if bs.ledger.SpentCents+bs.reservedCents >= bs.monthlyCap {
 		return errBudgetExhausted{
 			Month:       bs.ledger.Month,
 			SpentCents:  bs.ledger.SpentCents,
@@ -342,6 +366,57 @@ func (bs *budgetService) allow() error {
 		}
 	}
 	return nil
+}
+
+// reserve atomically admits a call and holds reserveCents against the
+// budget for the duration of the upstream round-trip. It returns the
+// reserved amount (to pass to settle) and an error when the budget — with
+// committed spend AND all currently in-flight reservations counted — has no
+// room for one more call. Because the check and the reservation happen under
+// a single lock acquisition, N concurrent callers can never all pass the
+// gate while the budget is near the cap: each reservation is visible to the
+// next caller. The worst-case overshoot is one reserveCents, not N×cost.
+func (bs *budgetService) reserve() (int, error) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.rollOverIfNewMonth()
+	if bs.ledger.SpentCents+bs.reservedCents >= bs.monthlyCap {
+		return 0, errBudgetExhausted{
+			Month:       bs.ledger.Month,
+			SpentCents:  bs.ledger.SpentCents,
+			BudgetCents: bs.monthlyCap,
+		}
+	}
+	bs.reservedCents += reserveCents
+	return reserveCents, nil
+}
+
+// settle releases a reservation taken by reserve() and commits the call's
+// real cost. Called exactly once per successful reserve(), after the
+// upstream response is parsed. The reservation is always released (even when
+// the real cost is 0, e.g. an upstream error), so a failed call doesn't
+// permanently pin budget. The real cost is committed to the ledger and the
+// breakdown, mirroring charge().
+func (bs *budgetService) settle(reserved int, model string, costCents int) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.rollOverIfNewMonth()
+	bs.reservedCents -= reserved
+	if bs.reservedCents < 0 {
+		bs.reservedCents = 0
+	}
+	if costCents > 0 {
+		bs.ledger.SpentCents += costCents
+		if bs.ledger.ByModel == nil {
+			bs.ledger.ByModel = map[string]int{}
+		}
+		if model != "" {
+			bs.ledger.ByModel[model] += costCents
+		}
+	}
+	if err := bs.persistFunc(); err != nil {
+		fmt.Fprintf(os.Stderr, "[ai_proxy] persisting ledger failed: %v\n", err)
+	}
 }
 
 // charge adds the cost of a completed call to the ledger and
@@ -588,10 +663,21 @@ func parseOpenAIJSONUsage(body []byte) (in, out int, model string) {
 	return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Model
 }
 
-// parseOpenAISSEUsage scans an OpenAI Chat Completions SSE stream
-// for the final usage event. The Chat Completions stream ends with
-// a chunk that has empty choices but a populated usage object — that's
-// what we look for.
+// parseOpenAISSEUsage scans an OpenAI SSE stream for the final usage event.
+// It handles BOTH streaming surfaces the proxy forwards to:
+//
+//   - Chat Completions (/v1/chat/completions): the stream ends with a chunk
+//     that has empty choices but a top-level `usage` object.
+//
+//   - Responses (/v1/responses): usage is NOT top-level. It is nested as
+//     `response.usage.{input_tokens,output_tokens}` inside the terminal
+//     `response.completed` (or `response.incomplete`) event. Missing this
+//     nesting meant every streamed Responses call parsed to in=0/out=0 and
+//     was billed $0 against the per-machine ledger, so the budget cap never
+//     engaged for that traffic.
+//
+// Both top-level and nested usage are consulted on every data line; whichever
+// the stream provides wins.
 func parseOpenAISSEUsage(streamed []byte) (in, out int, model string) {
 	lines := strings.Split(string(streamed), "\n")
 	for _, l := range lines {
@@ -611,13 +697,25 @@ func parseOpenAISSEUsage(streamed []byte) (in, out int, model string) {
 				InputTokens      int `json:"input_tokens"`
 				OutputTokens     int `json:"output_tokens"`
 			} `json:"usage"`
+			// Responses API terminal event: type=response.completed with the
+			// full response object (model + usage) nested under `response`.
+			Response struct {
+				Model string `json:"model"`
+				Usage struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
+			} `json:"response"`
 		}
 		if err := json.Unmarshal([]byte(payload), &evt); err != nil {
 			continue
 		}
 		if evt.Model != "" {
 			model = evt.Model
+		} else if evt.Response.Model != "" {
+			model = evt.Response.Model
 		}
+		// Top-level usage (Chat Completions).
 		if evt.Usage.InputTokens > 0 {
 			in = evt.Usage.InputTokens
 		} else if evt.Usage.PromptTokens > 0 {
@@ -627,6 +725,14 @@ func parseOpenAISSEUsage(streamed []byte) (in, out int, model string) {
 			out = evt.Usage.OutputTokens
 		} else if evt.Usage.CompletionTokens > 0 {
 			out = evt.Usage.CompletionTokens
+		}
+		// Nested usage (Responses API). Only override when present so a later
+		// non-terminal event can't zero out a value we already captured.
+		if evt.Response.Usage.InputTokens > 0 {
+			in = evt.Response.Usage.InputTokens
+		}
+		if evt.Response.Usage.OutputTokens > 0 {
+			out = evt.Response.Usage.OutputTokens
 		}
 	}
 	return
@@ -654,8 +760,13 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 			return
 		}
 
-		// 2. Budget gate. Cheap check before we burn upstream time/$.
-		if err := s.budget.allow(); err != nil {
+		// 2. Budget gate. Atomically admit-and-reserve before we burn
+		//    upstream time/$. The reservation is held against the cap for
+		//    the whole upstream round-trip and reconciled to the real cost
+		//    in settle() below, so concurrent calls can't each slip past a
+		//    near-cap budget while the others are still in flight.
+		reserved, err := s.budget.reserve()
+		if err != nil {
 			var ex errBudgetExhausted
 			if errors.As(err, &ex) {
 				w.Header().Set("Content-Type", "application/json")
@@ -673,6 +784,19 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 			jsonError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// settled guards against a double-settle on any return path. The
+		// reservation MUST be released exactly once, or it permanently pins
+		// budget. Charge the real cost only on a successful upstream
+		// response (set below); errors settle with cost 0.
+		settled := false
+		var settleModel string
+		var settleCost int
+		defer func() {
+			if !settled {
+				bs := s.budget
+				bs.settle(reserved, settleModel, settleCost)
+			}
+		}()
 
 		// 3. Resolve the upstream path. Our prefix is /api/ai/credits/<provider>;
 		//    whatever the app appended after that is what the upstream
@@ -802,17 +926,26 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 			inTok, outTok, model = spec.parseUsage(body)
 		}
 
-		// 10. Charge the ledger only on successful upstream responses.
-		//     4xx/5xx upstream errors aren't billable; we shouldn't burn
-		//     budget on the customer's bad request.
-		if resp.StatusCode < 400 && (inTok > 0 || outTok > 0) {
-			c := costCents(model, inTok, outTok)
-			s.budget.charge(model, c)
+		// 10. Reconcile the reservation to the call's real cost. Charge the
+		//     ledger only on successful upstream responses — 4xx/5xx upstream
+		//     errors aren't billable, so they settle with cost 0 (releasing
+		//     the reservation without spending budget). The defer performs
+		//     the single settle for every return path.
+		if resp.StatusCode < 400 {
+			settleModel = model
+			settleCost = costCents(model, inTok, outTok)
+			// Defensive: a 200 with no parseable usage (e.g. an upstream
+			// shape we don't recognize) still consumed platform tokens.
+			// Charge a conservative floor rather than billing $0, which
+			// would let unparseable streamed traffic bypass the cap.
+			if settleCost <= 0 {
+				settleCost = 1
+			}
 			s.auditLog.Log(audit.Entry{
 				Action:   "ai_credits_call",
 				Category: "ai_credits",
 				Details: fmt.Sprintf("provider=%s model=%s input_tokens=%d output_tokens=%d cost_cents=%d",
-					spec.name, model, inTok, outTok, c),
+					spec.name, model, inTok, outTok, settleCost),
 				RiskLevel: "low",
 			})
 		}
