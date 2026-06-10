@@ -397,6 +397,13 @@ func runTaskStream(cmd *cobra.Command, args []string) error {
 	// to a completed one and the CLI would exit 0 — an agent then reads
 	// truncation as success. See the close-handling block after Stream().
 	sawTerminal := false
+	// Did the task park on an approval / credential card (waiting_for_input)?
+	// The daemon emits task:waiting / task:credentials_requested for this, with
+	// NO `status` field, so neither the terminal switch nor the status fallback
+	// used to catch it — the SSE stayed open on keepalives FOREVER, blocking an
+	// agent on the very pause that needs it to act. We treat it as terminal for
+	// the stream and map it to exit 3, mirroring `task wait`.
+	sawWaiting := false
 
 	onEvent := func(ev client.StreamEvent) error {
 		// Forward the event as a JSON Lines line. We pass through the
@@ -435,6 +442,13 @@ func runTaskStream(cmd *cobra.Command, args []string) error {
 			case "task:completed", "task:failed", "task:cancelled":
 				sawTerminal = true
 				return terminate
+			case "task:waiting", "task:credentials_requested":
+				// Parked on an approval / credential card. Terminal for the
+				// stream — otherwise it hangs on keepalives until the operator
+				// acts. Resolved to exit 3 after the stream ends.
+				sawTerminal = true
+				sawWaiting = true
+				return terminate
 			case schema.EventFinal:
 				sawTerminal = true
 				return terminate
@@ -445,6 +459,10 @@ func runTaskStream(cmd *cobra.Command, args []string) error {
 				switch statusStr {
 				case "completed", "failed", "cancelled":
 					sawTerminal = true
+					return terminate
+				case "waiting_for_input":
+					sawTerminal = true
+					sawWaiting = true
 					return terminate
 				}
 			}
@@ -466,6 +484,22 @@ func runTaskStream(cmd *cobra.Command, args []string) error {
 	// connection drops, so a clean end IS the success condition.
 	if flagStreamFollowFinal {
 		return nil
+	}
+
+	// The task parked on an approval / credential card. Mirror `task wait`:
+	// resolve the authoritative status and map it to its exit code
+	// (waiting_for_input -> 3) so an agent driving an approval-gated task
+	// unblocks and can act, instead of the stream hanging forever.
+	if sawWaiting {
+		ts := time.Now().UTC().Format(time.RFC3339Nano)
+		if task, getErr := c.GetTask(id); getErr == nil {
+			if code := exit.ForTaskStatus(task.Status); code != exit.OK {
+				_ = output.EmitEvent(schema.EventFinal, ts, map[string]any{"status": task.Status})
+				return &exit.OutcomeError{Code: code}
+			}
+		}
+		// Couldn't confirm, or the task already moved past waiting — fall
+		// through to a clean end rather than inventing an exit code.
 	}
 
 	// Default mode: a stream that ended WITHOUT a terminal event is a

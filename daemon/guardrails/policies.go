@@ -139,6 +139,18 @@ func (p *DangerousCommandPolicy) Evaluate(action Action) Decision {
 		}
 	}
 
+	// Flag-order-agnostic rm check. The regex matchers above anchor the flag
+	// group to the short-flag class -[rfRF]+, so GNU long-form and interleaved
+	// flags bypass them entirely: `rm --recursive --force /` and the canonical
+	// `rm -rf --no-preserve-root /` (the form that actually deletes / on modern
+	// coreutils) were NOT matched and fell through to Allow — irreversible loss
+	// of the whole machine, or of /home/vibecraft (the db.md company brain,
+	// worker creds, ~/systems), reachable via prompt injection. This token-scans
+	// every rm in the command and recognises recursive/force in any form.
+	if d, ok := rmDecision(cmd); ok {
+		return d
+	}
+
 	for _, pattern := range dangerousPatterns {
 		if pattern.MatchString(cmd) {
 			return Decision{
@@ -150,6 +162,110 @@ func (p *DangerousCommandPolicy) Evaluate(action Action) Decision {
 	}
 
 	return Decision{Action: Allow}
+}
+
+// rmSegmentSplitter splits a command line on shell separators so each rm in a
+// chain (`a && rm -rf / ; b`) is inspected on its own.
+var rmSegmentSplitter = regexp.MustCompile(`[;&|\n]+`)
+
+// rmCatastrophicRoots are the top-level targets whose recursive force-removal is
+// a hard Block (irreversible, whole-setup damage). A DEEPER path under one of
+// these (e.g. /etc/foo) is not here — that falls through to a Confirm.
+var rmCatastrophicRoots = map[string]bool{
+	"/": true, "/etc": true, "/var": true, "/usr": true, "/boot": true,
+	"/lib": true, "/lib64": true, "/sbin": true, "/bin": true, "/sys": true,
+	"/proc": true, "/opt": true, "/srv": true, "/root": true, "/home": true,
+	"/home/vibecraft": true, "~": true, "$HOME": true, "${HOME}": true,
+}
+
+// rmDecision returns a Block/Confirm decision (ok=true) when the command
+// contains a recursive AND force rm (in any flag form: -rf, -r -f, --recursive
+// --force, mixed), or any rm with --no-preserve-root. Block when a target is a
+// catastrophic root; Confirm when a target is any other absolute path. ok=false
+// means "no destructive rm here" and the caller continues its other checks.
+func rmDecision(cmd string) (Decision, bool) {
+	for _, seg := range rmSegmentSplitter.Split(cmd, -1) {
+		fields := strings.Fields(seg)
+		idx := -1
+		for i, f := range fields {
+			base := f
+			if slash := strings.LastIndex(base, "/"); slash >= 0 {
+				base = base[slash+1:]
+			}
+			if base == "rm" {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			continue
+		}
+
+		recursive, force, noPreserve := false, false, false
+		var operands []string
+		for _, tok := range fields[idx+1:] {
+			switch {
+			case tok == "--":
+				// end of options; everything after is an operand
+			case tok == "--recursive":
+				recursive = true
+			case tok == "--force":
+				force = true
+			case tok == "--no-preserve-root":
+				noPreserve = true
+			case strings.HasPrefix(tok, "--"):
+				// some other long option — ignore
+			case strings.HasPrefix(tok, "-") && len(tok) > 1:
+				for _, c := range tok[1:] {
+					switch c {
+					case 'r', 'R':
+						recursive = true
+					case 'f':
+						force = true
+					}
+				}
+			default:
+				operands = append(operands, tok)
+			}
+		}
+
+		if !((recursive && force) || noPreserve) {
+			continue
+		}
+
+		for _, op := range operands {
+			if rmTargetIsCatastrophic(op) {
+				return Decision{
+					Action: Block,
+					Reason: "recursive force-remove of a system or home root",
+					Rule:   "dangerous_command_block",
+				}, true
+			}
+		}
+		for _, op := range operands {
+			if strings.HasPrefix(op, "/") || strings.HasPrefix(op, "~") ||
+				strings.HasPrefix(op, "$HOME") || strings.HasPrefix(op, "${HOME}") {
+				return Decision{
+					Action: Confirm,
+					Reason: "this could modify or shut down the machine",
+					Rule:   "dangerous_command_confirm",
+				}, true
+			}
+		}
+	}
+	return Decision{}, false
+}
+
+// rmTargetIsCatastrophic reports whether op (an rm operand) is a top-level
+// system/home root whose recursive removal must be hard-blocked. A deeper path
+// under such a root is intentionally NOT catastrophic (legitimate cleanup).
+func rmTargetIsCatastrophic(op string) bool {
+	// Strip surrounding quotes and a single trailing slash (but keep "/").
+	op = strings.Trim(op, `"'`)
+	if op != "/" {
+		op = strings.TrimRight(op, "/")
+	}
+	return rmCatastrophicRoots[op]
 }
 
 func (p *DangerousCommandPolicy) Description() string {

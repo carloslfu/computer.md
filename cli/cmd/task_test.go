@@ -225,6 +225,37 @@ func TestTaskStream_ConnectionClosed_FallsBackToTerminalStatus(t *testing.T) {
 	}
 }
 
+// A task that parks on an approval / credential card (task:waiting) must
+// TERMINATE the stream and exit 3 (TaskNeedsInput), matching `task wait`.
+// Before the fix the daemon's task:waiting event (no `status` field) matched
+// neither the terminal switch nor the status fallback, so the SSE hung on
+// keepalives forever — an agent blocked on the very pause that needs it to act.
+func TestTaskStream_WaitingForInput_ExitsNeedsInput(t *testing.T) {
+	srv := streamDaemon(t,
+		[]string{"event: task:waiting\ndata: {\"task_id\":\"t1\"}\n\n"},
+		`{"id":"t1","status":"waiting_for_input","instruction":"go"}`,
+	)
+	isolateEnv(t, srv.URL, "vc_machine_test_test_test_xyz")
+	withOutputMode(t, output.ModeJSON)
+	resetVersionHandshake()
+	flagStreamFollowFinal = false
+
+	_, runErr := captureStdout(t, func() error {
+		return runTaskStream(taskStreamCmd, []string{"t1"})
+	})
+
+	if runErr == nil {
+		t.Fatalf("expected non-nil error (exit 3) for a task parked on an approval card, got nil")
+	}
+	var oe *exit.OutcomeError
+	if !errors.As(runErr, &oe) {
+		t.Fatalf("expected *OutcomeError, got %T: %v", runErr, runErr)
+	}
+	if oe.Code != exit.TaskNeedsInput {
+		t.Errorf("OutcomeError.Code: got %d, want %d (TaskNeedsInput)", oe.Code, exit.TaskNeedsInput)
+	}
+}
+
 // A dropped SSE connection on a task that is STILL running must surface a
 // distinct non-zero error (not a false success and not a task-outcome
 // code), so the caller knows the stream was truncated mid-flight.

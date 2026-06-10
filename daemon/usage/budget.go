@@ -119,6 +119,13 @@ type BudgetTracker struct {
 	http         *http.Client
 	notify       NotifyFunc // nil = thresholds tracked but no notification sent (tests)
 	managerMode  string
+
+	// proxySpentFunc, when set, returns this month's hosted-tool AI spend (the
+	// ai_proxy ledger) in cents. store.Aggregate only sums usage_records
+	// (manager turns), so without this the platform-facing spend report omits
+	// every dollar a deployed hosted tool burned through the credits proxy —
+	// VibeCraft pays it and never bills it back. nil = no proxy on this build.
+	proxySpentFunc func() int
 }
 
 // NewBudgetTracker wires a tracker. machineID + healthToken + platformBase
@@ -143,6 +150,15 @@ func NewBudgetTracker(store *Store, machineID, healthToken, platformBase string)
 func (bt *BudgetTracker) SetNotifier(n NotifyFunc) {
 	bt.mu.Lock()
 	bt.notify = n
+	bt.mu.Unlock()
+}
+
+// SetProxySpend wires the hosted-tool AI spend source (the ai_proxy ledger) so
+// Refresh reports it to the platform alongside manager-turn spend. Nil leaves
+// reporting to manager turns only.
+func (bt *BudgetTracker) SetProxySpend(fn func() int) {
+	bt.mu.Lock()
+	bt.proxySpentFunc = fn
 	bt.mu.Unlock()
 }
 
@@ -260,6 +276,7 @@ func (bt *BudgetTracker) Refresh(ctx context.Context) error {
 	// still call the endpoint, just without the spent_cents param.
 	bt.mu.RLock()
 	managerMode := bt.managerMode
+	proxySpent := bt.proxySpentFunc
 	bt.mu.RUnlock()
 	spentCents := -1
 	if managerMode != "platform" {
@@ -269,6 +286,15 @@ func (bt *BudgetTracker) Refresh(ctx context.Context) error {
 		spentCents = int(summary.TotalCostUSD*100 + 0.5)
 		if spentCents < 0 {
 			spentCents = 0
+		}
+		// Add hosted-tool AI spend (the ai_proxy ledger). Aggregate only sums
+		// manager-turn usage_records; without this the customer is never
+		// billed for the AI a deployed hosted tool consumed through the
+		// platform-paid credits proxy.
+		if proxySpent != nil {
+			if pc := proxySpent(); pc > 0 {
+				spentCents += pc
+			}
 		}
 	}
 

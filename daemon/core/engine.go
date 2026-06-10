@@ -1146,8 +1146,9 @@ func (e *Engine) processTask(parentCtx context.Context, task *Task) {
 	e.tasks.SetResult(task.ID, result)
 
 	e.broker.Emit("task:completed", map[string]interface{}{
-		"task_id": task.ID,
-		"result":  result,
+		"task_id":         task.ID,
+		"conversation_id": task.ConversationID,
+		"result":          result,
 	})
 
 	e.audit.Log(audit.Entry{
@@ -1525,9 +1526,10 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 			masked := e.vaultMask.Mask(pendingCaption)
 			e.tasks.AddMessage(task.ConversationID, "assistant", masked)
 			e.broker.Emit("task:message", map[string]interface{}{
-				"task_id":   task.ID,
-				"content":   masked,
-				"timestamp": time.Now().UTC().Format(time.RFC3339),
+				"task_id":         task.ID,
+				"conversation_id": task.ConversationID,
+				"content":         masked,
+				"timestamp":       time.Now().UTC().Format(time.RFC3339),
 			})
 			pendingCaption = ""
 		}
@@ -1814,12 +1816,13 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 				// (transparency principle). The dashboard renders this
 				// as a small pill below the agent's narration.
 				e.broker.Emit("task:auto_approved", map[string]interface{}{
-					"task_id":   task.ID,
-					"tool":      tc.Name,
-					"title":     humanTitle(tc.Name, maskedInput, decision.Rule),
-					"reason":    result.Reason,
-					"command":   maskedInput,
-					"timestamp": time.Now().UTC().Format(time.RFC3339),
+					"task_id":         task.ID,
+					"conversation_id": task.ConversationID,
+					"tool":            tc.Name,
+					"title":           humanTitle(tc.Name, maskedInput, decision.Rule),
+					"reason":          result.Reason,
+					"command":         maskedInput,
+					"timestamp":       time.Now().UTC().Format(time.RFC3339),
 				})
 				// Fall through to the normal execute path. Action runs
 				// as if the guardrail had returned Allow.
@@ -1902,9 +1905,10 @@ func (e *Engine) runToolBlock(ctx context.Context, task *Task, tc managerclient.
 			e.mu.Unlock()
 		}()
 		e.broker.Emit("task:waiting", map[string]interface{}{
-			"task_id":  task.ID,
-			"question": question,
-			"approval": approvalForUser,
+			"task_id":         task.ID,
+			"conversation_id": task.ConversationID,
+			"question":        question,
+			"approval":        approvalForUser,
 		})
 		e.emitTaskProgress(task, "Waiting for your approval before continuing.", approvalForUser.Title, false)
 		e.audit.Log(audit.Entry{
@@ -2077,9 +2081,10 @@ autoApproved:
 	if result.IsImage && tc.Name == "computer" && tc.Input["action"] == "screenshot" {
 		maskedCaption := e.vaultMask.Mask(caption)
 		e.broker.Emit("task:screenshot", map[string]interface{}{
-			"task_id": task.ID,
-			"image":   result.Content,
-			"caption": maskedCaption,
+			"task_id":         task.ID,
+			"conversation_id": task.ConversationID,
+			"image":           result.Content,
+			"caption":         maskedCaption,
 		})
 		if err := e.tasks.AddScreenshotMessage(task.ConversationID, maskedCaption, result.Content); err != nil {
 			log.Printf("screenshot: persist failed for task %s: %v", task.ID, err)
@@ -2180,9 +2185,10 @@ func (e *Engine) handleCredentialRequest(ctx context.Context, task *Task, tc man
 	e.tasks.SetWaitingForInput(task.ID, payloadJSON)
 
 	e.broker.Emit("task:credentials_requested", map[string]interface{}{
-		"task_id":    task.ID,
-		"message_id": msgID,
-		"payload":    payload,
+		"task_id":         task.ID,
+		"conversation_id": task.ConversationID,
+		"message_id":      msgID,
+		"payload":         payload,
 	})
 
 	e.audit.Log(audit.Entry{
@@ -2701,97 +2707,121 @@ func humanSize(n int64) string {
 	}
 }
 
+// editorHelperPython is a CONSTANT shell command: a python helper that reads a
+// JSON request from stdin and performs the text-editor op (view/create/
+// str_replace/insert). It contains NO interpolated or untrusted data, so there
+// is no shell- or script-injection surface — path / old_str / new_str /
+// file_text / insert_line all arrive as JSON on stdin and are parsed by python.
+//
+// This replaces the prior fmt.Sprintf("...%q...") approach, which was REMOTE
+// CODE EXECUTION: Go's %q is Go-quoting, not shell-quoting, and the result was
+// spliced into an outer `python3 -c "..."` double-quoted SHELL string. %q does
+// not escape "$" or backticks, so a path / old_str containing a command
+// substitution executed as the agent identity, bypassing every bash guardrail
+// (the editor op is gated as a benign-looking file path, not a dangerous
+// command).
+//
+// Wrapped in single quotes for `bash -c`; the script itself uses ONLY double
+// quotes, so the single-quote wrapper can never be broken. Secrets still travel
+// on stdin only (never argv/ps), and the helper still runs through e.sh() with
+// the shell's dropped privileges, so created files keep the correct owner.
+const editorHelperPython = `python3 -c '
+import sys, json, os
+req = json.loads(sys.stdin.read())
+cmd = req["command"]
+path = req["path"]
+if cmd == "view":
+    with open(path) as f:
+        data = f.read()
+    out = []
+    i = 1
+    for line in data.splitlines():
+        out.append("%6d\t%s" % (i, line))
+        i += 1
+    sys.stdout.write("\n".join(out))
+elif cmd == "create":
+    content = req["file_text"]
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content)
+    sys.stdout.write("File created: " + path)
+elif cmd == "str_replace":
+    old = req["old_str"]
+    new = req["new_str"]
+    with open(path) as f:
+        content = f.read()
+    if old not in content:
+        sys.stdout.write("ERROR: old_str not found in file")
+        sys.exit(1)
+    n = content.count(old)
+    if n > 1:
+        sys.stdout.write("ERROR: old_str found %d times, must be unique" % n)
+        sys.exit(1)
+    content = content.replace(old, new, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    sys.stdout.write("Replacement done")
+elif cmd == "insert":
+    new = req["new_str"]
+    line_num = int(req["insert_line"])
+    with open(path) as f:
+        lines = f.readlines()
+    lines.insert(line_num, new + "\n")
+    with open(path, "w") as f:
+        f.writelines(lines)
+    sys.stdout.write("Insert done")
+else:
+    sys.stderr.write("unknown command: " + str(cmd))
+    sys.exit(2)
+'`
+
 func (e *Engine) executeTextEditorTool(ctx context.Context, tc managerclient.ToolCall) (*ToolExecResult, error) {
 	command, _ := tc.Input["command"]
 	path, _ := tc.Input["path"]
 
+	// Build the request payload. NOTHING untrusted is interpolated into the
+	// command — every field travels as JSON on stdin to the constant helper
+	// above. Vault-backed fields (file_text / new_str) are resolved here and
+	// also ride stdin only, so plaintext never reaches argv / ps / cmdline.
+	req := map[string]string{"command": command, "path": path}
 	switch command {
 	case "view":
-		output, err := e.sh().Execute(ctx, fmt.Sprintf("cat -n %q", path))
-		if err != nil {
-			return nil, err
-		}
-		return &ToolExecResult{Content: output}, nil
-
+		// no extra fields
 	case "create":
-		content, _ := tc.Input["file_text"]
-		resolved := e.vault.ResolveReferences(content)
-		// Secret-resolved content is fed via stdin, never argv — keeps
-		// plaintext out of ps/​/proc/<pid>/cmdline (Phase 0a follow-up).
-		// Python still handles file creation (avoids heredoc injection);
-		// only the non-secret path stays in the argv script.
-		script := fmt.Sprintf(`python3 -c "
-import os, sys
-path = %q
-content = sys.stdin.read()
-os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-with open(path, 'w') as f:
-    f.write(content)
-print('File created: ' + path)
-"`, path)
-		output, err := e.sh().ExecuteInteractive(ctx, script, resolved)
-		if err != nil {
-			return nil, fmt.Errorf("creating file: %w (output: %s)", err, output)
-		}
-		return &ToolExecResult{Content: fmt.Sprintf("File created: %s", path)}, nil
-
+		req["file_text"] = e.vault.ResolveReferences(tc.Input["file_text"])
 	case "str_replace":
-		oldStr, _ := tc.Input["old_str"]
-		newStr, _ := tc.Input["new_str"]
-		resolvedNew := e.vault.ResolveReferences(newStr)
-		// Only new_str is vault-resolved (can carry secrets) — it goes via
-		// stdin, never argv. old_str/path are non-secret matching text and
-		// stay in the script (Phase 0a follow-up).
-		script := fmt.Sprintf(`python3 -c "
-import sys
-path = %q
-old = %q
-new = sys.stdin.read()
-with open(path) as f:
-    content = f.read()
-if old not in content:
-    print('ERROR: old_str not found in file')
-    sys.exit(1)
-count = content.count(old)
-if count > 1:
-    print(f'ERROR: old_str found {count} times, must be unique')
-    sys.exit(1)
-content = content.replace(old, new, 1)
-with open(path, 'w') as f:
-    f.write(content)
-print('Replacement done')
-"`, path, oldStr)
-		output, err := e.sh().ExecuteInteractive(ctx, script, resolvedNew)
-		if err != nil {
-			return nil, fmt.Errorf("str_replace: %w (output: %s)", err, output)
-		}
-		return &ToolExecResult{Content: output}, nil
-
+		req["old_str"] = tc.Input["old_str"]
+		req["new_str"] = e.vault.ResolveReferences(tc.Input["new_str"])
 	case "insert":
-		insertLine, _ := tc.Input["insert_line"]
-		newStr, _ := tc.Input["new_str"]
-		resolvedNew := e.vault.ResolveReferences(newStr)
-		// new_str is vault-resolved (can carry secrets) — via stdin, never
-		// argv. path/line are non-secret (Phase 0a follow-up).
-		script := fmt.Sprintf(`python3 -c "
-import sys
-path = %q
-line_num = int(%q)
-new_text = sys.stdin.read()
-with open(path) as f:
-    lines = f.readlines()
-lines.insert(line_num, new_text + '\n')
-with open(path, 'w') as f:
-    f.writelines(lines)
-print('Insert done')
-"`, path, insertLine)
-		output, err := e.sh().ExecuteInteractive(ctx, script, resolvedNew)
-		if err != nil {
-			return nil, fmt.Errorf("insert: %w (output: %s)", err, output)
-		}
-		return &ToolExecResult{Content: output}, nil
-
+		req["insert_line"] = tc.Input["insert_line"]
+		req["new_str"] = e.vault.ResolveReferences(tc.Input["new_str"])
 	default:
 		return nil, fmt.Errorf("unknown text_editor command: %s", command)
 	}
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("text_editor: marshaling request: %w", err)
+	}
+
+	output, err := e.sh().ExecuteInteractive(ctx, editorHelperPython, string(payload))
+	if err != nil {
+		switch command {
+		case "create":
+			return nil, fmt.Errorf("creating file: %w (output: %s)", err, output)
+		case "str_replace":
+			return nil, fmt.Errorf("str_replace: %w (output: %s)", err, output)
+		case "insert":
+			return nil, fmt.Errorf("insert: %w (output: %s)", err, output)
+		default:
+			return nil, err
+		}
+	}
+
+	if command == "create" {
+		return &ToolExecResult{Content: fmt.Sprintf("File created: %s", path)}, nil
+	}
+	return &ToolExecResult{Content: output}, nil
 }

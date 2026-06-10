@@ -220,6 +220,20 @@ func TestDangerousCommandPolicy(t *testing.T) {
 		{"rm -rf / (root)", "rm -rf /", "", Block},
 		{"rm -rf /etc with semicolon", "rm -rf /etc; echo done", "", Block},
 
+		// Flag-order-agnostic rm: GNU long-form, interleaved, separate, and
+		// --no-preserve-root flags must NOT bypass the block (the old
+		// -[rfRF]+ regex anchor missed all of these).
+		{"rm long-form root", "rm --recursive --force /", "", Block},
+		{"rm -rf --no-preserve-root root", "rm -rf --no-preserve-root /", "", Block},
+		{"rm long-form --no-preserve-root", "rm --recursive --force --no-preserve-root /", "", Block},
+		{"rm separate flags root", "rm -r -f /", "", Block},
+		{"rm reversed short flags root", "rm -fr /", "", Block},
+		{"rm long-form /etc", "rm --recursive --force /etc", "", Block},
+		{"rm long-form company brain", "rm --recursive --force /home/vibecraft", "", Block},
+		{"rm -rf company brain (short)", "rm -rf /home/vibecraft", "", Block},
+		{"rm -rf $HOME", "rm -rf $HOME", "", Block},
+		{"rm -rf chained after cd", "cd /tmp && rm --recursive --force /", "", Block},
+
 		// Platform integrity — VibeCraft's own infrastructure.
 		// Path-anchored: any read/write/delete on these paths is Block.
 		{"rm daemon binary", "rm /usr/local/bin/vibecraft-daemon", "", Block},
@@ -253,6 +267,7 @@ func TestDangerousCommandPolicy(t *testing.T) {
 		// customer can override with friction.
 		{"rm -rf sub-path under /etc", "rm -rf /etc/old-app-config", "", Confirm},
 		{"rm -rf sub-path under /var", "rm -rf /var/log/old-stuff", "", Confirm},
+		{"rm long-form sub-path of company brain", "rm --recursive --force /home/vibecraft/systems/old", "", Confirm},
 		{"dd to loopback", "dd if=/dev/zero of=/dev/loop0", "", Confirm},
 		{"mkfs on loopback", "mkfs.ext4 /dev/loop0", "", Confirm},
 		{"chmod 777 /", "chmod 777 /", "", Confirm},
@@ -264,6 +279,8 @@ func TestDangerousCommandPolicy(t *testing.T) {
 		// Allow: benign.
 		{"ls -la /tmp", "ls -la /tmp", "", Allow},
 		{"rm -f local file", "rm -f ./tmp.log", "", Allow},
+		{"rm -rf relative build dir", "rm -rf ./build", "", Allow},
+		{"rm -rf bare relative dir", "rm -rf node_modules", "", Allow},
 		{"dd imaging file", "dd if=/dev/zero of=./zeros bs=1M count=1", "", Allow},
 
 		// Allow: safe recipe chain short-circuits the generic `rm .../`

@@ -489,6 +489,30 @@ func TestBudget_OperatorKeyModeRecordsButDoesNotEnforceOrReportSpend(t *testing.
 	}
 }
 
+// TestBudget_RefreshIncludesProxySpend is the regression for
+// daemon-manager-ai-1: hosted-tool AI spend (the ai_proxy ledger) must be
+// reported to the platform alongside manager-turn spend, or it never bills
+// back. With no manager turns recorded, the reported spend is exactly the
+// proxy spend.
+func TestBudget_RefreshIncludesProxySpend(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	fb := newFakeBudget(t)
+	fb.set(100)
+	bt := trackerFor(store, fb)
+	bt.SetManagerKeyMode("platform")
+	bt.SetProxySpend(func() int { return 700 }) // $7 of hosted-tool AI
+
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	fb.mu.Lock()
+	gotQuery := fb.gotQuery
+	fb.mu.Unlock()
+	if !strings.Contains(gotQuery, "spent_cents=700") {
+		t.Fatalf("hosted-tool AI proxy spend must be reported to the platform; query=%q", gotQuery)
+	}
+}
+
 // J12 — TestBudget_RefreshParsesNonAIConfig verifies that the non-AI
 // plan-config fields (plan_name, backup_cadence, region) come through
 // the same poll the AI budget rides on (Track D5). The daemon's

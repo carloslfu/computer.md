@@ -261,8 +261,19 @@ type budgetService struct {
 	// month's tally via settle()).
 	reservedCents int
 
-	monthlyCap  int          // cents
+	monthlyCap  int          // cents — static fallback cap (pre-budget-fetch)
 	persistFunc func() error // override for tests
+
+	// pooled, when set, returns the plan-aware pooled budget from the
+	// BudgetTracker: remainingCents (already net of reported spend across all
+	// the account's machines, incl. this proxy's reported spend), whether the
+	// plan is unmetered, and whether a budget has been fetched yet. It is the
+	// authoritative ceiling — plan-sized and top-up-aware — and supersedes the
+	// static monthlyCap whenever a budget is available. Before the first fetch
+	// (have=false) the static cap applies as a startup safety net. This closes
+	// the bug where the cap was a hardcoded $50 for every plan because nothing
+	// ever wrote /etc/vibecraft/ai_budget_cents.
+	pooled func() (remainingCents int, unmetered bool, have bool)
 }
 
 // reserveCents is the worst-case cost we hold against the budget for a
@@ -358,14 +369,49 @@ func (bs *budgetService) allow() error {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 	bs.rollOverIfNewMonth()
-	if bs.ledger.SpentCents+bs.reservedCents >= bs.monthlyCap {
+	room, unmetered, ceiling := bs.roomCents()
+	if !unmetered && room <= 0 {
 		return errBudgetExhausted{
 			Month:       bs.ledger.Month,
 			SpentCents:  bs.ledger.SpentCents,
-			BudgetCents: bs.monthlyCap,
+			BudgetCents: ceiling,
 		}
 	}
 	return nil
+}
+
+// SetPooledBudget wires the plan-aware pooled-budget source (the BudgetTracker
+// snapshot). Safe to call before serving; nil leaves the static cap in force.
+func (bs *budgetService) SetPooledBudget(fn func() (remainingCents int, unmetered bool, have bool)) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.pooled = fn
+}
+
+// currentSpentCents reports this month's committed proxy spend so the
+// BudgetTracker can include hosted-tool AI in the spend it reports to the
+// platform (otherwise that spend never bills back). Caller-safe (locks).
+func (bs *budgetService) currentSpentCents() int {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.rollOverIfNewMonth()
+	return bs.ledger.SpentCents
+}
+
+// roomCents returns the cents available for a new reservation, whether the
+// budget is unmetered, and a ceiling figure for the over-budget error. Caller
+// must hold bs.mu. Prefers the plan-aware pooled budget (authoritative); falls
+// back to the static per-machine cap only before the first budget fetch.
+func (bs *budgetService) roomCents() (room int, unmetered bool, ceiling int) {
+	if bs.pooled != nil {
+		if remaining, um, have := bs.pooled(); have {
+			if um {
+				return 1 << 30, true, -1
+			}
+			return remaining - bs.reservedCents, false, bs.ledger.SpentCents + remaining
+		}
+	}
+	return bs.monthlyCap - bs.ledger.SpentCents - bs.reservedCents, false, bs.monthlyCap
 }
 
 // reserve atomically admits a call and holds reserveCents against the
@@ -380,11 +426,12 @@ func (bs *budgetService) reserve() (int, error) {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 	bs.rollOverIfNewMonth()
-	if bs.ledger.SpentCents+bs.reservedCents >= bs.monthlyCap {
+	room, unmetered, ceiling := bs.roomCents()
+	if !unmetered && room <= 0 {
 		return 0, errBudgetExhausted{
 			Month:       bs.ledger.Month,
 			SpentCents:  bs.ledger.SpentCents,
-			BudgetCents: bs.monthlyCap,
+			BudgetCents: ceiling,
 		}
 	}
 	bs.reservedCents += reserveCents

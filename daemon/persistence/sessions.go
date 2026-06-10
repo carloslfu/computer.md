@@ -101,6 +101,22 @@ func (db *DB) DeleteAllSessions() (int64, error) {
 	return res.RowsAffected()
 }
 
+// DeleteSessionsBySub removes every browser session belonging to one user
+// (WorkOS sub). Called from the management channel when the platform
+// offboards a user (control-revoke, team removal, deactivation): the cookie
+// bakes in the access tier at handshake with a multi-hour expiry and is never
+// re-checked against platform access, so without this a removed teammate keeps
+// full dashboard control until the cookie expires. Returns rows deleted.
+func (db *DB) DeleteSessionsBySub(sub string) (int64, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	res, err := db.conn.Exec(`DELETE FROM sessions WHERE sub = ?`, sub)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // CountActiveSessions returns the number of unexpired browser sessions
 // at the given cutoff (typically time.Now().UTC()). Used by /metrics
 // (Workstream K) to publish vibecraft_session_active as a gauge.
@@ -157,6 +173,20 @@ func (db *DB) DeleteSSOSession(idHash string) error {
 	defer db.mu.Unlock()
 	_, err := db.conn.Exec(`DELETE FROM sso_sessions WHERE id_hash = ?`, idHash)
 	return err
+}
+
+// DeleteSSOSessionsBySub removes every SSO session for one user (WorkOS sub) —
+// companion to DeleteSessionsBySub. The vc_sso cookie grants subdomain-wide
+// access to internal apps, so an offboarded user's SSO session must be cut
+// alongside their main session. Returns rows deleted.
+func (db *DB) DeleteSSOSessionsBySub(sub string) (int64, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	res, err := db.conn.Exec(`DELETE FROM sso_sessions WHERE sub = ?`, sub)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // DeleteAllSSOSessions wipes every SSO session — companion to

@@ -275,6 +275,28 @@ func main() {
 	aiTok := &AICreditsToken{value: aiTokVal}
 	bsvc := newBudgetService()
 
+	// Link the AI-credits proxy to the plan-aware pooled budget + spend
+	// reporting (daemon-manager-ai-1 / -2):
+	//   • The proxy gates on the BudgetTracker's pooled remaining budget — the
+	//     authoritative, plan-sized, top-up-aware ceiling — instead of the
+	//     hardcoded $50 static cap (which nothing ever wrote, so every plan was
+	//     capped at $50). Before the first budget fetch the static cap stands
+	//     as a startup safety net.
+	//   • The tracker reports the proxy ledger's spend to the platform, so
+	//     hosted-tool AI bills back at cost like manager turns instead of being
+	//     silently absorbed.
+	bsvc.SetPooledBudget(func() (int, bool, bool) {
+		snap := budgetTracker.Snapshot()
+		if snap == nil {
+			return 0, false, false // no fetch yet → fall back to the static cap
+		}
+		if snap.BudgetUSD < 0 {
+			return 0, true, true // -1 = unmetered (Enterprise)
+		}
+		return int(snap.BudgetUSD*100 + 0.5), false, true
+	})
+	budgetTracker.SetProxySpend(bsvc.currentSpentCents)
+
 	// Build HTTP server with all routes.
 	srv := &Server{
 		cfg:           cfg,
@@ -724,6 +746,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// platform→daemon call here (same reasoning as the JWKS/session
 	// incident-response handlers above).
 	dual("/management/revoke-keys", s.withHealthAuth(s.handleManagementRevokeKeys))
+	dual("/management/revoke-sessions-for-user", s.withHealthAuth(s.handleManagementRevokeSessionsForUser))
 	// Push-to-user bridge (localhost only — the manager calls this via
 	// curl from bash, exactly like /daemon/task and /routes: only
 	// processes on this machine reach loopback; Caddy sets
@@ -2890,6 +2913,58 @@ func (s *Server) handleManagementRevokeKeys(w http.ResponseWriter, r *http.Reque
 	jsonResponse(w, http.StatusOK, map[string]any{"revoked": revoked})
 }
 
+// handleManagementRevokeSessionsForUser revokes every browser session (the
+// vc_session main cookie AND the vc_sso subdomain cookie) belonging to the
+// given userId. The platform calls this (best-effort) from every offboarding
+// path — control-access revoke, team-member removal, account deactivation —
+// alongside revoke-keys. The daemon stamps the access tier into the cookie at
+// handshake with a fixed multi-hour expiry and never re-checks it against
+// platform access, so without this a fired/downgraded teammate keeps full
+// control-tier dashboard access (tasks, vault, browser/terminal, the db.md
+// company brain, guardrail edits) until the cookie expires — the browser
+// analog of the CLI-key gap revoke-keys closes. Body: {"userId":"<sub>"}.
+// Returns {"revoked":<int>} (sessions + sso_sessions rows deleted).
+func (s *Server) handleManagementRevokeSessionsForUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		UserID string `json:"userId"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.UserID) == "" {
+		jsonError(w, "userId is required", http.StatusBadRequest)
+		return
+	}
+
+	var revoked int64
+	n, err := s.db.DeleteSessionsBySub(req.UserID)
+	if err != nil {
+		jsonError(w, fmt.Sprintf("delete sessions: %v", err), http.StatusInternalServerError)
+		return
+	}
+	revoked += n
+	n, err = s.db.DeleteSSOSessionsBySub(req.UserID)
+	if err != nil {
+		jsonError(w, fmt.Sprintf("delete sso sessions: %v", err), http.StatusInternalServerError)
+		return
+	}
+	revoked += n
+
+	s.auditLog.Log(audit.Entry{
+		Action:    "browser_sessions_revoked_for_user",
+		Category:  "security",
+		UserID:    req.UserID,
+		Details:   fmt.Sprintf("revoked=%d", revoked),
+		RiskLevel: "high",
+	})
+	jsonResponse(w, http.StatusOK, map[string]any{"revoked": revoked})
+}
+
 // --- CORS middleware ---
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -2999,6 +3074,24 @@ func (rl *rateLimiter) cleanup() {
 
 func (rl *rateLimiter) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Exempt genuinely-local control-plane traffic. Caddy ALWAYS sets
+		// X-Forwarded-For when proxying external traffic (the same property
+		// withLoopbackOnly relies on), so a request whose socket is loopback
+		// AND carries no X-Forwarded-For can only come from a process on this
+		// machine: the AI-credits proxy (high call volume from hosted tools
+		// the operator built), Caddy's on-demand-TLS `ask` to /routes/verify,
+		// or the manager's own loopback calls. These all share the single
+		// 127.0.0.1 bucket, so one busy hosted tool issuing >60 AI calls/min
+		// got 429'd AND starved Caddy's TLS-issuance ask (new hosted-tool
+		// subdomains then failed to get a cert). They are already gated by
+		// withLoopbackOnly / withLocalhostAuth and bounded by the per-machine
+		// AI budget cap, so the coarse IP limiter only does harm here. External
+		// traffic always carries X-Forwarded-For via Caddy and stays limited.
+		if isLocalControlPlane(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Key on the last-hop IP (see clientIP). Keying on the spoofable
 		// leftmost X-Forwarded-For let a single attacker rotate the
 		// header to get unlimited fresh rate-limit buckets.
@@ -3012,6 +3105,21 @@ func (rl *rateLimiter) middleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isLocalControlPlane reports whether a request originates from a process on
+// this machine reaching the daemon directly over loopback (no Caddy hop).
+// Caddy's reverse_proxy always sets X-Forwarded-For, so loopback + absent
+// X-Forwarded-For uniquely identifies in-machine control-plane callers.
+func isLocalControlPlane(r *http.Request) bool {
+	if r.Header.Get("X-Forwarded-For") != "" {
+		return false
+	}
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	return host == "127.0.0.1" || host == "::1"
 }
 
 // --- Helpers ---

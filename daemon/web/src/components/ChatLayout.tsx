@@ -60,6 +60,25 @@ export function nextConversationAfterLoad(
   return loaded[0]?.id ?? null;
 }
 
+// isForeignConversationEvent decides whether a content-appending SSE event
+// (message / screenshot / approval + credential cards / activity) belongs to a
+// DIFFERENT conversation than the one on screen and must therefore be dropped.
+// The daemon's SSE broker is a global fan-out, so without this a task running
+// elsewhere (a scheduled system, a switched-away task, another teammate on the
+// shared machine) would inject its bubbles — and live Approve/Deny cards —
+// into the current viewer's chat. Only filters when the event actually carries
+// a conversation_id (older daemons omit it → preserve prior behavior).
+export function isForeignConversationEvent(
+  eventConversationId: string | null | undefined,
+  activeConversationId: string | null | undefined,
+): boolean {
+  return (
+    !!eventConversationId &&
+    !!activeConversationId &&
+    eventConversationId !== activeConversationId
+  );
+}
+
 export function ChatLayout({
   who,
   initialConversation,
@@ -220,6 +239,21 @@ export function ChatLayout({
         });
       }
 
+      // The daemon's SSE broker is a global fan-out. A task running in ANOTHER
+      // conversation (a scheduled system, a switched-away task, another
+      // teammate on the shared company machine) must NOT inject its bubbles —
+      // or its live Approve/Deny + credential cards — into the conversation
+      // currently on screen. Content-append cases below bail when the event
+      // belongs to a different conversation. Only filter when the event
+      // actually carries a conversation_id (older daemons omit it, in which
+      // case we preserve the prior behavior); global lifecycle state is
+      // unaffected and still flows through publishTaskEvent above.
+      const evConversationId = data.conversation_id as string | undefined;
+      const isForeignConversation = isForeignConversationEvent(
+        evConversationId,
+        activeConversationRef.current,
+      );
+
       switch (event) {
         case "presence": {
           const users = (data as { users?: PresenceUser[] }).users;
@@ -238,38 +272,43 @@ export function ChatLayout({
         case "task:completed": {
           const result = data.result as string;
           const completedId = data.task_id as string | undefined;
-          setMessages((prev) => {
-            const updated = completedId
-              ? prev.map((m) =>
-                  m.type === "approval" &&
-                  m.id === completedId &&
-                  !m.approvalResolution
-                    ? {
-                        ...m,
-                        approvalResolution: "decided" as const,
-                        actions: undefined,
-                      }
-                    : m,
-                )
-              : prev;
-            if (!result) return updated;
-            return [
-              ...updated,
-              {
-                id: `sse-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                role: "agent",
-                type: "text",
-                content: result,
-                timestamp: new Date().toISOString(),
-              },
-            ];
-          });
+          // Append the result + resolve the card only for the active
+          // conversation; the global running/agent state below still clears
+          // regardless (lifecycle).
+          if (!isForeignConversation) {
+            setMessages((prev) => {
+              const updated = completedId
+                ? prev.map((m) =>
+                    m.type === "approval" &&
+                    m.id === completedId &&
+                    !m.approvalResolution
+                      ? {
+                          ...m,
+                          approvalResolution: "decided" as const,
+                          actions: undefined,
+                        }
+                      : m,
+                  )
+                : prev;
+              if (!result) return updated;
+              return [
+                ...updated,
+                {
+                  id: `sse-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                  role: "agent",
+                  type: "text",
+                  content: result,
+                  timestamp: new Date().toISOString(),
+                },
+              ];
+            });
+          }
           setAgentStatus("online");
           setRunningTaskId(null);
           setRunningTaskConversationId(null);
           setStopping(false);
 
-          if (completedId) {
+          if (completedId && !isForeignConversation) {
             const convAtComplete = activeConversationRef.current;
             setTimeout(() => {
               if (!convAtComplete) return;
@@ -452,6 +491,7 @@ export function ChatLayout({
           break;
         }
         case "task:waiting": {
+          if (isForeignConversation) break;
           const question = data.question as string;
           const taskId = data.task_id as string;
           const approval = data.approval as
@@ -498,6 +538,7 @@ export function ChatLayout({
           break;
         }
         case "task:auto_approved": {
+          if (isForeignConversation) break;
           const taskId = typeof data.task_id === "string" ? data.task_id : "";
           const title =
             typeof data.title === "string" ? data.title : "Auto-approved action";
@@ -524,6 +565,7 @@ export function ChatLayout({
           break;
         }
         case "task:screenshot": {
+          if (isForeignConversation) break;
           const imageBase64 = data.image as string;
           const caption =
             typeof data.caption === "string" ? data.caption : "";
@@ -546,6 +588,7 @@ export function ChatLayout({
           break;
         }
         case "task:message": {
+          if (isForeignConversation) break;
           const content = data.content as string;
           const timestamp =
             (data.timestamp as string) || new Date().toISOString();
@@ -565,6 +608,7 @@ export function ChatLayout({
         }
         case "task:activity":
         case "task:progress": {
+          if (isForeignConversation) break;
           const taskId = data.task_id as string;
           const summaryMarkdown = data.summary_markdown as string;
           const stepCount = data.step_count as number | undefined;
@@ -602,6 +646,7 @@ export function ChatLayout({
           break;
         }
         case "task:credentials_requested": {
+          if (isForeignConversation) break;
           const messageId = data.message_id as string | undefined;
           const payload = data.payload as CredentialRequestPayload | undefined;
           if (!messageId || !payload) break;
