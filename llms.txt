@@ -2,7 +2,7 @@
 
 > The agent-native command-line surface for VibeCraft (https://vibecraft.so). Every command returns JSON envelopes on stdout; errors go to stderr with stable code strings; streaming commands emit JSON Lines. Exit codes signal task outcome. Read this once; refer to it forever.
 
-VibeCraft is an agentic computer for business. The customer owns a Linux box with a real desktop, terminal, browser, and filesystem. A manager AI on that box runs other agents on the customer's behalf. You (the external agent reading this) are talking to that manager through this CLI.
+VibeCraft is the self-operating company computer. The customer owns a Linux box with a real desktop, terminal, browser, and filesystem. A manager AI on that box runs other agents on the customer's behalf. You (the external agent reading this) are talking to that manager through this CLI.
 
 Three layers: **computer** (the box) → **manager** (the on-box AI you direct) → **workers** (Claude Code / Codex, spawned by the manager). You talk to the manager. The manager drives the computer.
 
