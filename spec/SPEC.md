@@ -272,9 +272,10 @@ generate it via `computer-md init --role <name>`:
 ## Relationship to db.md
 
 A computer.md computer typically ships a [db.md](https://github.com/carloslfu/db.md)
-store at `~/db/` — the LLM-curated markdown knowledge base for the
-team. `COMPUTER.md` describes the *computer*; the db.md store holds
-the *knowledge*. They compose; neither requires the other.
+store at `~/db/` — a database in plain files for records, sources, and
+wiki pages the agent curates. `COMPUTER.md` describes the *computer*;
+the db.md store holds the *data and knowledge*. They compose; neither
+requires the other.
 
 ## Versioning
 

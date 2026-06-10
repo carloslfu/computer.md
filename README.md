@@ -169,9 +169,10 @@ typosquats, suspicious install scripts).
 
 ## Related
 
-- **db.md** — the open database in plain files, the natural storage
-  layer for a computer.md computer. An independent standard, usable
-  on its own. See its
+- **db.md** — the open standard for databases in plain files, the
+  natural storage layer for records, sources, and wiki pages in a
+  computer.md computer.
+  An independent standard, usable on its own. See its
   [SPEC.md](https://github.com/carloslfu/db.md/blob/main/SPEC.md) and
   [repo](https://github.com/carloslfu/db.md).
 - **AGENTS.md** — the agent-instruction convention computer.md
