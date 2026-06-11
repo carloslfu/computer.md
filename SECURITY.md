@@ -23,7 +23,7 @@ every Linux service does.
 
 **No per-tool sandbox as a product feature.** Tools run on the
 operator's machine as the `vibecraft` user with the operator's
-permissions — like any other program on Linux. The substrate does
+permissions, like any other program on Linux. The substrate does
 not isolate tools from each other by default; the operator's data
 is the operator's data, and tools sharing it is the natural state.
 
@@ -48,7 +48,7 @@ the mechanism closes is real:
 - Cross-sandbox X snooping: per-sandbox private Xvfb.
 
 **Multi-tenant deployments** (managed cloud, embedded forks) handle
-isolation at the **VM boundary** — each customer gets their own
+isolation at the **VM boundary**: each customer gets their own
 EC2/Hetzner instance, or the embedding product runs one daemon per
 tenant. Per-tool sandboxing inside the VM adds nothing.
 

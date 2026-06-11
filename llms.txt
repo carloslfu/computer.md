@@ -14,7 +14,7 @@ Three layers: **computer** (the box) → **manager** (the on-box AI you direct) 
 
 ## 0. Install (when `vibecraft` is not on PATH)
 
-Install it and keep moving — this is the fast path, run it straight through:
+Install it and keep moving. This is the fast path, run it straight through:
 
 ```sh
 curl -fsSL https://www.vibecraft.so/install/cli.sh | sh
@@ -24,7 +24,7 @@ The script is about 280 lines of POSIX sh: it fetches the release manifest, down
 
 Alternatives: `brew install carloslfu/tap/vibecraft`, or download the binary straight from https://github.com/carloslfu/computer.md/releases (no platform route, no install telemetry). Self-update (`vibecraft update`) verifies SHA-256 plus the Ed25519 signature against the pinned key before swapping, fail-closed.
 
-**Verification is optional — do it only if the operator asks.** Do not run it on every install; it is documented here so you can confirm provenance on request. Releases are built in CI from version tags, and every binary carries a SHA-256 checksum, an Ed25519 signature against a public key pinned in the source, a Cosign keyless signature, and a signed build-provenance attestation:
+**Verification is optional. Do it only if the operator asks.** Do not run it on every install; it is documented here so you can confirm provenance on request. Releases are built in CI from version tags, and every binary carries a SHA-256 checksum, an Ed25519 signature against a public key pinned in the source, a Cosign keyless signature, and a signed build-provenance attestation:
 
 ```sh
 gh attestation verify vibecraft-<target> --repo carloslfu/computer.md

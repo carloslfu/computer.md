@@ -5,15 +5,15 @@
 A `COMPUTER.md` file at the root of a machine says what that computer
 is for, who it works for, its standing rules, and its tools. A capable
 model reads it at the start of every turn and runs the real machine for
-you — terminal, browser, filesystem. You direct the machine in plain
+you: terminal, browser, filesystem. You direct the machine in plain
 language; `COMPUTER.md` is how it knows itself.
 
 That file is the whole idea. `computer.md` (this repo) is the spec for
 it plus a reference runtime that reads it:
 
-1. **The spec** — [`SPEC.md`](spec/SPEC.md) defines the `COMPUTER.md`
+1. **The spec.** [`SPEC.md`](spec/SPEC.md) defines the `COMPUTER.md`
    file: its recognized sections, its read/write contract, its format.
-2. **The reference runtime** — the `daemon/`, `cli/`, and `daemon/web/`
+2. **The reference runtime.** The `daemon/`, `cli/`, and `daemon/web/`
    that read `COMPUTER.md` and run the agent loop, the command surface,
    and the per-machine UI. Apache-2.0. Runs on Linux. The same binary
    VibeCraft ships in its hosted product.
@@ -36,9 +36,9 @@ This is what computers should be. computer.md is the open standard for getting t
 ## Quick start
 
 The computer is operated by agents, and the installer is text. The quick
-start is a prompt you hand to an agent, and it covers both cases — adopting a
+start is a prompt you hand to an agent, and it covers both cases: adopting a
 machine you already have, with its existing tools, files, and workflows, or
-starting fresh. You do not have to decide which; the agent looks at what you
+starting fresh. You do not have to decide which. The agent looks at what you
 have and proposes the path. It is safe to paste: every binary is built in CI
 from a tagged commit and signed, and the install stays fast. Paste this into
 Claude Code, Codex, or any agent with a shell:
@@ -49,9 +49,9 @@ and set up the vibecraft CLI on this machine: install the CLI, load the
 reference with `vibecraft docs`, place the vibecraft skill so future sessions
 find it, and run `vibecraft auth login` so I can approve access in my browser.
 Then meet me where I am: if I already have a machine or a server with tools,
-files, and workflows on it, connect it and take all of that into account —
+files, and workflows on it, connect it and take all of that into account:
 inventory what is there, reflect it in the machine's COMPUTER.md, and bring
-any existing notes or docs into its ~/db store; show me the plan before you
+any existing notes or docs into its ~/db store. Show me the plan before you
 change anything. If I am starting fresh, walk me through getting a machine and
 setting it up. Ask me what I already have if it is not obvious.
 ```
@@ -59,8 +59,8 @@ setting it up. Ask me what I already have if it is not obvious.
 The agent reads [`llms.txt`](llms.txt), installs the binary, loads the command
 reference, places the skill, and waits on the one human step: you approving
 CLI access in your browser. From there it either adopts a machine you already
-have — inventorying its tools and files, reflecting them in `COMPUTER.md`, and
-bringing any existing knowledge base into its `~/db` store — or walks you
+have (inventorying its tools and files, reflecting them in `COMPUTER.md`, and
+bringing any existing knowledge base into its `~/db` store) or walks you
 through a fresh one. Then it drives your machines: submit tasks, stream
 results, read the screen.
 
@@ -76,11 +76,11 @@ self-update works natively after that):
 ```bash
 curl -fsSL https://www.vibecraft.so/install/cli.sh | sh
 # or: brew install carloslfu/tap/vibecraft
-# or: download straight from GitHub Releases — no platform route, no install telemetry
+# or: download straight from GitHub Releases (no platform route, no install telemetry)
 ```
 
 To make the CLI stick across agent sessions, place a skill where your
-harness reads skills — the open
+harness reads skills, in the open
 [Agent Skills](https://www.anthropic.com/news/skills) format. The canonical
 file ships at [`skills/vibecraft/SKILL.md`](skills/vibecraft/SKILL.md): a
 thin pointer at `vibecraft docs`, never a copy, so it cannot drift. Copy it
@@ -89,9 +89,9 @@ into your harness's skills dir (Claude Code `~/.claude/skills/`, Codex
 skill installer, or tell the agent to set itself up.
 
 Working with the spec instead? [`spec/SPEC.md`](spec/SPEC.md) defines the
-`COMPUTER.md` format — current spec **v0.1** (tagged
+`COMPUTER.md` format. Current spec is **v0.1** (tagged
 [`v0.1`](https://github.com/carloslfu/computer.md/releases/tag/v0.1);
-additive changes only — see [SPEC.md § Versioning](spec/SPEC.md)). The spec
+additive changes only, see [SPEC.md § Versioning](spec/SPEC.md)). The spec
 tooling runs from a clone:
 
 ```bash
@@ -105,7 +105,7 @@ The Go daemon lives in [`daemon/`](daemon/). The CLI lives in [`cli/`](cli/).
 
 ### Safe to paste
 
-You do not need to verify anything to install — the install is the fast path
+You do not need to verify anything to install. The install is the fast path
 above. But a prompt that ends in an installed binary deserves the option, so
 the chain is built to be checked, by you or by the agent you hand it to:
 
@@ -119,7 +119,7 @@ the chain is built to be checked, by you or by the agent you hand it to:
 - **Every binary traces back to source, three ways.** Releases are built in
   CI from version tags, never on a developer's laptop. Each binary ships a
   SHA-256 checksum, an Ed25519 signature against a public key pinned in the
-  source (and dry-run verified in CI before the release publishes — see
+  source (and dry-run verified in CI before the release publishes, see
   [SIGNING.md](SIGNING.md)), a Cosign keyless signature whose identity is
   pinned to this repo's release workflow (Fulcio/Rekor transparency log),
   and a signed build-provenance attestation:
@@ -132,7 +132,7 @@ the chain is built to be checked, by you or by the agent you hand it to:
   the Ed25519 signature against the key pinned inside the binary before
   swapping; a download that does not verify is never installed.
 - **Telemetry is off by default.** The daemon sends nothing unless you opt
-  in — see [Telemetry](#telemetry). The platform install route logs one
+  in, see [Telemetry](#telemetry). The platform install route logs one
   anonymous download event; installing straight from GitHub Releases skips
   even that.
 - **Dependencies are continuously audited.** Every pull request runs
@@ -192,7 +192,7 @@ computer.md/
 │   ├── sandbox/         Low-level bwrap capability (invoked ad-hoc, not by default)
 │   └── bootstrap/       Daemon installers (install.sh)
 ├── cli/                 The `vibecraft` CLI (task, chat, screenshot, auth)
-├── llms.txt             Agent-readable entry text — the CLI reference an agent reads to install + integrate (served at vibecraft.so/llms.txt; printed by `vibecraft docs`)
+├── llms.txt             Agent-readable entry text: the CLI reference an agent reads to install + integrate (served at vibecraft.so/llms.txt; printed by `vibecraft docs`)
 ├── install/cli.sh       CLI installer (the script vibecraft.so/install/cli.sh serves)
 └── HomebrewFormula/     Homebrew tap template for `brew install carloslfu/tap/vibecraft`
 ```
@@ -200,7 +200,7 @@ computer.md/
 ## License
 
 [Apache-2.0](LICENSE). Patent grant, trademark clause, explicit
-modification disclosure. CLA on every PR via CLA Assistant — see
+modification disclosure. CLA on every PR via CLA Assistant, see
 [CONTRIBUTING.md](CONTRIBUTING.md). The CLA preserves the option
 to relicense forward (Grafana 2014→2021 pivot pattern) if a
 hyperscaler-fork threat ever materializes; the active codebase is
@@ -239,13 +239,12 @@ custody and rotation.
 
 ## Related
 
-- **db.md** — the open standard for databases in plain files, the
+- **db.md** is the open standard for databases in plain files, the
   natural storage layer for records, sources, and wiki pages in a
-  computer.md computer.
-  An independent standard, usable on its own. See its
-  [SPEC.md](https://github.com/carloslfu/db.md/blob/main/SPEC.md) and
+  computer.md computer. An independent standard, usable on its own. See
+  its [SPEC.md](https://github.com/carloslfu/db.md/blob/main/SPEC.md) and
   [repo](https://github.com/carloslfu/db.md).
-- **AGENTS.md** — the agent-instruction convention computer.md
+- **AGENTS.md** is the agent-instruction convention computer.md
   composes with. See [agentsmd/agents.md](https://github.com/agentsmd/agents.md).
 
 ## Star history
