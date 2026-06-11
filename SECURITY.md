@@ -62,15 +62,19 @@ tenant. Per-tool sandboxing inside the VM adds nothing.
 
 ## Supply chain
 
-Daemon releases ship signed via:
+Release binaries (daemon + CLI) ship signed via:
 
 - **Cosign keyless OIDC** (Sigstore), identity pinned to the
   release-workflow URL.
 - **Ed25519 detached signatures** (release-signing key documented
   in the release notes).
+- **SLSA build-provenance attestations**, binding each binary to the
+  exact commit and workflow run that built it. Verify out-of-band:
+  `gh attestation verify <binary> --repo carloslfu/computer.md`.
 
-The CLI verifies both before swapping in a new binary on
-auto-update. The cosign identity pin is a published commitment:
+The CLI verifies the two signatures before swapping in a new binary on
+auto-update; the attestation is an independent provenance check anyone
+can run by hand. The cosign identity pin is a published commitment:
 see Hard Rule #7 in
 [plans/open-source-and-computer-md.md](https://github.com/carloslfu/vibecraft-so/blob/main/plans/open-source-and-computer-md.md)
 in the upstream private repo for the rotation discipline. Rotating
