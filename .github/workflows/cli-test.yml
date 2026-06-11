@@ -53,7 +53,10 @@ jobs:
 
       - name: Fuzz output for 10s
         working-directory: cli
-        run: go test -run=^$ -fuzz=FuzzEmitArbitraryData -fuzztime=10s ./output/...
+        run: |
+          fuzz_cache="$(mktemp -d)"
+          trap 'rm -rf "$fuzz_cache"' EXIT
+          GOCACHE="$fuzz_cache" go test -run=^$ -fuzz=FuzzEmitArbitraryData -fuzztime=10s -parallel=1 ./output/...
 
       - name: Docs-check (every cobra verb must appear in llms.txt)
         working-directory: cli
