@@ -36,23 +36,33 @@ This is what computers should be. computer.md is the open standard for getting t
 ## Quick start
 
 The computer is operated by agents, and the installer is text. The quick
-start is a prompt you hand to an agent. It is safe to paste: every binary is
-built in CI from a tagged commit and signed, and the install stays fast, so
-you can run it now and check it later, or never. Paste this into Claude Code,
-Codex, or any agent with a shell:
+start is a prompt you hand to an agent, and it covers both cases — adopting a
+machine you already have, with its existing tools, files, and workflows, or
+starting fresh. You do not have to decide which; the agent looks at what you
+have and proposes the path. It is safe to paste: every binary is built in CI
+from a tagged commit and signed, and the install stays fast. Paste this into
+Claude Code, Codex, or any agent with a shell:
 
 ```text
 Read https://raw.githubusercontent.com/carloslfu/computer.md/main/llms.txt
 and set up the vibecraft CLI on this machine: install the CLI, load the
-reference with `vibecraft docs`, place the vibecraft skill so future
-sessions find it, and run `vibecraft auth login` so I can approve access in
-my browser.
+reference with `vibecraft docs`, place the vibecraft skill so future sessions
+find it, and run `vibecraft auth login` so I can approve access in my browser.
+Then meet me where I am: if I already have a machine or a server with tools,
+files, and workflows on it, connect it and take all of that into account —
+inventory what is there, reflect it in the machine's COMPUTER.md, and bring
+any existing notes or docs into its ~/db store; show me the plan before you
+change anything. If I am starting fresh, walk me through getting a machine and
+setting it up. Ask me what I already have if it is not obvious.
 ```
 
-The agent reads [`llms.txt`](llms.txt), installs the binary, loads the
-command reference, places the skill, and waits on the one human step: you
-approving CLI access in your browser. From there it drives your machines —
-submit tasks, stream results, read the screen.
+The agent reads [`llms.txt`](llms.txt), installs the binary, loads the command
+reference, places the skill, and waits on the one human step: you approving
+CLI access in your browser. From there it either adopts a machine you already
+have — inventorying its tools and files, reflecting them in `COMPUTER.md`, and
+bringing any existing knowledge base into its `~/db` store — or walks you
+through a fresh one. Then it drives your machines: submit tasks, stream
+results, read the screen.
 
 Want to confirm it is safe before trusting it? You do not have to verify
 anything to install, but you can: [Safe to paste](#safe-to-paste) below has
