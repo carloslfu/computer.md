@@ -36,24 +36,28 @@ This is what computers should be. computer.md is the open standard for getting t
 ## Quick start
 
 The computer is operated by agents, and the installer is text. The quick
-start is a prompt. Paste it into Claude Code, Codex, or any agent with a
-shell:
+start is a prompt you hand to an agent. It is safe to paste: every binary is
+built in CI from a tagged commit and signed, and the install stays fast, so
+you can run it now and check it later, or never. Paste this into Claude Code,
+Codex, or any agent with a shell:
 
 ```text
 Read https://raw.githubusercontent.com/carloslfu/computer.md/main/llms.txt
-and set up the vibecraft CLI on this machine. Audit before you install: read
-the install script and check the release provenance (gh attestation verify
-<binary> --repo carloslfu/computer.md). Then install the CLI, load the
+and set up the vibecraft CLI on this machine: install the CLI, load the
 reference with `vibecraft docs`, place the vibecraft skill so future
 sessions find it, and run `vibecraft auth login` so I can approve access in
 my browser.
 ```
 
-The agent reads [`llms.txt`](llms.txt) and the install script, checks the
-provenance, installs the binary, loads the command reference, places the
-skill, and waits on the one human step: you approving CLI access in your
-browser. From there it drives your machines — submit tasks, stream results,
-read the screen.
+The agent reads [`llms.txt`](llms.txt), installs the binary, loads the
+command reference, places the skill, and waits on the one human step: you
+approving CLI access in your browser. From there it drives your machines —
+submit tasks, stream results, read the screen.
+
+Want to confirm it is safe before trusting it? You do not have to verify
+anything to install, but you can: [Safe to paste](#safe-to-paste) below has
+the receipts and a one-line verify command, and you can ask your agent to run
+the audit for you.
 
 Installing by hand is one command on macOS and Linux (on Windows, download
 the binary from [Releases](https://github.com/carloslfu/computer.md/releases);
@@ -91,8 +95,9 @@ The Go daemon lives in [`daemon/`](daemon/). The CLI lives in [`cli/`](cli/).
 
 ### Safe to paste
 
-A prompt that ends in an installed binary deserves suspicion. The chain is
-built to be checked, by you or by the agent you hand it to:
+You do not need to verify anything to install — the install is the fast path
+above. But a prompt that ends in an installed binary deserves the option, so
+the chain is built to be checked, by you or by the agent you hand it to:
 
 - **The installer is readable.** [`install/cli.sh`](install/cli.sh) is about
   280 lines of POSIX sh: detect the platform, fetch the release manifest,
