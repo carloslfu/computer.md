@@ -12,6 +12,22 @@ Three layers: **computer** (the box) → **manager** (the on-box AI you direct) 
 
 ---
 
+## 0. Install (when `vibecraft` is not on PATH)
+
+```sh
+curl -fsSL https://www.vibecraft.so/install/cli.sh | sh
+```
+
+Audit before you run — the chain is built for it. The script is about 280 lines of POSIX sh: it fetches the release manifest, downloads the binary for your platform, verifies its SHA-256 against the manifest and refuses on mismatch, verifies the Cosign keyless signature when `cosign` is on PATH (signer identity pinned to this repo's release workflow), and installs to `~/.local/bin/vibecraft` with no sudo (`--system` opts into `/usr/local/bin`; `--version=vX.Y.Z` pins a release). Releases are built in CI from version tags, and every binary carries a SHA-256 checksum, an Ed25519 signature against a public key pinned in the source, a Cosign keyless signature, and a signed build-provenance attestation:
+
+```sh
+gh attestation verify vibecraft-<target> --repo carloslfu/computer.md
+```
+
+Alternatives: `brew install carloslfu/tap/vibecraft`, or download the binary straight from https://github.com/carloslfu/computer.md/releases (no platform route, no install telemetry). Self-update (`vibecraft update`) verifies SHA-256 plus the Ed25519 signature against the pinned key before swapping, fail-closed.
+
+---
+
 ## 1. The contract
 
 Every CLI invocation produces ONE of these:

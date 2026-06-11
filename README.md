@@ -35,44 +35,105 @@ This is what computers should be. computer.md is the open standard for getting t
 
 ## Quick start
 
-```bash
-# Install the CLI (works on macOS, Linux, Windows)
-curl -fsSL https://www.vibecraft.so/install/cli.sh | sh
+The computer is operated by agents, and the installer is text. The quick
+start is a prompt. Paste it into Claude Code, Codex, or any agent with a
+shell:
 
-# Generate a COMPUTER.md (replace 'developer' with your role)
-computer-md init --role developer
-
-# Validate a COMPUTER.md
-computer-md validate
+```text
+Read https://raw.githubusercontent.com/carloslfu/computer.md/main/llms.txt
+and set up the vibecraft CLI on this machine. Audit before you install: read
+the install script and check the release provenance (gh attestation verify
+<binary> --repo carloslfu/computer.md). Then install the CLI, load the
+reference with `vibecraft docs`, place the vibecraft skill so future
+sessions find it, and run `vibecraft auth login` so I can approve access in
+my browser.
 ```
 
-The spec, the parser, and the example role files live in [`spec/`](spec/SPEC.md).
-The current spec is **v0.1** (tagged [`v0.1`](https://github.com/carloslfu/computer.md/releases/tag/v0.1); additive changes only — see [SPEC.md § Versioning](spec/SPEC.md)).
+The agent reads [`llms.txt`](llms.txt) and the install script, checks the
+provenance, installs the binary, loads the command reference, places the
+skill, and waits on the one human step: you approving CLI access in your
+browser. From there it drives your machines — submit tasks, stream results,
+read the screen.
+
+Installing by hand is one command on macOS and Linux (on Windows, download
+the binary from [Releases](https://github.com/carloslfu/computer.md/releases);
+self-update works natively after that):
+
+```bash
+curl -fsSL https://www.vibecraft.so/install/cli.sh | sh
+# or: brew install carloslfu/tap/vibecraft
+# or: download straight from GitHub Releases — no platform route, no install telemetry
+```
+
+To make the CLI stick across agent sessions, place a skill where your
+harness reads skills — the open
+[Agent Skills](https://www.anthropic.com/news/skills) format. The canonical
+file ships at [`skills/vibecraft/SKILL.md`](skills/vibecraft/SKILL.md): a
+thin pointer at `vibecraft docs`, never a copy, so it cannot drift. Copy it
+into your harness's skills dir (Claude Code `~/.claude/skills/`, Codex
+`~/.codex/skills/`, any other harness's equivalent), use the harness's own
+skill installer, or tell the agent to set itself up.
+
+Working with the spec instead? [`spec/SPEC.md`](spec/SPEC.md) defines the
+`COMPUTER.md` format — current spec **v0.1** (tagged
+[`v0.1`](https://github.com/carloslfu/computer.md/releases/tag/v0.1);
+additive changes only — see [SPEC.md § Versioning](spec/SPEC.md)). The spec
+tooling runs from a clone:
+
+```bash
+git clone https://github.com/carloslfu/computer.md
+cd computer.md/spec
+go run ./cmd/computer-md init --role developer   # generate a COMPUTER.md
+go run ./cmd/computer-md validate                # validate one
+```
+
 The Go daemon lives in [`daemon/`](daemon/). The CLI lives in [`cli/`](cli/).
 
-**Point your coding agent at the computer. The installer is text.** The
-`vibecraft` CLI is software for your agent, and a capable agent installs and
-wires it up by reading markdown and acting on it — there is no per-harness
-machinery to depend on. Two layers of reachability:
+### Safe to paste
 
-1. **Before the binary exists** — point your agent at the agent-readable entry
-   text: [`llms.txt`](llms.txt) in this repo (also served at
-   [`vibecraft.so/llms.txt`](https://www.vibecraft.so/llms.txt)). It says what
-   VibeCraft is, how to install the CLI, and how to integrate.
-2. **After the binary exists** — run `vibecraft docs` (or `vibecraft docs
-   --json`). It prints the same reference — the single source of truth — and the
-   agent drives your machine(s) from there: submit tasks, stream results, read
-   the screen.
+A prompt that ends in an installed binary deserves suspicion. The chain is
+built to be checked, by you or by the agent you hand it to:
 
-To make it stick across sessions, place a skill where your harness reads skills —
-the open [Agent Skills](https://www.anthropic.com/news/skills) format. The
-canonical file ships in this repo at [`skills/vibecraft/SKILL.md`](skills/vibecraft/SKILL.md)
-(`name`/`description` frontmatter; a thin pointer at `vibecraft docs`, never a
-copy, so it cannot drift). Placing it is generic file work: copy it into your
-harness's skills dir (Claude Code `~/.claude/skills/`, Codex `~/.codex/skills/`,
-or any other harness's equivalent), use the harness's own skill installer, or
-just load `vibecraft docs` into the system prompt. There is no `vibecraft
-install-skill` command — the mechanism is generic text plus a smart model.
+- **The installer is readable.** [`install/cli.sh`](install/cli.sh) is about
+  280 lines of POSIX sh: detect the platform, fetch the release manifest,
+  download the binary, verify its SHA-256 against the manifest and refuse on
+  mismatch, install to `~/.local/bin` with no sudo (`--system` opts into
+  `/usr/local/bin`, `--version` pins a release). When `cosign` is on your
+  PATH it also verifies the keyless signature and refuses a binary signed by
+  anyone but this repo's release workflow.
+- **Every binary traces back to source, three ways.** Releases are built in
+  CI from version tags, never on a developer's laptop. Each binary ships a
+  SHA-256 checksum, an Ed25519 signature against a public key pinned in the
+  source (and dry-run verified in CI before the release publishes — see
+  [SIGNING.md](SIGNING.md)), a Cosign keyless signature whose identity is
+  pinned to this repo's release workflow (Fulcio/Rekor transparency log),
+  and a signed build-provenance attestation:
+
+  ```bash
+  gh attestation verify vibecraft-<target> --repo carloslfu/computer.md
+  ```
+
+- **Self-update is fail-closed.** `vibecraft update` verifies SHA-256 plus
+  the Ed25519 signature against the key pinned inside the binary before
+  swapping; a download that does not verify is never installed.
+- **Telemetry is off by default.** The daemon sends nothing unless you opt
+  in — see [Telemetry](#telemetry). The platform install route logs one
+  anonymous download event; installing straight from GitHub Releases skips
+  even that.
+- **Dependencies are continuously audited.** Every pull request runs
+  `govulncheck` over the Go modules and fails on a reachable vulnerability;
+  Dependabot and Socket watch the Go and npm trees for malware, typosquats,
+  and suspicious install scripts.
+
+Do not take the list's word for it. The audit is one more prompt:
+
+```text
+Read install/cli.sh and .github/workflows/release.yml in
+carloslfu/computer.md and tell me whether this is safe to install.
+```
+
+[SIGNING.md](SIGNING.md) documents key custody and rotation;
+[SECURITY.md](SECURITY.md) holds the threat model.
 
 ## The four deployment shapes
 
@@ -152,20 +213,14 @@ Sign the Apache ICLA via the CLA Assistant bot on your first PR.
 ## Security
 
 Report vulnerabilities to security@vibecraft.so; see
-[SECURITY.md](SECURITY.md) for the threat model. Two things worth
-knowing if you run this:
+[SECURITY.md](SECURITY.md) for the threat model.
 
-**Releases are verifiable.** Every binary is built in CI,
-SHA256-checksummed, and signed with computer.md's Ed25519 release key,
-which `install.sh` and the CLI self-updater check against a pinned
-public key (plus cosign keyless signatures and build-provenance
-attestations). See [SIGNING.md](SIGNING.md).
-
-**Dependencies are continuously audited.** Every pull request runs
-`govulncheck` over the Go modules and fails on a reachable
-vulnerability; the Go and web (npm) dependency trees are also watched
-by GitHub Dependabot and Socket supply-chain scanning (malware,
-typosquats, suspicious install scripts).
+The supply chain is covered in [Safe to paste](#safe-to-paste) above:
+CI-built from version tags, SHA-256-checksummed, Ed25519-signed against a
+pinned key, Cosign-keyless-signed against the release workflow identity,
+provenance-attested, fail-closed self-update, telemetry off by default,
+dependencies continuously audited. [SIGNING.md](SIGNING.md) documents key
+custody and rotation.
 
 ## Related
 
@@ -177,3 +232,13 @@ typosquats, suspicious install scripts).
   [repo](https://github.com/carloslfu/db.md).
 - **AGENTS.md** — the agent-instruction convention computer.md
   composes with. See [agentsmd/agents.md](https://github.com/agentsmd/agents.md).
+
+## Star history
+
+<a href="https://www.star-history.com/#carloslfu/computer.md&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=carloslfu/computer.md&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=carloslfu/computer.md&type=Date" />
+   <img alt="Star history chart for carloslfu/computer.md" src="https://api.star-history.com/svg?repos=carloslfu/computer.md&type=Date" />
+ </picture>
+</a>

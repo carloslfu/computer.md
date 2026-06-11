@@ -12,6 +12,10 @@ permissions:
   contents: write
   # id-token: write enables cosign keyless signing via GitHub OIDC.
   id-token: write
+  # attestations: write enables SLSA build-provenance attestations
+  # (actions/attest-build-provenance), verifiable with
+  #   gh attestation verify <binary> --repo carloslfu/computer.md
+  attestations: write
 
 # Binaries are uploaded straight to the GitHub Release from each build
 # job. We deliberately do NOT use actions/upload-artifact: artifact
@@ -241,6 +245,24 @@ jobs:
             -sigfile vibecraft-daemon-linux-amd64.sig
           echo "release signature verified with the pinned fleet public key"
 
+      # Signed SLSA build-provenance attestation. Binds the binary to the
+      # exact commit + workflow run that built it; anyone verifies with
+      #   gh attestation verify vibecraft-daemon-linux-amd64 --repo carloslfu/computer.md
+      # One retry: the attestation API occasionally flakes transiently and
+      # a release should not die on that.
+      - name: Attest daemon build provenance (attempt 1)
+        id: attest_daemon_1
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: daemon/vibecraft-daemon-linux-amd64
+
+      - name: Attest daemon build provenance (retry, final)
+        if: steps.attest_daemon_1.outcome == 'failure'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: daemon/vibecraft-daemon-linux-amd64
+
       - name: Upload daemon to release
         working-directory: daemon
         env:
@@ -352,6 +374,24 @@ jobs:
             --output-signature "vibecraft-${{ matrix.suffix }}.sig" \
             --output-certificate "vibecraft-${{ matrix.suffix }}.pem" \
             "vibecraft-${{ matrix.suffix }}${{ matrix.ext }}"
+
+      # Signed SLSA build-provenance attestation. Binds each CLI binary to
+      # the exact commit + workflow run that built it; anyone verifies with
+      #   gh attestation verify vibecraft-<target> --repo carloslfu/computer.md
+      # One retry: the attestation API occasionally flakes transiently and
+      # a release should not die on that.
+      - name: Attest CLI build provenance (attempt 1)
+        id: attest_cli_1
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: cli/vibecraft-${{ matrix.suffix }}${{ matrix.ext }}
+
+      - name: Attest CLI build provenance (retry, final)
+        if: steps.attest_cli_1.outcome == 'failure'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: cli/vibecraft-${{ matrix.suffix }}${{ matrix.ext }}
 
       - name: Upload CLI to release (${{ matrix.suffix }})
         working-directory: cli
