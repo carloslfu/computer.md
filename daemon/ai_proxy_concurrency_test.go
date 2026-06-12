@@ -129,6 +129,51 @@ func TestAIProxyHandler_ChargesStreamedResponsesUsage(t *testing.T) {
 	}
 }
 
+func TestAIProxyHandler_UnparseableSuccessfulStreamChargesReservation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`event: response.completed`,
+			`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4-mini"}}`,
+			``,
+		}, "\n")))
+	}))
+	defer upstream.Close()
+
+	keyFile := t.TempDir() + "/openai.key"
+	if err := writeTempFile(keyFile, "PLATFORM_OPENAI_KEY"); err != nil {
+		t.Fatal(err)
+	}
+	spec := providerSpec{
+		name:           "openai",
+		upstreamBase:   upstream.URL,
+		authHeaderName: "Authorization",
+		authHeaderFmt:  "Bearer %s",
+		keyPath:        keyFile,
+		parseUsage:     parseOpenAIJSONUsage,
+		parseSSEUsage:  parseOpenAISSEUsage,
+	}
+
+	srv := mustNewServerForAIProxy(t, "vc-tok", 1_000_000)
+	h := srv.aiProxyHandler(spec)
+
+	req := httptest.NewRequest("POST", "/api/ai/credits/openai/v1/responses",
+		strings.NewReader(`{"model":"gpt-5.4-mini","stream":true,"input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer vc-tok")
+	req = req.WithContext(context.Background())
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("handler returned %d: %s", w.Code, w.Body.String())
+	}
+	if got := srv.budget.ledger.SpentCents; got != reserveCents {
+		t.Errorf("unparseable successful stream charged %d cents, want reservation %d", got, reserveCents)
+	}
+}
+
 // TestBudget_CapHoldsUnderConcurrency is the core race fix. With the old
 // allow()/charge() split (no lock held across the upstream call) N callers
 // at a near-cap budget all passed allow() and then all charged, overspending

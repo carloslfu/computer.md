@@ -32,10 +32,11 @@ func fakePlatformBudget(t *testing.T, budgetUSD float64) *httptest.Server {
 	periodStart, periodEnd := usage.CurrentMonthBounds()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"ai_budget_usd": budgetUSD,
-			"period_start":  periodStart,
-			"period_end":    periodEnd,
-			"period_source": "subscription",
+			"ai_budget_usd":    budgetUSD,
+			"usage_budget_usd": budgetUSD,
+			"period_start":     periodStart,
+			"period_end":       periodEnd,
+			"period_source":    "subscription",
 		})
 	}))
 	t.Cleanup(srv.Close)
@@ -229,9 +230,9 @@ func TestBudgetGate_FailOpenWhenBudgetUnknown(t *testing.T) {
 	}
 }
 
-// TestBudgetGate_EnterpriseNeverBlocked — a fetched budget of -1
-// (Enterprise / unmetered) never blocks, regardless of spend.
-func TestBudgetGate_EnterpriseNeverBlocked(t *testing.T) {
+// TestBudgetGate_CustomNegativeBudgetNeverBlocked — a fetched budget of -1
+// is a legacy/custom no-local-enforcement sentinel and never blocks.
+func TestBudgetGate_CustomNegativeBudgetNeverBlocked(t *testing.T) {
 	srv := newBudgetGateTestServer(t, -1.0, true)
 	srv.usageStore.Record("gpt-5.4-mini", "seed", manager.Usage{
 		OutputTokens: 99_999_999,
@@ -239,7 +240,7 @@ func TestBudgetGate_EnterpriseNeverBlocked(t *testing.T) {
 
 	code, _ := postTask(t, srv, "convo-1", "do the thing")
 	if code != 201 {
-		t.Fatalf("Enterprise unmetered must never be blocked, got %d", code)
+		t.Fatalf("custom negative budget must never be blocked, got %d", code)
 	}
 }
 
@@ -288,5 +289,8 @@ func TestBudgetGate_FullJoin(t *testing.T) {
 	}
 	if summary.BudgetState.BudgetUSD != 5 {
 		t.Errorf("budget_state.budget_usd should be the fetched $5, got %.2f", summary.BudgetState.BudgetUSD)
+	}
+	if summary.BudgetState.UsageBudgetUSD != 5 {
+		t.Errorf("budget_state.usage_budget_usd should be the fetched $5, got %.2f", summary.BudgetState.UsageBudgetUSD)
 	}
 }

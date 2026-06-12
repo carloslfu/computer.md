@@ -48,10 +48,13 @@ func newFakeBudget(t *testing.T) *fakeBudget {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"ai_budget_usd": fb.budget,
-			"period_start":  fb.start,
-			"period_end":    fb.end,
-			"period_source": "subscription",
+			"ai_budget_usd":         fb.budget,
+			"usage_budget_usd":      fb.budget,
+			"monthly_usage_cap_usd": 250.0,
+			"cap_reached_reason":    nil,
+			"period_start":          fb.start,
+			"period_end":            fb.end,
+			"period_source":         "subscription",
 		})
 	}))
 	t.Cleanup(fb.server.Close)
@@ -120,6 +123,12 @@ func TestBudget_RefreshFetchesAndParsesAllFields(t *testing.T) {
 	}
 	if st.BudgetUSD != 200 {
 		t.Errorf("budget didn't parse: got %.2f want 200", st.BudgetUSD)
+	}
+	if st.UsageBudgetUSD != 200 {
+		t.Errorf("usage_budget_usd didn't parse: got %.2f want 200", st.UsageBudgetUSD)
+	}
+	if st.MonthlyUsageCapUSD == nil || *st.MonthlyUsageCapUSD != 250 {
+		t.Errorf("monthly_usage_cap_usd didn't parse: got %+v want 250", st.MonthlyUsageCapUSD)
 	}
 	if !st.Enforced {
 		t.Errorf("a fetched positive budget must engage enforcement")
@@ -233,6 +242,52 @@ func TestBudget_EnforcesWhenSpendExceedsBudget(t *testing.T) {
 	}
 }
 
+// TestBudget_StateIncludesProxySpend pins hosted-tool AI accounting in the
+// local task gate. The platform budget response excludes this machine's own
+// spend, so State must net both manager-turn spend and proxy spend locally.
+func TestBudget_StateIncludesProxySpend(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	fb := newFakeBudget(t)
+	fb.set(5)
+	bt := trackerFor(store, fb)
+	bt.SetProxySpend(func() int { return 600 })
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	st, err := bt.State()
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if st.SpentUSD != 6 {
+		t.Fatalf("State must include proxy spend; got spent %.2f want 6.00", st.SpentUSD)
+	}
+	if !st.Paused {
+		t.Fatalf("$6 proxy spend over $5 budget must pause; got %+v", st)
+	}
+}
+
+func TestBudget_LocalUsageRecordSpendCentsExcludesProxy(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	fb := newFakeBudget(t)
+	fb.set(20)
+	bt := trackerFor(store, fb)
+	bt.SetProxySpend(func() int { return 600 })
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	seedSpend(t, store, "c1", 4.0)
+	if got := bt.LocalUsageRecordSpendCents(); got != 400 {
+		t.Fatalf("local usage-record spend must exclude proxy ledger: got %d want 400", got)
+	}
+
+	bt.SetManagerKeyMode("operator")
+	if got := bt.LocalUsageRecordSpendCents(); got != 0 {
+		t.Fatalf("operator-paid manager mode must not count VibeCraft credit spend: got %d", got)
+	}
+}
+
 // TestBudget_DrainedPoolZeroPauses — a fetched budget of exactly 0 (a fully
 // drained multi-machine pool, which the platform clamps to 0.0) must pause.
 // Regression for the old `budget > 0` guard that let a drained pool keep
@@ -274,9 +329,9 @@ func TestBudget_NotPausedUnderBudget(t *testing.T) {
 	}
 }
 
-// TestBudget_EnterpriseUnmeteredNeverPauses — a fetched budget of -1
-// (Enterprise) never pauses, regardless of spend.
-func TestBudget_EnterpriseUnmeteredNeverPauses(t *testing.T) {
+// TestBudget_CustomNegativeBudgetNeverPauses — a fetched budget of -1 is a
+// legacy/custom no-local-enforcement sentinel and never pauses.
+func TestBudget_CustomNegativeBudgetNeverPauses(t *testing.T) {
 	store := NewStore(openTestDB(t))
 	fb := newFakeBudget(t)
 	fb.set(-1)
@@ -286,10 +341,10 @@ func TestBudget_EnterpriseUnmeteredNeverPauses(t *testing.T) {
 	seedSpend(t, store, "c1", 100_000.0)
 	st, _ := bt.State()
 	if st.Enforced {
-		t.Errorf("unmetered (-1) must not be enforced")
+		t.Errorf("custom negative budget must not be enforced")
 	}
 	if st.Paused {
-		t.Errorf("unmetered (-1) must never pause")
+		t.Errorf("custom negative budget must never pause")
 	}
 }
 
@@ -365,7 +420,7 @@ func TestBudget_Warn80FiresOnceOnCrossing(t *testing.T) {
 	}
 	// +$1.50 → $8.50, crosses 80%. One warning.
 	bt.Record("gpt-5.4-mini", "c1", manager.Usage{OutputTokens: outTokensFor(1.5)})
-	if len(*notes) != 1 || (*notes)[0].title != "AI budget 80% used" {
+	if len(*notes) != 1 || (*notes)[0].title != "Usage credit 80% used" {
 		t.Fatalf("expected exactly one 80%% warning, got %+v", *notes)
 	}
 	// +$0.30 → still 80–100%. No repeat.
@@ -390,20 +445,21 @@ func TestBudget_Warn100FiresHighPriority(t *testing.T) {
 
 	var got *capturedNote
 	for i := range *notes {
-		if (*notes)[i].title == "AI credits exhausted" {
+		if (*notes)[i].title == "Usage credit exhausted" {
 			got = &(*notes)[i]
 		}
 	}
 	if got == nil {
-		t.Fatalf("expected an 'AI credits exhausted' notification, got %+v", *notes)
+		t.Fatalf("expected a 'Usage credit exhausted' notification, got %+v", *notes)
 	}
 	if got.priority != "high" {
 		t.Errorf("credits-exhausted must be high priority, got %q", got.priority)
 	}
 }
 
-// TestBudget_NoWarningWhenUnmetered — Enterprise never warns.
-func TestBudget_NoWarningWhenUnmetered(t *testing.T) {
+// TestBudget_NoWarningWhenCustomNegative — legacy/custom negative budgets do
+// not warn locally.
+func TestBudget_NoWarningWhenCustomNegative(t *testing.T) {
 	store := NewStore(openTestDB(t))
 	fb := newFakeBudget(t)
 	fb.set(-1)
@@ -414,7 +470,7 @@ func TestBudget_NoWarningWhenUnmetered(t *testing.T) {
 
 	bt.Record("gpt-5.4-mini", "c1", manager.Usage{OutputTokens: outTokensFor(9999.0)})
 	if len(*notes) != 0 {
-		t.Errorf("unmetered must never warn, got %+v", *notes)
+		t.Errorf("custom negative budget must never warn, got %+v", *notes)
 	}
 }
 
@@ -515,7 +571,7 @@ func TestBudget_RefreshIncludesProxySpend(t *testing.T) {
 
 // J12 — TestBudget_RefreshParsesNonAIConfig verifies that the non-AI
 // plan-config fields (plan_name, backup_cadence, region) come through
-// the same poll the AI budget rides on (Track D5). The daemon's
+// the same poll the usage budget rides on (Track D5). The daemon's
 // backup module + dashboard read these off the cached Snapshot().
 func TestBudget_RefreshParsesNonAIConfig(t *testing.T) {
 	store := NewStore(openTestDB(t))
@@ -525,6 +581,7 @@ func TestBudget_RefreshParsesNonAIConfig(t *testing.T) {
 	fb.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"ai_budget_usd":    100.0,
+			"usage_budget_usd": 100.0,
 			"period_start":     "2026-05-02",
 			"period_end":       "2026-06-02",
 			"period_source":    "subscription",
@@ -561,7 +618,7 @@ func TestBudget_RefreshParsesNonAIConfig(t *testing.T) {
 
 // J12 — TestBudget_RefreshHandlesMissingNonAIFields verifies the
 // backward-compat path: an older platform that doesn't return the D5
-// extension fields still works — the AI budget refresh succeeds and
+// extension fields still works — the usage-budget refresh succeeds and
 // the non-AI fields default to empty strings (daemon callers cope).
 func TestBudget_RefreshHandlesMissingNonAIFields(t *testing.T) {
 	store := NewStore(openTestDB(t))

@@ -43,6 +43,8 @@ function installFetchMock(responses: MockResponses) {
 const fullPlan = {
   plan_name: "Production",
   ai_budget_usd: 200,
+  usage_budget_usd: 200,
+  monthly_usage_cap_usd: 5000,
   period_start: "2026-05-01",
   period_end: "2026-05-31",
   period_source: "subscription" as const,
@@ -51,6 +53,7 @@ const fullPlan = {
 const calendarPlan = {
   plan_name: "Starter",
   ai_budget_usd: 50,
+  usage_budget_usd: 50,
   period_start: "2026-05-01",
   period_end: "2026-05-31",
   period_source: "calendar_month" as const,
@@ -59,6 +62,7 @@ const calendarPlan = {
 const enterprisePlan = {
   plan_name: "Enterprise",
   ai_budget_usd: -1,
+  usage_budget_usd: -1,
   period_start: "2026-05-01",
   period_end: "2026-05-31",
   period_source: "subscription" as const,
@@ -138,9 +142,9 @@ describe("UsageSettings", () => {
     // Wait for both fetches to resolve.
     await waitFor(() => screen.getByText("$23.45"));
 
-    // Hero shows the consumed amount + the included budget.
+    // Hero shows the consumed amount + available usage credit.
     expect(screen.getByText("$23.45")).toBeTruthy();
-    expect(screen.getByText("of $200")).toBeTruthy();
+    expect(screen.getByText("against $200")).toBeTruthy();
 
     // Progress bar: 23.45 / 200 = 11.725% → rounded to 12% used.
     expect(screen.getByText(/12% used/)).toBeTruthy();
@@ -192,8 +196,7 @@ describe("UsageSettings", () => {
     // 14 days elapsed of a 31-day cycle, $23.45 burned → ~$51.93 projected.
     await waitFor(() => screen.getByText(/At this pace/));
     // Projection is loose — assert just the framing + the dollar shape.
-    expect(screen.getByText(/At this pace/)).toBeTruthy();
-    expect(screen.getByText(/this cycle/)).toBeTruthy();
+    expect(screen.getByText(/At this pace/).textContent).toContain("this cycle");
   });
 
   it("hides pace estimate when there's nothing to project from yet", async () => {
@@ -205,7 +208,7 @@ describe("UsageSettings", () => {
       usage: { body: emptySummary },
     });
     render(<UsageSettings />);
-    await waitFor(() => screen.getByText("No AI consumption yet this period."));
+    await waitFor(() => screen.getByText("No metered AI consumption yet this period."));
     expect(screen.queryByText(/At this pace/)).toBeNull();
   });
 
@@ -223,7 +226,7 @@ describe("UsageSettings", () => {
     expect(screen.queryByText(/At this pace/)).toBeNull();
   });
 
-  it("renders Custom plan framing for Enterprise (aiBudget = -1)", async () => {
+  it("renders custom-term framing for legacy negative budgets", async () => {
     installFetchMock({
       plan: { body: enterprisePlan },
       usage: { body: sampleSummary },
@@ -233,17 +236,17 @@ describe("UsageSettings", () => {
     await waitFor(() => screen.getByText("$23.45"));
 
     expect(screen.getByText("Custom plan")).toBeTruthy();
-    // No progress bar copy when unmetered.
+    // No progress bar copy when custom terms are handled outside the machine.
     expect(screen.queryByText(/% used/)).toBeNull();
     expect(screen.queryByText(/of \$/)).toBeNull();
-    expect(screen.getByText(/don't have a per-month cap/)).toBeTruthy();
+    expect(screen.getByText(/custom metered terms/i)).toBeTruthy();
   });
 
   it("shows empty state when no consumption yet this period", async () => {
     installFetchMock({ plan: { body: fullPlan }, usage: { body: emptySummary } });
     render(<UsageSettings />);
 
-    await waitFor(() => screen.getByText("No AI consumption yet this period."));
+    await waitFor(() => screen.getByText("No metered AI consumption yet this period."));
 
     // No by-model card, no top-chats card.
     expect(screen.queryByText("By model")).toBeNull();
@@ -300,9 +303,9 @@ describe("UsageSettings", () => {
     });
     render(<UsageSettings />);
 
-    await waitFor(() => screen.getByText("Monthly AI budget reached"));
+    await waitFor(() => screen.getByText("Usage credit reached"));
     const alert = screen.getByRole("alert");
-    expect(alert.textContent).toContain("Monthly AI budget reached");
+    expect(alert.textContent).toContain("Usage credit reached");
     expect(alert.textContent).toContain("2026-06-02");
     expect(alert.textContent).toContain("paused");
   });
@@ -325,7 +328,7 @@ describe("UsageSettings", () => {
     });
     render(<UsageSettings />);
     await waitFor(() => screen.getByText("$23.45"));
-    expect(screen.queryByText("Monthly AI budget reached")).toBeNull();
+    expect(screen.queryByText("Usage credit reached")).toBeNull();
   });
 
   it("renders gracefully when /api/plan fails (degraded mode)", async () => {

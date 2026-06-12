@@ -100,7 +100,7 @@ func TestUnregisterTearsDownAppService(t *testing.T) {
 	// 3. The 0600 secret sidecar must be gone — this is the leak the
 	//    finding flagged. Its survival is the actual harm.
 	if _, err := os.Stat(envPath); !os.IsNotExist(err) {
-		t.Errorf("secret env sidecar %s still exists after Unregister (stat err=%v) — resolved vault secrets + AI-credits token leaked on disk", envPath, err)
+		t.Errorf("secret env sidecar %s still exists after Unregister (stat err=%v) — resolved vault secrets + usage-credit token leaked on disk", envPath, err)
 	}
 }
 

@@ -4,17 +4,17 @@ import { useEffect, useMemo, useState } from "react";
 import { apiFetch } from "../../api/fetch";
 import { PLATFORM_BASE } from "../../auth/types";
 
-// AI Usage panel.
+// Usage panel.
 //
 // Joins two sources of truth at render time:
 //   - Daemon /api/usage: per-machine consumption, billed at cost. Real
 //     tokens, real cost in USD. Source: this machine's usage_records.
-//   - Platform /api/plan: user-scoped plan + monthly credit budget +
+//   - Platform /api/plan: user-scoped plan + usage-credit budget +
 //     billing period boundaries (from the Stripe subscription when
 //     available; calendar month otherwise).
 //
 // The platform sources the budget and the period; the daemon sources
-// the spend. Joined here so the user sees "$X.XX of $Y/mo included"
+// the spend. Joined here so the user sees "$X.XX against $Y available"
 // against the period that's actually being billed.
 //
 // Why the join lives in the SPA rather than on the platform: keeping
@@ -50,6 +50,9 @@ type ConvoBreakdown = {
 // recomputing paused-ness from plan + spend.
 type BudgetState = {
   budget_usd: number;
+  usage_budget_usd?: number;
+  monthly_usage_cap_usd?: number;
+  cap_reached_reason?: string | null;
   enforced: boolean;
   paused: boolean;
   spent_usd: number;
@@ -68,7 +71,14 @@ type Summary = {
 
 type Plan = {
   plan_name: string | null;
-  ai_budget_usd: number;
+  ai_budget_usd?: number;
+  usage_budget_usd?: number;
+  remaining_usage_usd?: number;
+  monthly_usage_cap_usd?: number;
+  included_usage_credit_usd?: number;
+  usage_credit_balance_usd?: number;
+  committed_resource_usd?: number;
+  cap_reached_reason?: string | null;
   period_start: string;
   period_end: string;
   period_source: "subscription" | "calendar_month";
@@ -340,8 +350,10 @@ export function UsageSettings() {
   }, [summary]);
 
   const hasUsage = summary !== null && summary.total_cost_usd > 0;
-  const budget = plan?.ai_budget_usd ?? 0;
-  const isUnmetered = budget === -1;
+  const budget =
+    plan?.usage_budget_usd ?? plan?.remaining_usage_usd ?? plan?.ai_budget_usd ?? 0;
+  const monthlyCap = plan?.monthly_usage_cap_usd ?? 0;
+  const hasCustomTerms = budget === -1;
   const pctUsed =
     hasUsage && budget > 0
       ? Math.min(100, (summary!.total_cost_usd / budget) * 100)
@@ -363,12 +375,11 @@ export function UsageSettings() {
   return (
     <div>
       <h3 className="font-poppins text-base font-semibold text-slate-950">
-        AI usage
+        Usage
       </h3>
       <p className="mt-1.5 text-sm leading-relaxed text-slate-500">
-        Per-machine token consumption from the manager, billed at cost.
-        VibeCraft pays the upstream model provider and passes the rate through unchanged — no
-        markup.
+        Per-machine AI consumption from the manager and hosted tools when they
+        use VibeCraft-metered routes. Usage credit is billed at cost.
       </p>
 
       {loading && (
@@ -400,17 +411,17 @@ export function UsageSettings() {
               className="rounded-2xl border border-amber-300/80 bg-amber-50 p-5"
             >
               <p className="font-poppins text-sm font-semibold text-amber-900">
-                Monthly AI budget reached
+                Usage credit reached
               </p>
               <p className="mt-1.5 text-sm leading-relaxed text-amber-800">
-                You&apos;ve used your full{" "}
-                {formatUSD(summary.budget_state.budget_usd, 0)} monthly AI
-                budget. New tasks are paused until your billing cycle renews
-                on{" "}
+                You&apos;ve used your available{" "}
+                {formatUSD(summary.budget_state.usage_budget_usd ?? summary.budget_state.budget_usd, 0)} VibeCraft usage credit. New tasks are
+                paused until your billing cycle renews on{" "}
                 <span className="font-medium">
                   {summary.budget_state.resets_on}
                 </span>
-                . Anything already running finishes normally.
+                , or until the account is topped up. Anything already running
+                finishes normally.
               </p>
             </div>
           )}
@@ -432,10 +443,10 @@ export function UsageSettings() {
                 <span className="text-slate-500">
                   {planError
                     ? "Plan unavailable"
-                    : isUnmetered
+                    : hasCustomTerms
                       ? "Custom plan"
                       : plan
-                        ? `${formatUSD(budget, 0)}/mo included`
+                        ? `${formatUSD(budget, 0)} available`
                         : "—"}
                 </span>
               </div>
@@ -444,14 +455,14 @@ export function UsageSettings() {
                 <span className="font-poppins text-3xl font-semibold text-slate-950">
                   {formatUSD(summary.total_cost_usd)}
                 </span>
-                {!isUnmetered && plan && budget > 0 && (
+                {!hasCustomTerms && plan && budget > 0 && (
                   <span className="text-sm text-slate-500">
-                    of {formatUSD(budget, 0)}
+                    against {formatUSD(budget, 0)}
                   </span>
                 )}
               </div>
 
-              {!isUnmetered && plan && budget > 0 && (
+              {!hasCustomTerms && plan && budget > 0 && (
                 <div className="mt-4">
                   <div
                     className="h-1.5 overflow-hidden rounded-full bg-slate-100"
@@ -496,13 +507,22 @@ export function UsageSettings() {
                       this {plan.period_source === "subscription" ? "cycle" : "month"}.
                     </p>
                   )}
+                  {monthlyCap > 0 && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Account cap:{" "}
+                      <span className="font-medium text-slate-700">
+                        {formatUSD(monthlyCap, 0)}
+                      </span>{" "}
+                      this cycle.
+                    </p>
+                  )}
                 </div>
               )}
 
-              {isUnmetered && (
+              {hasCustomTerms && (
                 <p className="mt-3 text-xs text-slate-500">
-                  Enterprise plans don&apos;t have a per-month cap. Spend is
-                  tracked and invoiced separately.
+                  This account uses custom metered terms. Spend is tracked and
+                  reconciled separately.
                 </p>
               )}
             </div>
@@ -512,7 +532,7 @@ export function UsageSettings() {
           {!hasUsage && (
             <div className="rounded-xl border border-dashed border-slate-200/80 bg-white/30 p-6 text-center">
               <p className="text-sm text-slate-500">
-                No AI consumption yet this period.
+                No metered AI consumption yet this period.
               </p>
               <p className="mt-1.5 text-xs text-slate-400">
                 Send the manager a task to get started. Token spend will
@@ -613,7 +633,7 @@ export function UsageSettings() {
 
           {/* ── Footer — restate the trust framing ──────────────────── */}
           <p className="text-[11px] text-slate-400">
-            Billed at cost. OpenAI publishes current API rates at{" "}
+            VibeCraft-metered AI is billed at cost. OpenAI publishes current API rates at{" "}
             <a
               href="https://developers.openai.com/api/docs/pricing"
               target="_blank"
@@ -622,8 +642,9 @@ export function UsageSettings() {
             >
               developers.openai.com/api/docs/pricing
             </a>
-            . Workers (Claude Code, Codex) run on your own subscription and
-            don&apos;t appear here.
+            . Managed infrastructure reservations and account-wide credit live
+            in the billing dashboard. BYOM own-key manager calls and workers
+            (Claude Code, Codex) don&apos;t appear here.
           </p>
         </div>
       )}

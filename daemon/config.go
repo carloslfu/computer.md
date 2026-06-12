@@ -49,6 +49,8 @@ type Config struct {
 	// platform = VibeCraft-owned managed key and VibeCraft credits apply.
 	// operator = BYOM/self-host operator-owned key and VibeCraft credits do not.
 	// relay = no local hosted key; reserved for a future server-side relay.
+	// Until that transport exists, relay mode fails closed and ignores any
+	// local key so it cannot silently become unmetered direct OpenAI usage.
 	ManagerKeyMode string
 
 	// ManagerModel is the OpenAI model id used by the manager. Hosted launch
@@ -369,8 +371,9 @@ func loadManagerSettings(
 	if mode == "platform" && key == "" {
 		unavailable = "This managed computer needs manager setup before it can run tasks. No local key is needed."
 	}
-	if mode == "relay" && key == "" {
-		unavailable = "This computer needs manager setup before it can run tasks."
+	if mode == "relay" {
+		key = ""
+		unavailable = "This computer is configured for VibeCraft manager relay, but relay transport is not available in this daemon build yet. Switch to an operator-owned key or update after relay support ships."
 	}
 
 	model = strings.TrimSpace(getenv("VIBECRAFT_MANAGER_MODEL"))

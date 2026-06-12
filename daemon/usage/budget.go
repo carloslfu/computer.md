@@ -16,7 +16,7 @@ import (
 
 // Budget enforcement.
 //
-// The daemon enforces the customer's monthly AI credit budget: when
+// The daemon enforces the customer's VibeCraft-metered usage budget: when
 // the period's spend reaches the budget, NEW tasks are held with a
 // clear in-chat explanation (see the gate in handleTask). This is the
 // operational half of PRODUCT.md's "no surprise bills" promise — the
@@ -34,20 +34,29 @@ import (
 //     finishes, even if its final turns tip spend past the budget.
 //     Killing work in progress is the opposite of smooth.
 //
-//   - Enterprise is never paused. aiBudget == -1 means unmetered.
+//   - Legacy/custom negative budgets are not paused by the daemon. Current
+//     platform plans should send funded remaining usage instead.
 //
 //   - The customer is warned at 80% (see CheckWarningThreshold), so
 //     hitting 100% is never a surprise.
 
 // Budget is the platform's answer to GET /api/machine/budget — the
-// plan's monthly AI credit allowance plus the current billing period.
+// plan's current usage-credit balance plus the current billing period.
 // Track D5 extends it with non-AI plan config (plan_name, backup_cadence,
 // region) on the same poll.
 type Budget struct {
-	BudgetUSD    float64 `json:"ai_budget_usd"`
-	PeriodStart  string  `json:"period_start"`
-	PeriodEnd    string  `json:"period_end"`
-	PeriodSource string  `json:"period_source"`
+	// BudgetUSD is the legacy field name kept for rolling compatibility.
+	// Prefer UsageBudgetUSD when present.
+	BudgetUSD      float64  `json:"ai_budget_usd"`
+	UsageBudgetUSD *float64 `json:"usage_budget_usd,omitempty"`
+
+	MonthlyUsageCapUSD *float64 `json:"monthly_usage_cap_usd,omitempty"`
+	RemainingUsageUSD  *float64 `json:"remaining_usage_usd,omitempty"`
+	CapReachedReason   *string  `json:"cap_reached_reason,omitempty"`
+
+	PeriodStart  string `json:"period_start"`
+	PeriodEnd    string `json:"period_end"`
+	PeriodSource string `json:"period_source"`
 
 	// Track D5: non-AI plan config the daemon caches off the same poll.
 	// Resolved per-machine (machines.planName) so an add-on machine
@@ -60,16 +69,40 @@ type Budget struct {
 	ManagerKeyMode string `json:"manager_key_mode,omitempty"`
 }
 
+// EffectiveBudgetUSD returns the currently enforceable VibeCraft-metered usage
+// budget. usage_budget_usd is the canonical 2026 field; ai_budget_usd remains a
+// compatibility fallback for older platform versions and older tests.
+func (b *Budget) EffectiveBudgetUSD() float64 {
+	if b == nil {
+		return 0
+	}
+	if b.UsageBudgetUSD != nil {
+		return *b.UsageBudgetUSD
+	}
+	if b.RemainingUsageUSD != nil {
+		return *b.RemainingUsageUSD
+	}
+	return b.BudgetUSD
+}
+
 // BudgetState is the enforcement verdict the rest of the daemon (the
 // task gate, the /api/usage endpoint) reads. It's a snapshot — recompute
 // it per decision rather than caching, since spend changes every turn.
 type BudgetState struct {
 	// BudgetUSD is the effective budget being enforced — the override
 	// when one is set (testing / manual control), else the platform
-	// value. -1 means unmetered (Enterprise).
+	// value. -1 is a legacy/custom no-local-enforcement sentinel.
 	BudgetUSD float64 `json:"budget_usd"`
+	// UsageBudgetUSD is the canonical alias surfaced to the SPA. Keep
+	// BudgetUSD for existing clients.
+	UsageBudgetUSD float64 `json:"usage_budget_usd"`
+	// MonthlyUsageCapUSD is the account cap, when the platform provided it.
+	MonthlyUsageCapUSD *float64 `json:"monthly_usage_cap_usd,omitempty"`
+	// CapReachedReason explains whether the hard cap, not just funds, is the
+	// reason new VibeCraft-metered usage is paused.
+	CapReachedReason *string `json:"cap_reached_reason,omitempty"`
 	// Enforced is true when there's a positive budget to enforce
-	// against. False for Enterprise (-1) and for the fail-open case
+	// against. False for legacy/custom negative budgets and for the fail-open case
 	// (budget never successfully fetched).
 	Enforced bool `json:"enforced"`
 	// Paused is true when Enforced and period spend >= budget. When
@@ -162,10 +195,36 @@ func (bt *BudgetTracker) SetProxySpend(fn func() int) {
 	bt.mu.Unlock()
 }
 
+// LocalUsageRecordSpendCents returns this machine's current-period
+// VibeCraft-metered manager/daemon spend from usage_records only. It
+// deliberately does not include proxySpentFunc; callers that already hold the
+// proxy budget lock must be able to call this without re-entering the proxy
+// ledger. On read errors we return 0, matching the tracker's fail-open stance.
+func (bt *BudgetTracker) LocalUsageRecordSpendCents() int {
+	_, _, periodStart, periodEnd := bt.snapshot()
+	bt.mu.RLock()
+	managerMode := bt.managerMode
+	bt.mu.RUnlock()
+	if managerMode != "platform" {
+		return 0
+	}
+
+	summary, err := bt.store.Aggregate(periodStart, periodEnd, 0)
+	if err != nil {
+		return 0
+	}
+	spentCents := int(summary.TotalCostUSD*100 + 0.5)
+	if spentCents < 0 {
+		return 0
+	}
+	return spentCents
+}
+
 // SetManagerKeyMode controls whether VibeCraft credits are enforced for
 // manager calls. platform means VibeCraft paid upstream and credits apply;
-// operator/relay usage is recorded locally but not deducted locally as
-// VibeCraft credit spend by this daemon.
+// operator usage is recorded locally but not deducted locally as VibeCraft
+// credit spend by this daemon. relay is reserved for server-side metering; in
+// current builds config fails closed before manager calls can run.
 func (bt *BudgetTracker) SetManagerKeyMode(mode string) {
 	bt.mu.Lock()
 	switch mode {
@@ -226,9 +285,9 @@ func (bt *BudgetTracker) maybeWarn() {
 	if fire100 {
 		notify(
 			"budget",
-			"AI credits exhausted",
+			"Usage credit exhausted",
 			fmt.Sprintf(
-				"You've used your monthly AI credits. New tasks are paused. Top up at any amount to resume right away, or wait for your billing cycle to renew on %s.",
+				"You've used your available VibeCraft usage credit. New tasks are paused. Top up to resume right away, or wait for your billing cycle to renew on %s.",
 				st.ResetsOn,
 			),
 			"high",
@@ -236,9 +295,9 @@ func (bt *BudgetTracker) maybeWarn() {
 	} else if fire80 {
 		notify(
 			"budget",
-			"AI budget 80% used",
+			"Usage credit 80% used",
 			fmt.Sprintf(
-				"You've used $%.2f of your $%.0f monthly AI budget. New tasks will pause if you reach the limit before %s.",
+				"You've used $%.2f of your $%.0f VibeCraft usage credit. New tasks will pause if you reach the limit before %s.",
 				st.SpentUSD, st.BudgetUSD, st.ResetsOn,
 			),
 			"normal",
@@ -416,7 +475,7 @@ func (bt *BudgetTracker) snapshot() (budget float64, haveBudget bool, periodStar
 	if periodStart == "" || periodEnd == "" {
 		periodStart, periodEnd = CurrentMonthBounds()
 	}
-	return bt.current.BudgetUSD, true, periodStart, periodEnd
+	return bt.current.EffectiveBudgetUSD(), true, periodStart, periodEnd
 }
 
 // Snapshot returns the last successfully-fetched budget config. nil
@@ -439,13 +498,21 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 	budget, haveBudget, periodStart, periodEnd := bt.snapshot()
 	bt.mu.RLock()
 	managerMode := bt.managerMode
+	proxySpent := bt.proxySpentFunc
 	bt.mu.RUnlock()
 
 	st := BudgetState{
 		BudgetUSD:      budget,
+		UsageBudgetUSD: budget,
 		ResetsOn:       periodEnd,
 		ManagerKeyMode: managerMode,
 	}
+	bt.mu.RLock()
+	if bt.current != nil {
+		st.MonthlyUsageCapUSD = bt.current.MonthlyUsageCapUSD
+		st.CapReachedReason = bt.current.CapReachedReason
+	}
+	bt.mu.RUnlock()
 
 	if managerMode != "platform" {
 		if summary, err := bt.store.Aggregate(periodStart, periodEnd, 0); err == nil {
@@ -458,7 +525,7 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 	if !haveBudget {
 		return st, nil
 	}
-	// Enterprise / unmetered.
+	// Legacy/custom negative budget: no local enforcement.
 	if budget < 0 {
 		return st, nil
 	}
@@ -471,12 +538,17 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 	}
 
 	st.SpentUSD = summary.TotalCostUSD
+	if proxySpent != nil {
+		if pc := proxySpent(); pc > 0 {
+			st.SpentUSD += float64(pc) / 100
+		}
+	}
 	st.Enforced = true
-	// budget >= 0 here (the budget < 0 unmetered/Enterprise case returned
+	// budget >= 0 here (the legacy/custom budget < 0 case returned
 	// above). A budget of exactly 0 is a fully-drained pool — the platform
 	// clamps a drained multi-machine pool to 0.0 — so it must pause too. The
 	// old `budget > 0` guard let a drained pool keep spending past zero on the
 	// remaining sibling machines.
-	st.Paused = summary.TotalCostUSD >= budget
+	st.Paused = st.SpentUSD >= budget
 	return st, nil
 }

@@ -229,7 +229,7 @@ func teardownAppService(name string) {
 	}
 
 	// Remove the unit file and its secret sidecar. The env file holds
-	// resolved live secrets + the AI-credits token at mode 0600 — this
+	// resolved live secrets + the usage-credit token at mode 0600 — this
 	// is the leak the finding flagged, so its removal is the point.
 	if err := removeFileFn(unitPath); err != nil {
 		log.Printf("teardown: removing unit file %s: %v", unitPath, err)

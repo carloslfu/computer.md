@@ -260,7 +260,7 @@ Status values: `queued`, `running`, `waiting_for_input`, `completed`, `failed`, 
 | Verb | Purpose |
 |------|---------|
 | `machine list` | Every machine on your account (live query to the platform). |
-| `machine create [name]` | Provision a new managed (cloud) machine. Uses a plan slot you already pay for; no charge. At the plan cap → `limit_reached` (a human upgrades the plan). |
+| `machine create [name]` | Provision a new VibeCraft-managed cloud machine. Reserves the machine's monthly resource cost against funded usage credit and account metered spend terms before provisioning. If the request does not fit → `limit_reached` (add credit, raise the spend limit, or choose a smaller resource). |
 | `machine connect <name>` | Register a BYOM machine (your own hardware) — returns a registration token + install command. Free. |
 | `machine terminate <id> --confirm` | Permanently terminate a machine. Irreversible — refuses without `--confirm`. |
 | `machine select <id>` | Set the default machine for commands run without `--machine`. |
@@ -279,9 +279,11 @@ Status values: `queued`, `running`, `waiting_for_input`, `completed`, `failed`, 
 
 Critical actions require `--confirm`: only `machine terminate` (irreversible).
 Everything else is reversible and runs without a gate. The CLI never moves
-money — `machine create` consumes a pre-paid plan slot; over the cap it
-returns `limit_reached` for a human to resolve. Billing, plan changes, and
-account sign-up stay dashboard-only by design.
+money — `machine create` reserves usage-credit resource budget against funded
+credit and account metered spend terms. If the request does not fit, it returns
+`limit_reached` for a human to add credit, raise the spend limit, or choose a
+smaller resource. Billing, plan changes, and account sign-up stay dashboard-only
+by design.
 
 ### Files
 
@@ -408,7 +410,7 @@ in its systemd unit. `tools env <name>` lists the KEYS (values are never returne
 over the network). Set or change a value with `tools deploy <name> --env
 KEY=VALUE`; the value may reference a vault secret as `$SECRET_NAME`, which the
 daemon resolves on the machine, so plaintext never touches your shell history.
-Store the secret first with `vault set`. On Managed machines the AI-credit proxy
+Store the secret first with `vault set`. On Managed machines the usage-credit proxy
 variables (`VIBECRAFT_AI_PROXY_URL`, `VIBECRAFT_AI_CREDITS_TOKEN`) are injected
 automatically and shown as VibeCraft-managed in `tools env`.
 

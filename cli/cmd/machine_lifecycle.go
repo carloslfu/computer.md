@@ -14,9 +14,9 @@ import (
 
 // Machine lifecycle verbs — provision, connect, terminate. These hit
 // the platform (not a daemon) with the account key, so the CLI can
-// manage the fleet end to end. No payment ever flows through the CLI:
-// `create` consumes a plan slot the account already pays for; over the
-// cap it returns limit_reached and a human upgrades the plan.
+// manage machines end to end. No payment ever flows through the CLI:
+// `create` reserves a managed-resource commitment against funded usage
+// credit and account metered spend terms before provisioning.
 //
 // Only `terminate` is gated — by --confirm — because it is the one
 // irreversible action (it destroys the customer's computer).
@@ -28,9 +28,10 @@ var machineCreateCmd = &cobra.Command{
 	Short: "Provision a new managed (cloud) machine",
 	Long: `Provision a managed VibeCraft machine — VibeCraft runs it on AWS.
 
-Uses a machine slot your plan already pays for; no charge flows through
-the CLI. If the plan is at its cap, this returns 'limit_reached' and a
-human upgrades the plan from the dashboard.
+Reserves the machine's monthly resource cost against funded usage credit
+and account metered spend terms before provisioning. If the request does
+not fit, this returns 'limit_reached' so you can add credit, raise the
+spend limit, or choose a smaller resource from the dashboard.
 
   vibecraft machine create
   vibecraft machine create "Ops box"`,

@@ -272,7 +272,7 @@ func (s *Server) doInstallAppService(ctx context.Context, req installAppServiceR
 	// read back from a unit file and an Environment merged from caller
 	// overrides — both must be control-char-clean before they are
 	// re-rendered into a unit, or a newline injects a systemd directive.
-	// Run before the AI-credits injection below so the daemon's own
+	// Run before the usage-credit injection below so the daemon's own
 	// (reserved-name) vars aren't rejected by the reserved-name check.
 	if err := validateUnitFields(req); err != nil {
 		return result, err
@@ -286,7 +286,7 @@ func (s *Server) doInstallAppService(ctx context.Context, req installAppServiceR
 		return result, fmt.Errorf("ensuring systemd-user dir: %w", err)
 	}
 
-	// 1b. Auto-inject the AI credits proxy env vars on Managed machines.
+	// 1b. Auto-inject the usage-credit proxy env vars on Managed machines.
 	//     Every Managed installed app gets these for free; the app code just does
 	//
 	//       createOpenAI({
@@ -299,7 +299,7 @@ func (s *Server) doInstallAppService(ctx context.Context, req installAppServiceR
 	//     server-side. See daemon/ai_proxy.go for the full chain.
 	//
 	//     Connected/BYOM operator-owned key mode does not get this
-	//     proxy: VibeCraft-funded local app AI credits require a relay
+	//     proxy: VibeCraft-metered local app usage requires a relay
 	//     before they are safe on customer-owned hardware.
 	//
 	//     Injected only when the daemon was able to load a credits
@@ -321,7 +321,7 @@ func (s *Server) doInstallAppService(ctx context.Context, req installAppServiceR
 
 	// 2b. Write the secret-bearing EnvironmentFile 0600. The unit above
 	//     is world-readable (0644) and deliberately holds ZERO secret
-	//     values — every KEY=VALUE (resolved vault refs, the AI-credits
+	//     values — every KEY=VALUE (resolved vault refs, the usage-credit
 	//     token) lands here instead, readable only by the vibecraft user
 	//     systemd runs the service as. Atomic tmp+rename, same as the
 	//     unit. When the app declares no env we remove any stale file so
@@ -587,7 +587,7 @@ func waitForServiceCycle(ctx context.Context, uid, runtimeDir, unit string, oldP
 // expects it readable). It therefore MUST NOT contain secret values.
 // Environment is never inlined as `Environment=` lines here; instead the
 // unit references a sibling EnvironmentFile= that doInstallAppService
-// writes 0600. That keeps resolved vault values and the AI-credits token
+// writes 0600. That keeps resolved vault values and the usage-credit token
 // out of the world-readable unit. renderUnitFile assumes every field has
 // already passed validateUnitFields / validateAppServiceEnvironment, so
 // no value can contain a newline that would inject extra directives.

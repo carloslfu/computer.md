@@ -5,6 +5,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/carloslfu/computer.md/daemon/manager"
 )
 
 func newTestBudgetSvc(capCents int) *budgetService {
@@ -17,8 +19,8 @@ func newTestBudgetSvc(capCents int) *budgetService {
 
 // TestBudgetService_PooledCapSupersedesStatic is the regression for
 // daemon-manager-ai-2: the proxy cap was a hardcoded $50 (nothing ever wrote
-// /etc/vibecraft/ai_budget_cents), so a Business/Enterprise machine that paid
-// for a large AI budget got hosted-tool AI cut off at $50. The proxy must gate
+// /etc/vibecraft/ai_budget_cents), so a larger account that paid for a bigger
+// usage budget got hosted-tool AI cut off at $50. The proxy must gate
 // on the plan-aware pooled budget when available, and only fall back to the
 // static cap before the first budget fetch.
 func TestBudgetService_PooledCapSupersedesStatic(t *testing.T) {
@@ -39,10 +41,21 @@ func TestBudgetService_PooledCapSupersedesStatic(t *testing.T) {
 	bs.SetPooledBudget(func() (int, bool, bool) { return remaining, unmetered, have })
 
 	// $90 spent — well past the $50 static cap — but the plan's pooled budget
-	// has room, so the Business machine must NOT be blocked.
+	// still has $100 of account room before this machine's local proxy spend.
+	// Pooled budget supersedes the static fallback, while this machine still
+	// subtracts its own settled proxy spend locally.
 	bs.ledger.SpentCents = 9000
+	remaining = 10000
 	if err := bs.allow(); err != nil {
 		t.Fatalf("pooled budget has room; must allow despite >static-cap spend: %v", err)
+	}
+
+	// If the platform's pooled remaining budget is already fully consumed by
+	// this machine's local proxy ledger, the proxy must block until the next
+	// refresh/top-up instead of reusing the same remote room.
+	remaining = 9000
+	if err := bs.allow(); err == nil {
+		t.Fatal("pooled budget consumed by local proxy spend; must block")
 	}
 
 	// Pooled budget exhausted → block.
@@ -51,10 +64,10 @@ func TestBudgetService_PooledCapSupersedesStatic(t *testing.T) {
 		t.Fatal("pooled budget exhausted; must block")
 	}
 
-	// Unmetered (Enterprise, -1 → unmetered=true) → always allow.
+	// Legacy/custom negative budget → no local pooled-budget enforcement.
 	unmetered = true
 	if err := bs.allow(); err != nil {
-		t.Fatalf("unmetered plan must always allow: %v", err)
+		t.Fatalf("custom negative budget must always allow: %v", err)
 	}
 
 	// No pooled snapshot (have=false) → fall back to the static cap.
@@ -62,6 +75,27 @@ func TestBudgetService_PooledCapSupersedesStatic(t *testing.T) {
 	bs.ledger.SpentCents = 5000
 	if err := bs.allow(); err == nil {
 		t.Fatal("no pooled snapshot → static cap applies; at cap should block")
+	}
+}
+
+func TestBudgetService_PooledBudgetSubtractsManagerSpend(t *testing.T) {
+	srv := newBudgetGateTestServer(t, 10, true)
+	if err := srv.budgetTracker.Record("gpt-5.4-mini", "c1", manager.Usage{
+		OutputTokens: 1_000_000, // $4.50
+	}); err != nil {
+		t.Fatalf("record manager spend: %v", err)
+	}
+
+	bs := newTestBudgetSvc(5000)
+	bs.SetPooledBudget(pooledBudgetSourceForProxy(srv.budgetTracker))
+
+	// The platform returns $10 excluding this machine. Local manager spend has
+	// already used $4.50, and local proxy spend has used the other $5.50. Before
+	// the proxy source subtracted manager spend, this incorrectly had $4.50 of
+	// room and allowed another hosted-tool AI call.
+	bs.ledger.SpentCents = 550
+	if err := bs.allow(); err == nil {
+		t.Fatal("manager spend plus proxy spend at the pooled budget must block")
 	}
 }
 

@@ -73,15 +73,15 @@ func (s *Server) handleDaemonTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Budget gate: same pause-at-zero rule as the human-facing /task. When the
-	// AI budget is exhausted, do NOT enqueue autonomous/system work — otherwise
+	// usage credit is exhausted, do NOT enqueue autonomous/system work — otherwise
 	// standing systems (cron, watchers, sub-agents) keep spending past zero,
 	// which is exactly the unattended path where "no surprise bills" matters
 	// most. The box, supercronic, and the system files keep running; only this
-	// AI turn is withheld, so the system resumes cleanly when credits return.
+	// AI turn is withheld, so the system resumes cleanly when credit returns.
 	if s.budgetTracker != nil {
 		if state, err := s.budgetTracker.State(); err == nil && state.Paused {
 			msg := fmt.Sprintf(
-				"AI budget exhausted ($%.0f/mo). This system's task is held until the billing cycle renews on %s. The computer and your systems keep running; work resumes automatically when credits return.",
+				"Usage credit exhausted ($%.0f available). This system's task is held until the billing cycle renews on %s or the account is topped up. The computer and your systems keep running; work resumes automatically when credit returns.",
 				state.BudgetUSD, state.ResetsOn,
 			)
 			_ = s.taskStore.EnsureConversation(req.ConversationID, req.Instruction)

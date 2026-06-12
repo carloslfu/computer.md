@@ -21,7 +21,7 @@ import (
 	"github.com/carloslfu/computer.md/daemon/audit"
 )
 
-// ai_proxy.go is the platform's "included AI credits" surface. Apps the
+// ai_proxy.go is the platform's VibeCraft-metered usage-credit surface. Apps the
 // manager deploys on this machine can ask the daemon to make AI calls
 // on their behalf without ever touching the platform's API key.
 //
@@ -29,7 +29,7 @@ import (
 //
 //   On Managed machines, the platform's OpenAI API key lives at
 //   /etc/vibecraft/openai.key (0600 root). The root daemon reads it
-//   for the manager and, on Managed only, for included app AI credits.
+//   for the manager and, on Managed only, for included app AI usage.
 //   Hosted apps deployed via /api/daemon/install-app-service run as
 //   the vibecraft user on the host. If those apps could read the key
 //   directly (root-only, so they can't) OR if we ever wrote the key
@@ -38,7 +38,7 @@ import (
 //
 // Customer-owned keys are a separate concern: the customer can put
 // them directly in app env or pull from the vault. This proxy is
-// exclusively for the included monthly AI budget that the platform
+// exclusively for the included monthly usage credit that the platform
 // pays for. In operator-owned BYOM/self-host key mode, this local
 // included-credit proxy is disabled unless a future relay is added.
 //
@@ -69,7 +69,7 @@ import (
 //
 //   6. After the response, the ledger is charged for the call's
 //      token usage. If the per-machine monthly budget is exceeded,
-//      subsequent calls return 429 until the next UTC month.
+//      subsequent calls return 429 until the next UTC month or credit refill.
 //
 // What we deliberately do NOT do:
 //
@@ -88,8 +88,8 @@ const (
 	aiLedgerPath       = "/var/lib/vibecraft/ai_ledger.json"
 
 	// Default monthly budget if /etc/vibecraft/ai_budget_cents is
-	// missing or unreadable. $50 — matches the Starter plan AI budget
-	// in lib/config.ts; the cloud-init writes the real plan value at
+	// missing or unreadable. $50 is a defensive fallback; the budget
+	// tracker writes the real account-level usage budget when it is
 	// provision time. Defensive default so a misconfigured machine
 	// doesn't accidentally grant unlimited AI.
 	defaultMonthlyBudgetCents = 5000
@@ -267,7 +267,8 @@ type budgetService struct {
 	// pooled, when set, returns the plan-aware pooled budget from the
 	// BudgetTracker: remainingCents (already net of reported spend across all
 	// the account's machines, incl. this proxy's reported spend), whether the
-	// plan is unmetered, and whether a budget has been fetched yet. It is the
+	// platform sent a legacy/custom no-local-enforcement sentinel, and whether
+	// a budget has been fetched yet. It is the
 	// authoritative ceiling — plan-sized and top-up-aware — and supersedes the
 	// static monthlyCap whenever a budget is available. Before the first fetch
 	// (have=false) the static cap applies as a startup safety net. This closes
@@ -399,16 +400,17 @@ func (bs *budgetService) currentSpentCents() int {
 }
 
 // roomCents returns the cents available for a new reservation, whether the
-// budget is unmetered, and a ceiling figure for the over-budget error. Caller
-// must hold bs.mu. Prefers the plan-aware pooled budget (authoritative); falls
-// back to the static per-machine cap only before the first budget fetch.
+// budget uses the legacy/custom no-local-enforcement sentinel, and a ceiling
+// figure for the over-budget error. Caller must hold bs.mu. Prefers the
+// plan-aware pooled budget (authoritative); falls back to the static
+// per-machine cap only before the first budget fetch.
 func (bs *budgetService) roomCents() (room int, unmetered bool, ceiling int) {
 	if bs.pooled != nil {
 		if remaining, um, have := bs.pooled(); have {
 			if um {
 				return 1 << 30, true, -1
 			}
-			return remaining - bs.reservedCents, false, bs.ledger.SpentCents + remaining
+			return remaining - bs.ledger.SpentCents - bs.reservedCents, false, remaining
 		}
 	}
 	return bs.monthlyCap - bs.ledger.SpentCents - bs.reservedCents, false, bs.monthlyCap
@@ -506,7 +508,7 @@ type errBudgetExhausted struct {
 }
 
 func (e errBudgetExhausted) Error() string {
-	return fmt.Sprintf("monthly AI budget exhausted: spent $%.2f of $%.2f in %s",
+	return fmt.Sprintf("monthly usage-credit budget exhausted: spent $%.2f of $%.2f in %s",
 		float64(e.SpentCents)/100, float64(e.BudgetCents)/100, e.Month)
 }
 
@@ -798,12 +800,12 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 		// 1. Auth — bearer / x-api-key against the machine-local token.
 		presented := requestPresentedToken(r)
 		if !s.aiCreditsToken.validate(presented) {
-			jsonError(w, "ai credits token required", http.StatusUnauthorized)
+			jsonError(w, "usage-credit proxy token required", http.StatusUnauthorized)
 			return
 		}
 
 		if !s.platformAIProxyEnabled() {
-			jsonError(w, "included AI credits proxy is disabled for operator-owned manager key mode", http.StatusForbidden)
+			jsonError(w, "VibeCraft-metered usage proxy is disabled for operator-owned manager key mode", http.StatusForbidden)
 			return
 		}
 
@@ -824,7 +826,7 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 					"spent_cents":   ex.SpentCents,
 					"budget_cents":  ex.BudgetCents,
 					"resets_at_utc": "first of next month",
-					"hint":          "the included AI budget for this machine is used up for the month; switch to a customer-owned key or upgrade the plan to continue",
+					"hint":          "the available VibeCraft usage credit for this machine is used up for the month; add credit, raise the cap, or switch this app to a customer-owned key",
 				})
 				return
 			}
@@ -983,10 +985,10 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 			settleCost = costCents(model, inTok, outTok)
 			// Defensive: a 200 with no parseable usage (e.g. an upstream
 			// shape we don't recognize) still consumed platform tokens.
-			// Charge a conservative floor rather than billing $0, which
+			// Charge the held reservation rather than billing $0, which
 			// would let unparseable streamed traffic bypass the cap.
 			if settleCost <= 0 {
-				settleCost = 1
+				settleCost = reserved
 			}
 			s.auditLog.Log(audit.Entry{
 				Action:   "ai_credits_call",

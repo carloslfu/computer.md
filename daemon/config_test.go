@@ -106,6 +106,28 @@ func TestLoadManagerSettings_PlatformModeMissingKeyUsesManagedCopy(t *testing.T)
 	}
 }
 
+func TestLoadManagerSettings_RelayModeFailsClosedAndIgnoresLocalKey(t *testing.T) {
+	key, mode, _, unavailable, err := loadManagerSettings(
+		fakeManagerFiles(map[string]string{
+			"/etc/vibecraft/openai.key":       "sk-should-not-be-used",
+			"/etc/vibecraft/manager_key_mode": "relay",
+		}),
+		fakeManagerEnv(nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != "relay" {
+		t.Fatalf("mode = %q, want relay", mode)
+	}
+	if key != "" {
+		t.Fatalf("relay mode must ignore local OpenAI keys, got key=%q", key)
+	}
+	if !strings.Contains(unavailable, "relay transport is not available") {
+		t.Fatalf("unavailable = %q, want relay fail-closed copy", unavailable)
+	}
+}
+
 func TestLoadManagerRuntimeSettings_DefaultsToMediumReasoningAnd64KOutput(t *testing.T) {
 	effort, maxOutput, deepEffort, deepMaxOutput, err := loadManagerRuntimeSettings(
 		fakeManagerFiles(nil),

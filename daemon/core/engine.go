@@ -189,7 +189,7 @@ type Engine struct {
 	// with credential cards.
 	pendingApprovalMsgs map[string]pendingApprovalMsg
 
-	// budgetGate, when set, reports whether the AI budget is exhausted
+	// budgetGate, when set, reports whether the usage budget is exhausted
 	// (paused). loop() consults it before claiming a NEW task so pause-at-zero
 	// is enforced at the consumer, not only at submission — even if a task
 	// reached the queue by some other path. The box and any in-flight task
@@ -260,7 +260,7 @@ func (e *Engine) SetSummarizer(s *Summarizer) {
 	e.summarizer = s
 }
 
-// SetBudgetGate wires an optional predicate reporting whether the AI budget is
+// SetBudgetGate wires an optional predicate reporting whether the usage budget is
 // exhausted. When it returns true, loop() stops claiming NEW tasks (the box and
 // any in-flight task keep running, and it resumes automatically when credits
 // return). Nil disables the check (tests run without it).
@@ -894,7 +894,7 @@ func (e *Engine) loop(ctx context.Context) {
 			continue
 		}
 
-		// AI budget pause-at-zero (defense in depth). When the budget is
+		// Usage-budget pause-at-zero (defense in depth). When the budget is
 		// exhausted, don't claim a NEW task — let any in-flight task finish,
 		// keep the box and cron running, and resume automatically once credits
 		// return. The submission gates (/task, /daemon/task) are the primary
@@ -1445,6 +1445,9 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 
 	if shouldAnswerImageAttachmentDirectly(task.Instruction, convMsgs) {
 		if directManager, ok := e.manager.(NoToolsManagerAPI); ok {
+			if e.budgetGate != nil && e.budgetGate() {
+				return "", fmt.Errorf("usage budget exhausted before manager call")
+			}
 			callCtx, callCancel := context.WithTimeout(ctx, apiCallTimeout)
 			resp, err := directManager.SendNoTools(callCtx, systemPrompt+"\n"+directImageAttachmentPrompt, apiMessages)
 			callCancel()
@@ -1469,6 +1472,9 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		default:
+		}
+		if e.budgetGate != nil && e.budgetGate() {
+			return "", fmt.Errorf("usage budget exhausted before manager call")
 		}
 
 		e.broker.Emit("task:thinking", map[string]interface{}{

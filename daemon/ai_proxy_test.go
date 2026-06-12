@@ -18,7 +18,7 @@ import (
 	"github.com/carloslfu/computer.md/daemon/persistence"
 )
 
-// ai_proxy_test.go pins the load-bearing behaviors of the AI credits
+// ai_proxy_test.go pins the load-bearing behaviors of the usage-credit
 // proxy. The whole point of the proxy is that NONE of these can
 // silently regress without burning the platform's budget or leaking
 // the platform's key.

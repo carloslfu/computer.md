@@ -10,7 +10,7 @@ import (
 )
 
 // TestRateLimiterExemptsLocalControlPlane is the regression for daemon-services-1:
-// the AI-credits proxy, Caddy's on-demand-TLS ask, and the manager all reach the
+// the usage-credit proxy, Caddy's on-demand-TLS ask, and the manager all reach the
 // daemon over loopback with no X-Forwarded-For and shared one 127.0.0.1 bucket,
 // so a busy hosted tool got 429'd and starved TLS issuance. Loopback-no-XFF must
 // be exempt; external (X-Forwarded-For) traffic must still be limited.

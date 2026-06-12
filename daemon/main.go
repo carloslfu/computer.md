@@ -51,6 +51,24 @@ var embeddedPrompt []byte
 
 var version = "dev"
 
+func pooledBudgetSourceForProxy(budgetTracker *usage.BudgetTracker) func() (int, bool, bool) {
+	return func() (int, bool, bool) {
+		snap := budgetTracker.Snapshot()
+		if snap == nil {
+			return 0, false, false // no fetch yet -> fall back to the static cap
+		}
+		budgetUSD := snap.EffectiveBudgetUSD()
+		if budgetUSD < 0 {
+			return 0, true, true // legacy/custom no-local-enforcement sentinel
+		}
+		remainingCents := int(budgetUSD*100+0.5) - budgetTracker.LocalUsageRecordSpendCents()
+		if remainingCents < 0 {
+			remainingCents = 0
+		}
+		return remainingCents, false, true
+	}
+}
+
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Println(version)
@@ -157,12 +175,12 @@ func main() {
 	compactor := core.NewCompactor(managerClient, "", broker)
 	engine.SetCompactor(compactor)
 
-	// Wire the AI usage accumulator + budget enforcement. Every manager
+	// Wire the AI usage accumulator + usage-credit enforcement. Every manager
 	// call (engine, compactor, summarizer) records through the
 	// BudgetTracker: it forwards the token counts to the per-machine
 	// usage Store AND checks the budget thresholds, firing the 80% /
 	// 100% notifications. The BudgetTracker also fetches the customer's
-	// monthly AI credit budget from the platform (hourly) so the
+	// VibeCraft-metered usage budget from the platform (hourly) so the
 	// task-submission gate can hold new tasks once the budget is spent.
 	usageStore := usage.NewStore(db)
 	budgetTracker := usage.NewBudgetTracker(
@@ -176,7 +194,7 @@ func main() {
 	})
 	engine.SetUsageRecorder(budgetTracker)
 	// Enforce pause-at-zero at the engine consumer too (defense in depth):
-	// stop claiming new tasks when the AI budget is exhausted.
+	// stop claiming new tasks when the VibeCraft-metered usage budget is exhausted.
 	engine.SetBudgetGate(func() bool {
 		st, err := budgetTracker.State()
 		return err == nil && st.Paused
@@ -262,7 +280,7 @@ func main() {
 		cfg.JWTPublicKey,
 	)
 
-	// AI credits proxy: per-machine bearer token + monthly budget
+	// Usage-credit proxy: per-machine bearer token + budget
 	// ledger. Initialized BEFORE the Server struct so its handlers
 	// can reference them at registration time. Failure to load the
 	// token (e.g. /etc/vibecraft not writable on a dev box) is
@@ -275,7 +293,7 @@ func main() {
 	aiTok := &AICreditsToken{value: aiTokVal}
 	bsvc := newBudgetService()
 
-	// Link the AI-credits proxy to the plan-aware pooled budget + spend
+	// Link the usage-credit proxy to the plan-aware pooled budget + spend
 	// reporting (daemon-manager-ai-1 / -2):
 	//   • The proxy gates on the BudgetTracker's pooled remaining budget — the
 	//     authoritative, plan-sized, top-up-aware ceiling — instead of the
@@ -285,16 +303,7 @@ func main() {
 	//   • The tracker reports the proxy ledger's spend to the platform, so
 	//     hosted-tool AI bills back at cost like manager turns instead of being
 	//     silently absorbed.
-	bsvc.SetPooledBudget(func() (int, bool, bool) {
-		snap := budgetTracker.Snapshot()
-		if snap == nil {
-			return 0, false, false // no fetch yet → fall back to the static cap
-		}
-		if snap.BudgetUSD < 0 {
-			return 0, true, true // -1 = unmetered (Enterprise)
-		}
-		return int(snap.BudgetUSD*100 + 0.5), false, true
-	})
+	bsvc.SetPooledBudget(pooledBudgetSourceForProxy(budgetTracker))
 	budgetTracker.SetProxySpend(bsvc.currentSpentCents)
 
 	// Build HTTP server with all routes.
@@ -428,7 +437,7 @@ func main() {
 	// Cheap, idempotent, in-process — no cron / external scheduler.
 	srv.startSessionSweeper(ctx)
 
-	// Budget refresh loop: fetch the customer's AI credit budget from
+	// Budget refresh loop: fetch the customer's usage-credit budget from
 	// the platform on startup, then hourly. Until the first fetch
 	// succeeds, enforcement stays off (fail-open) — a platform outage
 	// must never wedge the machine.
@@ -522,8 +531,8 @@ type Server struct {
 	budgetTracker *usage.BudgetTracker // nil in tests; production wires usage.NewBudgetTracker(...)
 	startTime     time.Time
 
-	// AI credits proxy. Per-machine bearer token + monthly budget
-	// ledger. Initialized once at daemon startup (see initAIProxy).
+	// Usage-credit proxy. Per-machine bearer token + monthly budget
+	// ledger. Initialized once at daemon startup.
 	// Apps deployed via install-app-service receive the bearer in
 	// their unit env and call /api/ai/credits/{anthropic,openai}/...
 	// — the daemon strips their bearer, injects the platform key,
@@ -696,7 +705,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// systemd bus to the sandbox itself.
 	dual("/apps/", s.withLocalhostAuth(s.handleAppServiceAction))
 
-	// AI credits proxy (see daemon/ai_proxy.go). Per-machine bearer
+	// Usage-credit proxy (see daemon/ai_proxy.go). Per-machine bearer
 	// token in `x-api-key` / `Authorization: Bearer ...` validates;
 	// daemon strips the app's auth header, injects the platform's
 	// real provider key, forwards to api.anthropic.com /
@@ -1804,8 +1813,8 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── AI budget gate ──────────────────────────────────────────────
-	// If the customer has spent their full monthly AI credit budget,
+	// ── Usage-credit gate ───────────────────────────────────────────
+	// If the customer has spent their VibeCraft-metered usage budget,
 	// hold new tasks. This is the enforcement half of "no surprise
 	// bills" (PRODUCT.md). Deliberately *smooth*:
 	//   - Submission-time only — a task already running always
@@ -1816,12 +1825,12 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	//   - The response carries budget_blocked:true; the SPA renders the
 	//     manager reply inline and keeps the user's message visible.
 	//   - Fail-open: State() only reports Paused when there's a real,
-	//     positive budget AND spend has reached it. A platform outage
-	//     (no budget known) or Enterprise (-1) never pauses.
+	//     real budget AND spend has reached it. A platform outage
+	//     (no budget known) or legacy/custom negative terms never pause.
 	if s.budgetTracker != nil {
 		if state, err := s.budgetTracker.State(); err == nil && state.Paused {
 			msg := fmt.Sprintf(
-				"You've used your full $%.0f monthly AI budget. New tasks are paused until your billing cycle renews on %s — your usage resets then. Anything already running will finish normally.",
+				"You've used your available $%.0f VibeCraft usage credit. New tasks are paused until your billing cycle renews on %s, or until you top up. Anything already running will finish normally.",
 				state.BudgetUSD, state.ResetsOn,
 			)
 			// Persist the exchange so it survives reload and shows in
@@ -3078,14 +3087,14 @@ func (rl *rateLimiter) middleware(next http.Handler) http.Handler {
 		// X-Forwarded-For when proxying external traffic (the same property
 		// withLoopbackOnly relies on), so a request whose socket is loopback
 		// AND carries no X-Forwarded-For can only come from a process on this
-		// machine: the AI-credits proxy (high call volume from hosted tools
+		// machine: the usage-credit proxy (high call volume from hosted tools
 		// the operator built), Caddy's on-demand-TLS `ask` to /routes/verify,
 		// or the manager's own loopback calls. These all share the single
 		// 127.0.0.1 bucket, so one busy hosted tool issuing >60 AI calls/min
 		// got 429'd AND starved Caddy's TLS-issuance ask (new hosted-tool
 		// subdomains then failed to get a cert). They are already gated by
 		// withLoopbackOnly / withLocalhostAuth and bounded by the per-machine
-		// AI budget cap, so the coarse IP limiter only does harm here. External
+		// usage budget cap, so the coarse IP limiter only does harm here. External
 		// traffic always carries X-Forwarded-For via Caddy and stays limited.
 		if isLocalControlPlane(r) {
 			next.ServeHTTP(w, r)
