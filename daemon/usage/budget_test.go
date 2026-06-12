@@ -23,6 +23,7 @@ type fakeBudget struct {
 	server   *httptest.Server
 	mu       sync.Mutex
 	budget   float64
+	mode     string
 	start    string
 	end      string
 	status   int    // 0 or 200 → serve the budget; anything else → that status code
@@ -55,6 +56,7 @@ func newFakeBudget(t *testing.T) *fakeBudget {
 			"period_start":          fb.start,
 			"period_end":            fb.end,
 			"period_source":         "subscription",
+			"manager_key_mode":      fb.mode,
 		})
 	}))
 	t.Cleanup(fb.server.Close)
@@ -70,6 +72,12 @@ func (fb *fakeBudget) set(budget float64) {
 func (fb *fakeBudget) setStatus(code int) {
 	fb.mu.Lock()
 	fb.status = code
+	fb.mu.Unlock()
+}
+
+func (fb *fakeBudget) setMode(mode string) {
+	fb.mu.Lock()
+	fb.mode = mode
 	fb.mu.Unlock()
 }
 
@@ -329,9 +337,11 @@ func TestBudget_NotPausedUnderBudget(t *testing.T) {
 	}
 }
 
-// TestBudget_CustomNegativeBudgetNeverPauses — a fetched budget of -1 is a
-// legacy/custom no-local-enforcement sentinel and never pauses.
-func TestBudget_CustomNegativeBudgetNeverPauses(t *testing.T) {
+// TestBudget_NegativeFetchedBudgetPausesAsDrained — the current platform
+// contract never sends negative funded budgets. If a stale/custom platform does,
+// do not turn VibeCraft-metered usage into free unmetered spend; treat it as a
+// drained known budget.
+func TestBudget_NegativeFetchedBudgetPausesAsDrained(t *testing.T) {
 	store := NewStore(openTestDB(t))
 	fb := newFakeBudget(t)
 	fb.set(-1)
@@ -340,11 +350,11 @@ func TestBudget_CustomNegativeBudgetNeverPauses(t *testing.T) {
 
 	seedSpend(t, store, "c1", 100_000.0)
 	st, _ := bt.State()
-	if st.Enforced {
-		t.Errorf("custom negative budget must not be enforced")
+	if !st.Enforced {
+		t.Errorf("negative fetched budget is known and must enforce")
 	}
-	if st.Paused {
-		t.Errorf("custom negative budget must never pause")
+	if !st.Paused {
+		t.Errorf("negative fetched budget must pause as drained")
 	}
 }
 
@@ -457,9 +467,7 @@ func TestBudget_Warn100FiresHighPriority(t *testing.T) {
 	}
 }
 
-// TestBudget_NoWarningWhenCustomNegative — legacy/custom negative budgets do
-// not warn locally.
-func TestBudget_NoWarningWhenCustomNegative(t *testing.T) {
+func TestBudget_NoLocalWarningWhenNegativeFetchedBudgetIsUsed(t *testing.T) {
 	store := NewStore(openTestDB(t))
 	fb := newFakeBudget(t)
 	fb.set(-1)
@@ -470,7 +478,62 @@ func TestBudget_NoWarningWhenCustomNegative(t *testing.T) {
 
 	bt.Record("gpt-5.4-mini", "c1", manager.Usage{OutputTokens: outTokensFor(9999.0)})
 	if len(*notes) != 0 {
-		t.Errorf("custom negative budget must never warn, got %+v", *notes)
+		t.Fatalf("negative fetched budget should pause without noisy $0 warning, got %+v", *notes)
+	}
+}
+
+func TestBudget_ReserveRequiresHeadroomAndReleases(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	fb := newFakeBudget(t)
+	fb.set(2)
+	bt := trackerFor(store, fb)
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	seedSpend(t, store, "c1", 0.50)
+
+	release, err := bt.Reserve("gpt-5.4-mini", "c1")
+	if err != nil {
+		t.Fatalf("reserve should allow with more than $1 headroom: %v", err)
+	}
+	st, _ := bt.State()
+	if st.SpentUSD < 0.49 || st.SpentUSD > 0.51 {
+		t.Fatalf("reserved headroom should not be reported as actual spend, got %.2f", st.SpentUSD)
+	}
+	if got := bt.LocalReservedSpendCents(); got != managerCallReserveCents {
+		t.Fatalf("reserved headroom should be available to proxy budgeting, got %d", got)
+	}
+	release()
+	st, _ = bt.State()
+	if st.SpentUSD < 0.49 || st.SpentUSD > 0.51 {
+		t.Fatalf("release should remove reserved headroom, got %.2f", st.SpentUSD)
+	}
+
+	fb.set(1)
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if _, err := bt.Reserve("gpt-5.4-mini", "c1"); err == nil {
+		t.Fatal("reserve must block when less than $1 headroom remains")
+	}
+}
+
+func TestBudget_RefreshManagerKeyModeFromPlatformIsAuthoritative(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	fb := newFakeBudget(t)
+	fb.setMode("operator")
+	bt := trackerFor(store, fb)
+	bt.SetManagerKeyMode("platform")
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	seedSpend(t, store, "c1", 20)
+	st, err := bt.State()
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if st.ManagerKeyMode != "operator" || st.Enforced || st.Paused {
+		t.Fatalf("platform manager_key_mode should switch stale local mode to operator, got %+v", st)
 	}
 }
 

@@ -64,10 +64,12 @@ func TestBudgetService_PooledCapSupersedesStatic(t *testing.T) {
 		t.Fatal("pooled budget exhausted; must block")
 	}
 
-	// Legacy/custom negative budget → no local pooled-budget enforcement.
-	unmetered = true
-	if err := bs.allow(); err != nil {
-		t.Fatalf("custom negative budget must always allow: %v", err)
+	// Negative/invalid fetched budgets are treated as no remaining room by the
+	// BudgetTracker source, not as unmetered usage.
+	unmetered = false
+	remaining = 0
+	if err := bs.allow(); err == nil {
+		t.Fatal("negative fetched budget source should not become unmetered")
 	}
 
 	// No pooled snapshot (have=false) → fall back to the static cap.

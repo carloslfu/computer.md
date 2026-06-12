@@ -230,8 +230,13 @@ func (s *Summarizer) SummarizeTask(ctx context.Context, task *Task) error {
 	systemPrompt := summarizerSystemPrompt
 	userPrompt := s.buildUserPrompt(task, elapsed, auditEntries, windowMsgs)
 
+	release, reserveErr := reserveUsageCall(s.usage, summarizerModel, task.ConversationID)
+	if reserveErr != nil {
+		return nil
+	}
 	resp, err := s.client.SendText(ctx, summarizerModel, systemPrompt, userPrompt, summarizerMaxTokens)
 	if err != nil {
+		release()
 		return fmt.Errorf("summarizer API call: %w", err)
 	}
 
@@ -243,6 +248,7 @@ func (s *Summarizer) SummarizeTask(ctx context.Context, task *Task) error {
 			log.Printf("summarizer: usage.Record: %v", uerr)
 		}
 	}
+	release()
 
 	raw := strings.TrimSpace(resp.TextContent)
 	if raw == "" {

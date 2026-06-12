@@ -145,6 +145,11 @@ var openaiSpec = providerSpec{
 }
 
 func (s *Server) platformAIProxyEnabled() bool {
+	if s != nil && s.budgetTracker != nil {
+		if st, err := s.budgetTracker.State(); err == nil && st.ManagerKeyMode != "" {
+			return st.ManagerKeyMode == "platform"
+		}
+	}
 	if s == nil || s.cfg == nil || s.cfg.ManagerKeyMode == "" {
 		return true
 	}
@@ -266,9 +271,9 @@ type budgetService struct {
 
 	// pooled, when set, returns the plan-aware pooled budget from the
 	// BudgetTracker: remainingCents (already net of reported spend across all
-	// the account's machines, incl. this proxy's reported spend), whether the
-	// platform sent a legacy/custom no-local-enforcement sentinel, and whether
-	// a budget has been fetched yet. It is the
+	// the account's machines, incl. this proxy's reported spend), whether
+	// enforcement is explicitly disabled by the source, and whether a budget
+	// has been fetched yet. It is the
 	// authoritative ceiling — plan-sized and top-up-aware — and supersedes the
 	// static monthlyCap whenever a budget is available. Before the first fetch
 	// (have=false) the static cap applies as a startup safety net. This closes
@@ -400,8 +405,8 @@ func (bs *budgetService) currentSpentCents() int {
 }
 
 // roomCents returns the cents available for a new reservation, whether the
-// budget uses the legacy/custom no-local-enforcement sentinel, and a ceiling
-// figure for the over-budget error. Caller must hold bs.mu. Prefers the
+// budget source explicitly disables enforcement, and a ceiling figure for the
+// over-budget error. Caller must hold bs.mu. Prefers the
 // plan-aware pooled budget (authoritative); falls back to the static
 // per-machine cap only before the first budget fetch.
 func (bs *budgetService) roomCents() (room int, unmetered bool, ceiling int) {

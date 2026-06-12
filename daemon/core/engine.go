@@ -277,12 +277,23 @@ type UsageRecorder interface {
 	Record(model, conversationID string, usage managerclient.Usage) error
 }
 
+type UsageReserver interface {
+	Reserve(model, conversationID string) (func(), error)
+}
+
 // SetUsageRecorder wires the per-machine usage accumulator. Called
 // once at startup wiring. After this is set, every manager call the
 // engine makes is attributed by (model, conversation_id, day) to a
 // persistent total the dashboard reads back as a dollar amount.
 func (e *Engine) SetUsageRecorder(u UsageRecorder) {
 	e.usage = u
+}
+
+func reserveUsageCall(u UsageRecorder, model, conversationID string) (func(), error) {
+	if reserver, ok := u.(UsageReserver); ok {
+		return reserver.Reserve(model, conversationID)
+	}
+	return func() {}, nil
 }
 
 // SetCompactor wires the mid-task history compactor. Called during
@@ -1448,6 +1459,10 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 			if e.budgetGate != nil && e.budgetGate() {
 				return "", fmt.Errorf("usage budget exhausted before manager call")
 			}
+			release, reserveErr := reserveUsageCall(e.usage, modelID, task.ConversationID)
+			if reserveErr != nil {
+				return "", reserveErr
+			}
 			callCtx, callCancel := context.WithTimeout(ctx, apiCallTimeout)
 			resp, err := directManager.SendNoTools(callCtx, systemPrompt+"\n"+directImageAttachmentPrompt, apiMessages)
 			callCancel()
@@ -1457,10 +1472,12 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 						log.Printf("usage: record failed for direct attachment task %s: %v", task.ID, recErr)
 					}
 				}
+				release()
 				if text := strings.TrimSpace(resp.TextContent); text != "" {
 					return text, nil
 				}
 			} else {
+				release()
 				log.Printf("manager: direct image attachment path failed for task %s, falling back to tool loop: %v", task.ID, err)
 			}
 		}
@@ -1476,6 +1493,10 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 		if e.budgetGate != nil && e.budgetGate() {
 			return "", fmt.Errorf("usage budget exhausted before manager call")
 		}
+		release, reserveErr := reserveUsageCall(e.usage, modelID, task.ConversationID)
+		if reserveErr != nil {
+			return "", reserveErr
+		}
 
 		e.broker.Emit("task:thinking", map[string]interface{}{
 			"task_id":         task.ID,
@@ -1488,6 +1509,7 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 		resp, err := e.manager.SendComputerUse(callCtx, systemPrompt, apiMessages)
 		callCancel()
 		if err != nil {
+			release()
 			return "", fmt.Errorf("manager API error: %w", err)
 		}
 
@@ -1499,6 +1521,7 @@ func (e *Engine) agentLoop(ctx context.Context, task *Task) (string, error) {
 				log.Printf("engine: usage.Record(SendComputerUse): %v", err)
 			}
 		}
+		release()
 
 		// Check if response is a final text answer (no tool use).
 		// Keep this short-circuit: processTask will store the final text via

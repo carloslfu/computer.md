@@ -59,9 +59,11 @@ func pooledBudgetSourceForProxy(budgetTracker *usage.BudgetTracker) func() (int,
 		}
 		budgetUSD := snap.EffectiveBudgetUSD()
 		if budgetUSD < 0 {
-			return 0, true, true // legacy/custom no-local-enforcement sentinel
+			return 0, false, true
 		}
-		remainingCents := int(budgetUSD*100+0.5) - budgetTracker.LocalUsageRecordSpendCents()
+		remainingCents := int(budgetUSD*100+0.5) -
+			budgetTracker.LocalUsageRecordSpendCents() -
+			budgetTracker.LocalReservedSpendCents()
 		if remainingCents < 0 {
 			remainingCents = 0
 		}
@@ -1579,6 +1581,17 @@ func (s *Server) handleAIUsage(w http.ResponseWriter, r *http.Request) {
 	if s.budgetTracker != nil {
 		if state, berr := s.budgetTracker.State(); berr == nil {
 			summary.BudgetState = &state
+			if state.ManagerKeyMode == "platform" &&
+				state.PeriodStart == start &&
+				state.ResetsOn == end &&
+				state.SpentUSD > summary.TotalCostUSD {
+				proxyDelta := state.SpentUSD - summary.TotalCostUSD
+				summary.TotalCostUSD = state.SpentUSD
+				summary.ByModel = append(summary.ByModel, usage.ModelBreakdown{
+					Model:   "__hosted_tool_ai",
+					CostUSD: proxyDelta,
+				})
+			}
 		}
 	}
 
@@ -1817,20 +1830,20 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	// If the customer has spent their VibeCraft-metered usage budget,
 	// hold new tasks. This is the enforcement half of "no surprise
 	// bills" (PRODUCT.md). Deliberately *smooth*:
-	//   - Submission-time only — a task already running always
-	//     finishes; we never kill work in flight.
+	//   - No surprise spend — new manager turns are held once credit is
+	//     exhausted.
 	//   - The user's message + a clear manager reply are persisted to
 	//     the conversation, so the exchange survives a page reload and
 	//     reads like a normal turn, not a silent drop.
 	//   - The response carries budget_blocked:true; the SPA renders the
 	//     manager reply inline and keeps the user's message visible.
-	//   - Fail-open: State() only reports Paused when there's a real,
-	//     real budget AND spend has reached it. A platform outage
-	//     (no budget known) or legacy/custom negative terms never pause.
+	//   - Fail-open: State() only reports Paused after a platform budget
+	//     has been fetched. A platform outage before the first fetch does
+	//     not wedge the machine.
 	if s.budgetTracker != nil {
 		if state, err := s.budgetTracker.State(); err == nil && state.Paused {
 			msg := fmt.Sprintf(
-				"You've used your available $%.0f VibeCraft usage credit. New tasks are paused until your billing cycle renews on %s, or until you top up. Anything already running will finish normally.",
+				"You've used your available $%.0f VibeCraft usage credit. New manager turns are paused until your billing cycle renews on %s, or until you top up.",
 				state.BudgetUSD, state.ResetsOn,
 			)
 			// Persist the exchange so it survives reload and shows in

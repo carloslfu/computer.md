@@ -85,6 +85,35 @@ func TestUsageEndpoint_HappyPath(t *testing.T) {
 	}
 }
 
+func TestUsageEndpoint_IncludesProxySpendFromBudgetState(t *testing.T) {
+	srv := newBudgetGateTestServer(t, 20, true)
+	srv.budgetTracker.SetProxySpend(func() int { return 700 })
+	start, end := usage.CurrentMonthBounds()
+
+	req := httptest.NewRequest("GET", "/api/usage?start="+start+"&end="+end, nil)
+	w := httptest.NewRecorder()
+	srv.handleAIUsage(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var sum usage.Summary
+	if err := json.Unmarshal(w.Body.Bytes(), &sum); err != nil {
+		t.Fatalf("response is not valid Summary JSON: %v", err)
+	}
+	approxEqualHTTP(t, sum.TotalCostUSD, 7.0, "total including proxy")
+	foundProxy := false
+	for _, row := range sum.ByModel {
+		if row.Model == "__hosted_tool_ai" {
+			foundProxy = true
+			approxEqualHTTP(t, row.CostUSD, 7.0, "proxy model row")
+		}
+	}
+	if !foundProxy {
+		t.Fatalf("expected hosted-tool proxy spend row, got %+v", sum.ByModel)
+	}
+}
+
 // TestUsageEndpoint_DefaultPeriodIsCurrentMonth verifies that GET
 // /api/usage with no query params returns a Summary scoped to the
 // current calendar month (UTC). The SPA relies on this default when

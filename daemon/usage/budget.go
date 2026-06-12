@@ -24,18 +24,14 @@ import (
 //
 // Design commitments that make enforcement *smooth*:
 //
-//   - Fail-open. If we can't reach the platform to learn the budget,
-//     enforcement stays OFF. A platform outage must never wedge a
-//     customer's machine. Enforcement only engages once we have a
-//     real, positive budget number in hand.
+//   - Fail-open only before the first platform budget fetch. If we can't reach
+//     the platform to learn the budget, enforcement stays OFF. Once a budget is
+//     fetched, zero or malformed negative funded budget values are treated as
+//     drained.
 //
-//   - Submission-time only. The gate runs when a new task is
-//     submitted — never mid-task. A task already running always
-//     finishes, even if its final turns tip spend past the budget.
-//     Killing work in progress is the opposite of smooth.
-//
-//   - Legacy/custom negative budgets are not paused by the daemon. Current
-//     platform plans should send funded remaining usage instead.
+//   - New manager turns are reserved before the upstream call. That keeps
+//     already-running work from silently consuming past the funded pool after
+//     the next turn boundary.
 //
 //   - The customer is warned at 80% (see CheckWarningThreshold), so
 //     hitting 100% is never a surprise.
@@ -89,9 +85,8 @@ func (b *Budget) EffectiveBudgetUSD() float64 {
 // task gate, the /api/usage endpoint) reads. It's a snapshot — recompute
 // it per decision rather than caching, since spend changes every turn.
 type BudgetState struct {
-	// BudgetUSD is the effective budget being enforced — the override
-	// when one is set (testing / manual control), else the platform
-	// value. -1 is a legacy/custom no-local-enforcement sentinel.
+	// BudgetUSD is the effective budget being enforced from the platform.
+	// Negative fetched values are normalized to 0 (drained) in State().
 	BudgetUSD float64 `json:"budget_usd"`
 	// UsageBudgetUSD is the canonical alias surfaced to the SPA. Keep
 	// BudgetUSD for existing clients.
@@ -101,9 +96,8 @@ type BudgetState struct {
 	// CapReachedReason explains whether the hard cap, not just funds, is the
 	// reason new VibeCraft-metered usage is paused.
 	CapReachedReason *string `json:"cap_reached_reason,omitempty"`
-	// Enforced is true when there's a positive budget to enforce
-	// against. False for legacy/custom negative budgets and for the fail-open case
-	// (budget never successfully fetched).
+	// Enforced is true once a platform budget has been fetched. False for the
+	// fail-open case (budget never successfully fetched).
 	Enforced bool `json:"enforced"`
 	// Paused is true when Enforced and period spend >= budget. When
 	// true, new task submissions are rejected.
@@ -112,6 +106,7 @@ type BudgetState struct {
 	SpentUSD float64 `json:"spent_usd"`
 	// ResetsOn is the period end (YYYY-MM-DD) — when a paused machine
 	// frees up again. Empty when the period is unknown.
+	PeriodStart    string `json:"period_start,omitempty"`
 	ResetsOn       string `json:"resets_on"`
 	ManagerKeyMode string `json:"manager_key_mode"`
 }
@@ -126,6 +121,12 @@ type NotifyFunc func(kind, title, body, priority string)
 // the pre-exhaustion warning — early enough that hitting 100% is never
 // a surprise, late enough that it isn't noise.
 const WarningThreshold = 0.80
+
+// managerCallReserveCents is the minimum headroom required before the daemon
+// starts one more VibeCraft-metered manager call. It prevents the machine from
+// admitting a fresh expensive turn when only pennies remain, while still
+// letting small plans use most of their funded credit.
+const managerCallReserveCents = 100
 
 // BudgetTracker fetches + caches the budget, computes enforcement
 // verdicts, records usage (forwarding to the Store), and fires the
@@ -159,6 +160,11 @@ type BudgetTracker struct {
 	// every dollar a deployed hosted tool burned through the credits proxy —
 	// VibeCraft pays it and never bills it back. nil = no proxy on this build.
 	proxySpentFunc func() int
+
+	// reservedCents is temporary headroom held for in-flight manager calls.
+	// It contributes to pause decisions and proxy headroom before the usage row
+	// is persisted, but is not reported as actual customer-visible spend.
+	reservedCents int
 }
 
 // NewBudgetTracker wires a tracker. machineID + healthToken + platformBase
@@ -220,6 +226,15 @@ func (bt *BudgetTracker) LocalUsageRecordSpendCents() int {
 	return spentCents
 }
 
+func (bt *BudgetTracker) LocalReservedSpendCents() int {
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
+	if bt.managerMode != "platform" || bt.reservedCents < 0 {
+		return 0
+	}
+	return bt.reservedCents
+}
+
 // SetManagerKeyMode controls whether VibeCraft credits are enforced for
 // manager calls. platform means VibeCraft paid upstream and credits apply;
 // operator usage is recorded locally but not deducted locally as VibeCraft
@@ -227,13 +242,17 @@ func (bt *BudgetTracker) LocalUsageRecordSpendCents() int {
 // current builds config fails closed before manager calls can run.
 func (bt *BudgetTracker) SetManagerKeyMode(mode string) {
 	bt.mu.Lock()
+	bt.setManagerKeyModeLocked(mode)
+	bt.mu.Unlock()
+}
+
+func (bt *BudgetTracker) setManagerKeyModeLocked(mode string) {
 	switch mode {
 	case "operator", "relay":
 		bt.managerMode = mode
 	default:
 		bt.managerMode = "platform"
 	}
-	bt.mu.Unlock()
 }
 
 // Record forwards a manager call's usage to the Store, then checks the
@@ -385,7 +404,9 @@ func (bt *BudgetTracker) Refresh(ctx context.Context) error {
 	}
 
 	bt.mu.Lock()
-	if b.ManagerKeyMode == "" {
+	if b.ManagerKeyMode != "" {
+		bt.setManagerKeyModeLocked(b.ManagerKeyMode)
+	} else {
 		b.ManagerKeyMode = bt.managerMode
 	}
 	bt.current = &b
@@ -492,6 +513,76 @@ func (bt *BudgetTracker) Snapshot() *Budget {
 	return &clone
 }
 
+// Reserve holds headroom for one manager call. A nil error means the caller may
+// proceed and must invoke the returned release function after usage has been
+// recorded (or immediately on upstream failure). Before the first platform
+// budget fetch, and for operator-owned keys, it returns a no-op release.
+func (bt *BudgetTracker) Reserve(model, conversationID string) (func(), error) {
+	bt.mu.RLock()
+	current := bt.current
+	managerMode := bt.managerMode
+	reserved := bt.reservedCents
+	proxySpent := bt.proxySpentFunc
+	bt.mu.RUnlock()
+
+	if managerMode != "platform" || current == nil {
+		return func() {}, nil
+	}
+
+	periodStart, periodEnd := current.PeriodStart, current.PeriodEnd
+	if periodStart == "" || periodEnd == "" {
+		periodStart, periodEnd = CurrentMonthBounds()
+	}
+	budgetCents := int(current.EffectiveBudgetUSD()*100 + 0.5)
+	if budgetCents < 0 {
+		budgetCents = 0
+	}
+
+	summary, err := bt.store.Aggregate(periodStart, periodEnd, 0)
+	if err != nil {
+		// Match State's fail-open posture for transient local read errors.
+		return func() {}, nil
+	}
+	spentCents := int(summary.TotalCostUSD*100 + 0.5)
+	if spentCents < 0 {
+		spentCents = 0
+	}
+	if proxySpent != nil {
+		if pc := proxySpent(); pc > 0 {
+			spentCents += pc
+		}
+	}
+	if budgetCents-spentCents-reserved < managerCallReserveCents {
+		return nil, fmt.Errorf("usage budget exhausted before manager call")
+	}
+
+	bt.mu.Lock()
+	if current != bt.current || managerMode != bt.managerMode {
+		bt.mu.Unlock()
+		return bt.Reserve(model, conversationID)
+	}
+	if budgetCents-spentCents-bt.reservedCents < managerCallReserveCents {
+		bt.mu.Unlock()
+		return nil, fmt.Errorf("usage budget exhausted before manager call")
+	}
+	bt.reservedCents += managerCallReserveCents
+	released := false
+	bt.mu.Unlock()
+
+	return func() {
+		bt.mu.Lock()
+		defer bt.mu.Unlock()
+		if released {
+			return
+		}
+		released = true
+		bt.reservedCents -= managerCallReserveCents
+		if bt.reservedCents < 0 {
+			bt.reservedCents = 0
+		}
+	}, nil
+}
+
 // State computes the current enforcement verdict. Recompute per
 // decision — spend moves every turn.
 func (bt *BudgetTracker) State() (BudgetState, error) {
@@ -499,11 +590,13 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 	bt.mu.RLock()
 	managerMode := bt.managerMode
 	proxySpent := bt.proxySpentFunc
+	reservedCents := bt.reservedCents
 	bt.mu.RUnlock()
 
 	st := BudgetState{
 		BudgetUSD:      budget,
 		UsageBudgetUSD: budget,
+		PeriodStart:    periodStart,
 		ResetsOn:       periodEnd,
 		ManagerKeyMode: managerMode,
 	}
@@ -525,9 +618,10 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 	if !haveBudget {
 		return st, nil
 	}
-	// Legacy/custom negative budget: no local enforcement.
 	if budget < 0 {
-		return st, nil
+		budget = 0
+		st.BudgetUSD = 0
+		st.UsageBudgetUSD = 0
 	}
 
 	summary, err := bt.store.Aggregate(periodStart, periodEnd, 0)
@@ -544,11 +638,14 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 		}
 	}
 	st.Enforced = true
-	// budget >= 0 here (the legacy/custom budget < 0 case returned
-	// above). A budget of exactly 0 is a fully-drained pool — the platform
+	// budget >= 0 here. A budget of exactly 0 is a fully-drained pool — the platform
 	// clamps a drained multi-machine pool to 0.0 — so it must pause too. The
 	// old `budget > 0` guard let a drained pool keep spending past zero on the
 	// remaining sibling machines.
-	st.Paused = st.SpentUSD >= budget
+	pauseSpendUSD := st.SpentUSD
+	if reservedCents > 0 {
+		pauseSpendUSD += float64(reservedCents) / 100
+	}
+	st.Paused = pauseSpendUSD >= budget
 	return st, nil
 }

@@ -125,10 +125,15 @@ Be terse — under 1500 tokens total. This is working memory, not a report. Do n
 %s
 </transcript>`, transcript)
 
+	release, reserveErr := reserveUsageCall(c.usage, c.model, conversationID)
+	if reserveErr != nil {
+		return messages, nil
+	}
 	start := time.Now()
 	resp, err := c.manager.SendText(ctx, c.model, systemPrompt, userPrompt, 4096)
 	elapsed := time.Since(start)
 	if err != nil {
+		release()
 		return messages, fmt.Errorf("compactor SendText: %w", err)
 	}
 
@@ -141,6 +146,7 @@ Be terse — under 1500 tokens total. This is working memory, not a report. Do n
 			log.Printf("compactor: usage.Record: %v", uerr)
 		}
 	}
+	release()
 
 	summaryText := strings.TrimSpace(resp.TextContent)
 	if summaryText == "" {

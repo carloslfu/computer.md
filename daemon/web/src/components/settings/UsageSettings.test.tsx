@@ -59,8 +59,8 @@ const calendarPlan = {
   period_source: "calendar_month" as const,
 };
 
-const enterprisePlan = {
-  plan_name: "Enterprise",
+const staleNegativePlan = {
+  plan_name: "Custom",
   ai_budget_usd: -1,
   usage_budget_usd: -1,
   period_start: "2026-05-01",
@@ -226,9 +226,9 @@ describe("UsageSettings", () => {
     expect(screen.queryByText(/At this pace/)).toBeNull();
   });
 
-  it("renders custom-term framing for legacy negative budgets", async () => {
+  it("renders custom-term framing for stale negative plan payloads", async () => {
     installFetchMock({
-      plan: { body: enterprisePlan },
+      plan: { body: staleNegativePlan },
       usage: { body: sampleSummary },
     });
     render(<UsageSettings />);

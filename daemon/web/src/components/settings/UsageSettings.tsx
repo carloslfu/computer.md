@@ -88,6 +88,7 @@ const MODEL_LABEL: Record<string, string> = {
   "gpt-5.4-mini": "VibeCraft manager",
   "gpt-5.4-mini-2026-03-17": "VibeCraft manager",
   "gpt-5.4": "VibeCraft manager",
+  "__hosted_tool_ai": "Hosted tool routes",
 };
 
 function modelLabel(model: string): string {
@@ -420,8 +421,7 @@ export function UsageSettings() {
                 <span className="font-medium">
                   {summary.budget_state.resets_on}
                 </span>
-                , or until the account is topped up. Anything already running
-                finishes normally.
+                , or until the account is topped up.
               </p>
             </div>
           )}

@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	managerclient "github.com/carloslfu/computer.md/daemon/manager"
+	"github.com/carloslfu/computer.md/daemon/usage"
 )
 
 var (
@@ -387,6 +388,9 @@ func loadManagerSettings(
 	}
 	if model == "" {
 		model = "gpt-5.4-mini"
+	}
+	if mode == "platform" && !usage.IsKnownModel(model) {
+		return "", "", "", "", fmt.Errorf("manager model %q has no VibeCraft usage pricing entry", model)
 	}
 
 	return key, mode, model, unavailable, nil

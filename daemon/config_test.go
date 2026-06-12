@@ -86,6 +86,37 @@ func TestLoadManagerSettings_OperatorModeWithKeyIsReady(t *testing.T) {
 	}
 }
 
+func TestLoadManagerSettings_PlatformModeRejectsUnpricedModel(t *testing.T) {
+	_, _, _, _, err := loadManagerSettings(
+		fakeManagerFiles(map[string]string{
+			"/etc/vibecraft/openai.key":       "sk-platform",
+			"/etc/vibecraft/manager_key_mode": "platform",
+			"/etc/vibecraft/manager_model":    "gpt-unpriced-future",
+		}),
+		fakeManagerEnv(nil),
+	)
+	if err == nil || !strings.Contains(err.Error(), "usage pricing") {
+		t.Fatalf("expected unpriced platform model error, got %v", err)
+	}
+}
+
+func TestLoadManagerSettings_OperatorModeAllowsUnpricedModel(t *testing.T) {
+	key, mode, model, unavailable, err := loadManagerSettings(
+		fakeManagerFiles(map[string]string{
+			"/etc/vibecraft/openai.key":       "sk-operator",
+			"/etc/vibecraft/manager_key_mode": "operator",
+			"/etc/vibecraft/manager_model":    "local-or-future-model",
+		}),
+		fakeManagerEnv(nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "sk-operator" || mode != "operator" || model != "local-or-future-model" || unavailable != "" {
+		t.Fatalf("got key=%q mode=%q model=%q unavailable=%q", key, mode, model, unavailable)
+	}
+}
+
 func TestLoadManagerSettings_PlatformModeMissingKeyUsesManagedCopy(t *testing.T) {
 	_, mode, _, unavailable, err := loadManagerSettings(
 		fakeManagerFiles(map[string]string{

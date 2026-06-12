@@ -230,17 +230,18 @@ func TestBudgetGate_FailOpenWhenBudgetUnknown(t *testing.T) {
 	}
 }
 
-// TestBudgetGate_CustomNegativeBudgetNeverBlocked — a fetched budget of -1
-// is a legacy/custom no-local-enforcement sentinel and never blocks.
-func TestBudgetGate_CustomNegativeBudgetNeverBlocked(t *testing.T) {
+// TestBudgetGate_NegativeFetchedBudgetBlocks — the current platform contract
+// never sends negative funded budgets. If it happens, fail closed as a drained
+// known budget instead of treating platform-paid usage as free.
+func TestBudgetGate_NegativeFetchedBudgetBlocks(t *testing.T) {
 	srv := newBudgetGateTestServer(t, -1.0, true)
 	srv.usageStore.Record("gpt-5.4-mini", "seed", manager.Usage{
 		OutputTokens: 99_999_999,
 	})
 
-	code, _ := postTask(t, srv, "convo-1", "do the thing")
-	if code != 201 {
-		t.Fatalf("custom negative budget must never be blocked, got %d", code)
+	code, resp := postTask(t, srv, "convo-1", "do the thing")
+	if code != 200 || resp["budget_blocked"] != true {
+		t.Fatalf("negative fetched budget should be held, got code=%d resp=%+v", code, resp)
 	}
 }
 
