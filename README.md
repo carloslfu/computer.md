@@ -51,8 +51,9 @@ find it, and run `vibecraft auth login` so I can approve access in my browser.
 Then meet me where I am: if I already have a machine or a server with tools,
 files, and workflows on it, connect it and take all of that into account:
 inventory what is there, reflect it in the machine's COMPUTER.md, and bring
-any existing notes or docs into its ~/db store. Show me the plan before you
-change anything. If I am starting fresh, walk me through getting a machine and
+any existing notes or docs into its ~/db store; if tools, skills, or workflows
+here already connect to that knowledge base, update them to read from ~/db too.
+Show me the plan before you change anything. If I am starting fresh, walk me through getting a machine and
 setting it up. Ask me what I already have if it is not obvious.
 ```
 
