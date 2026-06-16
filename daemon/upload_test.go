@@ -423,6 +423,17 @@ func TestSanitizeFilenameCapsLength(t *testing.T) {
 	}
 }
 
+// A pathologically long "extension" (no separator to give filepath.Ext a
+// short suffix) must still be hard-bounded: keep < ext length would
+// otherwise leave the name above the cap and risk ENAMETOOLONG on create.
+func TestSanitizeFilenameCapsLongExtension(t *testing.T) {
+	huge := "a." + strings.Repeat("x", 500)
+	got := sanitizeFilename(huge)
+	if len(got) > 200 {
+		t.Errorf("expected length <= 200 for long-extension name, got %d", len(got))
+	}
+}
+
 func TestValidateAttachmentPathsAcceptsInboxPaths(t *testing.T) {
 	ts := newTestServer(t)
 	convID := "conv-abc"

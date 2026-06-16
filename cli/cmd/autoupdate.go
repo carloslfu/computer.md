@@ -33,8 +33,9 @@ const (
 )
 
 // maybeAutoUpdate is invoked once per command from the root
-// PersistentPreRunE. cmdName is cobra's leaf cmd.Name(), used to skip
-// commands where a self-update is redundant or self-defeating.
+// PersistentPostRun (after the command runs, so it never delays it).
+// cmdName is cobra's leaf cmd.Name(), used to skip commands where a
+// self-update is redundant or self-defeating.
 func maybeAutoUpdate(cmdName string) {
 	if os.Getenv(autoUpdateDisableEnv) != "" {
 		return

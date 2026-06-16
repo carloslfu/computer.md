@@ -11,13 +11,17 @@ import (
 	"strings"
 )
 
-// sandboxIPRange is the /16 carved up into per-sandbox /30s
+// sandboxMeshCIDR is the /16 carved up into per-sandbox /30s
 // (SetupNetwork: idx selects 10.77.<idx>.0/30). The DNS proxy must never
-// fold an address from this range into the allow set — that would let an
-// allowlisted name pointed at a peer sandbox's gateway/host IP smuggle
-// lateral access past enforce-mode default-deny.
+// fold an address from this range into the allow set, AND the rendered
+// rulesets must never let an operator AllowCIDRs entry that overlaps it
+// (e.g. 10.0.0.0/8) accept into it — either would let a sandbox reach a
+// peer sandbox's gateway/host IP and smuggle lateral access past
+// enforce-mode default-deny.
+const sandboxMeshCIDR = "10.77.0.0/16"
+
 var sandboxIPRange = func() *net.IPNet {
-	_, n, _ := net.ParseCIDR("10.77.0.0/16")
+	_, n, _ := net.ParseCIDR(sandboxMeshCIDR)
 	return n
 }()
 
@@ -43,18 +47,33 @@ var cgnatRange = func() *net.IPNet {
 // that is a deliberate, reviewed choice (and such CIDRs are emitted as
 // their own `ip daddr <cidr> accept` lines anyway). ipStr is a bare IPv4
 // literal as produced by net.IP.String().
+//
+// The escape hatch is NOT unconditional. The truly dangerous ranges — the
+// host/link-local space (loopback, unspecified, link-local, multicast; this
+// covers the cloud IMDS endpoint 169.254.169.254) and the sandbox /30 mesh
+// (10.77.0.0/16) — are HARD-denied first and can never be overridden by a
+// static CIDR, no matter how broad. Otherwise a broad operator entry
+// (0.0.0.0/0 re-opening the SSRF/IMDS hole, or a 10.0.0.0/8 that overlaps
+// the mesh and grants cross-sandbox lateral access) would defeat the guard.
+// Operator CIDRs may still reach OTHER internal/RFC1918/CGNAT addresses they
+// deliberately listed, since those are not in the hard-deny set.
 func allowSetIPAllowed(ipStr string, pol EgressPolicy) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
+	// Hard deny: never overridable by AllowCIDRs (fail closed).
+	if ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() || sandboxIPRange.Contains(ip) {
+		return false
+	}
+	// Operator-declared static CIDRs are the deliberate escape hatch for the
+	// remaining internal ranges (RFC1918 + CGNAT) below.
 	if staticCIDRAllows(ip, pol) {
 		return true
 	}
-	if ip.IsLoopback() || ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsMulticast() || ip.IsPrivate() ||
-		sandboxIPRange.Contains(ip) || cgnatRange.Contains(ip) {
+	if ip.IsPrivate() || cgnatRange.Contains(ip) {
 		return false
 	}
 	return true
@@ -198,6 +217,15 @@ func RenderForwardNftables(sandboxID, vethHost, sandboxCIDR string, pol EgressPo
 	b.WriteString("  }\n")
 	b.WriteString("  chain sb_egress {\n")
 	b.WriteString("    ct state established,related accept\n")
+	// Hard-deny the sandbox /30 mesh BEFORE any static accept, so a broad
+	// operator AllowCIDRs entry overlapping it (e.g. 10.0.0.0/8) can't open
+	// cross-sandbox lateral access. nft evaluates top-down; this wins for
+	// mesh-destined packets regardless of the accepts below. Enforce-only:
+	// audit mode never drops (CDN-churn hedge) and its terminal rule accepts
+	// everything anyway, so a mesh drop here would break the hedge.
+	if mode == EgressEnforce {
+		fmt.Fprintf(&b, "    ip daddr %s drop\n", sandboxMeshCIDR)
+	}
 	for _, c := range static {
 		fmt.Fprintf(&b, "    ip daddr %s accept\n", c)
 	}
@@ -261,6 +289,15 @@ func RenderNftables(sandboxID string, pol EgressPolicy, mode EgressMode) (string
 	// shared-host-netns model; external DNS on arbitrary port 53 does not
 	// get a blanket bypass and must match the allowlist like anything else.
 	b.WriteString("    oifname \"lo\" accept\n")
+	// Hard-deny the sandbox /30 mesh BEFORE any static accept, so a broad
+	// operator AllowCIDRs entry overlapping it (e.g. 10.0.0.0/8) can't open
+	// cross-sandbox lateral access. nft evaluates top-down; this wins for
+	// mesh-destined packets regardless of the accepts below. Enforce-only:
+	// audit mode never drops (CDN-churn hedge) and its terminal rule accepts
+	// everything anyway, so a mesh drop here would break the hedge.
+	if mode == EgressEnforce {
+		fmt.Fprintf(&b, "    ip daddr %s drop\n", sandboxMeshCIDR)
+	}
 	for _, c := range staticIPs {
 		fmt.Fprintf(&b, "    ip daddr %s accept\n", c)
 	}

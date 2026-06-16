@@ -72,6 +72,9 @@ func runTeamAdd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if args[0] == "" {
+		return schema.Newf(schema.CodeValidationError, "email cannot be empty")
+	}
 	payload, _ := json.Marshal(map[string]string{"email": args[0]})
 	data, err := platformMutate(key, "POST", "/api/v1/team", payload)
 	if err != nil {

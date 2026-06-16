@@ -24,7 +24,7 @@ export function AgentsSettings() {
       try {
         const res = await apiFetch("/api/system");
         if (!res.ok) {
-          setError("Could not reach the computer.");
+          if (!cancelled) setError("Could not reach the computer.");
           return;
         }
         const data = (await res.json()) as SystemInfo;

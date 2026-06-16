@@ -217,9 +217,24 @@ function statusLabel(status: string) {
   return status || "Success";
 }
 
-function dayBucket(ts: number, today: number): string {
-  const yesterday = today - 24 * 60 * 60 * 1000;
-  const sevenDays = today - 7 * 24 * 60 * 60 * 1000;
+// Local-midnight boundary `daysAgo` days before `today`. Built from a
+// Date so it lands on the real local midnight even across a DST
+// transition — a fixed `today - daysAgo * 86_400_000ms` offset would
+// drift by an hour on transition days and mislabel buckets.
+function midnightDaysAgo(today: Date, daysAgo: number): number {
+  return new Date(
+    today.getFullYear(),
+    today.getMonth(),
+    today.getDate() - daysAgo,
+  ).getTime();
+}
+
+function dayBucket(
+  ts: number,
+  today: number,
+  yesterday: number,
+  sevenDays: number,
+): string {
   if (ts >= today) return "Today";
   if (ts >= yesterday) return "Yesterday";
   if (ts >= sevenDays) return "Last week";
@@ -230,11 +245,10 @@ function groupActivityByDay(
   items: ActivityItem[],
 ): Array<{ label: string; items: ActivityItem[] }> {
   const now = new Date();
-  const today = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-  ).getTime();
+  const todayDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const today = todayDate.getTime();
+  const yesterday = midnightDaysAgo(todayDate, 1);
+  const sevenDays = midnightDaysAgo(todayDate, 7);
   const buckets: Record<string, ActivityItem[]> = {
     Today: [],
     Yesterday: [],
@@ -247,7 +261,7 @@ function groupActivityByDay(
       buckets.Earlier.push(item);
       continue;
     }
-    buckets[dayBucket(ts, today)].push(item);
+    buckets[dayBucket(ts, today, yesterday, sevenDays)].push(item);
   }
   return Object.entries(buckets)
     .filter(([, arr]) => arr.length > 0)

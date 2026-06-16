@@ -51,11 +51,33 @@ func TestProcessPolicy_DaemonKillCoverage(t *testing.T) {
 		{"service stop", "service vibecraft-daemon stop", "", Block},
 		{"service restart", "sudo service vibecraft-daemon restart", "", Block},
 
+		// Block: wrapper prefixes (nice/timeout/env/env-assignment/leading
+		// whitespace) must not let a daemon-kill slip past the head anchor.
+		{"nice pkill daemon", "nice pkill vibecraft-daemon", "", Block},
+		{"nice -n 10 pkill daemon", "nice -n 10 pkill vibecraft-daemon", "", Block},
+		{"timeout-wrapped pkill daemon", "timeout 5 pkill vibecraft-daemon", "", Block},
+		{"env-wrapped pkill daemon", "env FOO=bar pkill vibecraft-daemon", "", Block},
+		{"env-assignment prefix pkill daemon", "FOO=bar pkill vibecraft-daemon", "", Block},
+		{"leading whitespace pkill daemon", "  pkill vibecraft-daemon", "", Block},
+		{"nohup systemctl stop daemon", "nohup systemctl stop vibecraft-daemon", "", Block},
+
+		// Block: systemctl global options before the verb must not bypass.
+		{"systemctl --now disable unit", "systemctl --now disable vibecraft-daemon", "", Block},
+		{"systemctl --no-block stop unit", "systemctl --no-block stop vibecraft-daemon", "", Block},
+
+		// Block: alternate restart verbs disrupt the daemon too.
+		{"systemctl try-restart unit", "systemctl try-restart vibecraft-daemon", "", Block},
+		{"systemctl reload-or-restart unit", "systemctl reload-or-restart vibecraft-daemon", "", Block},
+
 		// Confirm: other kills/stops that don't target the daemon.
 		{"kill generic PID", "kill 1234", "", Confirm},
 		{"kill -9 generic PID", "kill -9 4321", "", Confirm},
 		{"pkill arbitrary", "pkill nginx", "", Confirm},
 		{"systemctl stop arbitrary service", "systemctl stop nginx", "", Confirm},
+		// Global options / alternate verbs on a non-daemon service still
+		// reach the generic Confirm (they no longer silently Allow).
+		{"systemctl --now disable arbitrary", "systemctl --now disable nginx", "", Confirm},
+		{"systemctl try-restart arbitrary", "systemctl try-restart nginx", "", Confirm},
 
 		// Allow: non-matching commands.
 		{"ls", "ls /tmp", "", Allow},
@@ -203,6 +225,22 @@ func TestDangerousCommandPolicy(t *testing.T) {
 		{"kill init", "kill -9 1", "", Block},
 		{"killall -9", "killall -9 -u root", "", Block},
 
+		// Kill PID 1 in any signal spelling — not just the literal -9 form.
+		{"kill init -s KILL", "kill -s KILL 1", "", Block},
+		{"kill init -s SIGKILL", "kill -s SIGKILL 1", "", Block},
+		{"kill init -SIGKILL", "kill -SIGKILL 1", "", Block},
+		{"kill init -KILL", "kill -KILL 1", "", Block},
+		{"kill init bare", "kill 1", "", Block},
+		{"sudo kill init -9", "sudo kill -9 1", "", Block},
+		// POSIX `--` end-of-options before PID 1 is just another spelling
+		// of "signal init" and must hard-Block, not degrade to Confirm.
+		{"kill init -- separator", "kill -- 1", "", Block},
+		{"kill init -9 -- separator", "kill -9 -- 1", "", Block},
+		// But other PIDs are NOT init — they must not be caught by the
+		// PID-1 rule (they Confirm via ProcessPolicy, not Block here).
+		{"kill other PID is not init", "kill 1234", "", Allow},
+		{"kill -9 other PID is not init", "kill -9 4321", "", Allow},
+
 		// Real-disk destruction: irreversible + destroys the boot
 		// disk / data disks.
 		{"dd to sda", "dd if=/dev/zero of=/dev/sda bs=1M", "", Block},
@@ -213,12 +251,22 @@ func TestDangerousCommandPolicy(t *testing.T) {
 		{"fdisk on sda", "fdisk /dev/sda", "", Block},
 		{"parted on nvme", "parted /dev/nvme0n1 mklabel gpt", "", Block},
 		{"redirect to /dev/sda", "echo x > /dev/sda", "", Block},
+		// wipefs / shred on a real block device are as catastrophic as
+		// dd/mkfs — they were silently Allowed before.
+		{"wipefs on sda", "wipefs -a /dev/sda", "", Block},
+		{"wipefs all on nvme", "wipefs --all /dev/nvme0n1", "", Block},
+		{"shred on sda", "shred -n 3 -z /dev/sda", "", Block},
+		{"shred on nvme", "shred /dev/nvme0n1", "", Block},
 
 		// Wholesale system-tree destruction (path ends at the root).
 		{"rm -rf /etc", "rm -rf /etc", "", Block},
 		{"rm -rf /usr", "rm -rf /usr", "", Block},
 		{"rm -rf / (root)", "rm -rf /", "", Block},
 		{"rm -rf /etc with semicolon", "rm -rf /etc; echo done", "", Block},
+		// Root-glob recursive delete is as catastrophic as `rm -rf /` —
+		// it expands to every top-level entry. Previously only Confirm.
+		{"rm -rf /* (root glob)", "rm -rf /*", "", Block},
+		{"rm long-form /* (root glob)", "rm --recursive --force /*", "", Block},
 
 		// Flag-order-agnostic rm: GNU long-form, interleaved, separate, and
 		// --no-preserve-root flags must NOT bypass the block (the old
@@ -332,9 +380,17 @@ func TestFileSystemPolicy_VibecraftDirectoryBypasses(t *testing.T) {
 		{"cat jwt_public.pem", "cat /etc/vibecraft/jwt_public.pem", "", Block},
 		{"edit jwt_public.pem", "vim /etc/vibecraft/jwt_public.pem", "", Block},
 
-		// Confirm: legitimately-sensitive system files.
-		{"cat /etc/shadow", "cat /etc/shadow", "", Confirm},
+		// Block: credential-bearing files (password hashes, SSH private
+		// keys). A Confirm here would be eligible for the auto-review pass
+		// and could be auto-approved + returned unmasked (daemon-vault-guard-4).
+		{"cat /etc/shadow", "cat /etc/shadow", "", Block},
+		{"cat ssh private key", "cat /home/vibecraft/.ssh/id_rsa", "", Block},
+		{"cat ssh ed25519 key", "cat ~/.ssh/id_ed25519", "", Block},
+
+		// Confirm: legitimately-sensitive but non-secret system files.
 		{"edit sshd_config", "vim /etc/ssh/sshd_config", "", Confirm},
+		{"cat /etc/passwd", "cat /etc/passwd", "", Confirm},
+		{"cat authorized_keys", "cat /home/vibecraft/.ssh/authorized_keys", "", Confirm},
 
 		// Allow: benign paths.
 		{"ls /tmp", "ls /tmp", "", Allow},
@@ -359,8 +415,20 @@ func TestFileSystemPolicy_CoversCanonicalEditorTool(t *testing.T) {
 			want:    Block,
 		},
 		{
-			name:    "canonical editor confirms sensitive system path",
+			name:    "canonical editor blocks credential file (shadow)",
 			command: `{"command":"view","path":"/etc/shadow"}`,
+			toolTyp: "str_replace_based_edit_tool",
+			want:    Block,
+		},
+		{
+			name:    "canonical editor blocks ssh private key",
+			command: `{"command":"view","path":"/home/vibecraft/.ssh/id_rsa"}`,
+			toolTyp: "str_replace_based_edit_tool",
+			want:    Block,
+		},
+		{
+			name:    "canonical editor confirms non-secret sensitive path",
+			command: `{"command":"view","path":"/etc/ssh/sshd_config"}`,
 			toolTyp: "str_replace_based_edit_tool",
 			want:    Confirm,
 		},

@@ -178,6 +178,37 @@ func errorsAsSchema(err error, target **schema.Error) bool {
 	return false
 }
 
+// TestMaskKey covers the display-only masking, including the short-key
+// guard: keys read straight from a hand-edited config are not
+// re-validated, so maskKey must not index out of bounds on a value
+// shorter than its slice bounds.
+func TestMaskKey(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		want string
+	}{
+		{"empty", "", "..."},
+		{"three-char", "abc", "..."},
+		{"four-char", "abcd", "..."},
+		{"five-char", "abcde", "abcd..."},
+		{"thirteen-char", "vc_machine_xy", "vc_machine_x...e_xy"},
+		{"full-key", "vc_machine_abc0123_456_789012", "vc_machine_a...9012"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := maskKey(tc.key)
+			if got != tc.want {
+				t.Errorf("maskKey(%q) = %q, want %q", tc.key, got, tc.want)
+			}
+			// The mask must never leak the full key.
+			if len(tc.key) > 16 && strings.Contains(got, tc.key) {
+				t.Errorf("maskKey(%q) leaked the full key: %q", tc.key, got)
+			}
+		})
+	}
+}
+
 // TestListAccountMachines parses the platform machines list.
 func TestListAccountMachines(t *testing.T) {
 	mux := http.NewServeMux()

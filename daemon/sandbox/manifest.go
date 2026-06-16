@@ -17,6 +17,7 @@ package sandbox
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -145,10 +146,25 @@ func (m *SandboxManifest) Validate() error {
 		if !strings.HasPrefix(mt.SandboxPath, "/") {
 			return fmt.Errorf("mount[%d]: sandbox path %q must be absolute", i, mt.SandboxPath)
 		}
+		// Canonicalize before any path-based check. A raw textual prefix
+		// match is bypassable via "/etc/x/../vibecraft" traversal or a
+		// symlink whose target is a forbidden dir; resolving symlinks +
+		// cleaning the path first closes both. Fail closed: if the path
+		// cannot be resolved (does not exist yet), fall back to the
+		// lexically-cleaned form so traversal is still defeated.
+		canon := canonicalHostPath(mt.HostPath)
 		// A bind-mount of the daemon's secret dirs into a sandbox would
 		// defeat the entire plan; reject it structurally.
-		if isForbiddenHostMount(mt.HostPath) {
+		if isForbiddenHostMount(canon) {
 			return fmt.Errorf("mount[%d]: host path %q is never bind-mountable into a sandbox", i, mt.HostPath)
+		}
+		// Per-system credential scoping: a system (or customer-app)
+		// manifest must not bind-mount another system's dir, the
+		// credential dirs (~/.claude, ~/.codex), or the whole host home —
+		// each would defeat the per-system scope the plan establishes. The
+		// only home-tree path a scoped sandbox may mount is its own dir.
+		if !mountWithinScope(m, canon) {
+			return fmt.Errorf("mount[%d]: host path %q is outside the sandbox's own scope", i, mt.HostPath)
 		}
 	}
 	for k := range m.Env {
@@ -184,14 +200,69 @@ var forbiddenHostPrefixes = []string{
 	"/home/vibecraft/.bashrc",
 }
 
+// hostHomeRoot is the host user's home. Scoped sandboxes (systems,
+// customer-apps) may bind-mount their own dir under it but nothing else
+// inside it — not the credential dirs (~/.claude, ~/.codex), not a
+// sibling system's dir, not the whole home. Mirrors the host layout the
+// plan and cloud-init establish.
+const hostHomeRoot = "/home/vibecraft"
+
 func isForbiddenHostMount(host string) bool {
-	clean := strings.TrimRight(host, "/")
+	// Lexically clean (and trim a trailing slash) so a raw caller still
+	// gets traversal defense; manifest.go additionally resolves symlinks
+	// before calling this. filepath.Clean already strips trailing
+	// slashes and resolves ".."/"." segments.
+	clean := filepath.Clean(host)
 	for _, p := range forbiddenHostPrefixes {
 		if clean == p || strings.HasPrefix(clean, p+"/") {
 			return true
 		}
 	}
 	return false
+}
+
+// canonicalHostPath resolves symlinks and cleans a host path so the
+// path-based security checks operate on the real target, not a string
+// that resolves elsewhere at mount time. EvalSymlinks requires the path
+// to exist; when it does not (a not-yet-created mount source, or a test
+// fixture path), we fall back to the lexically-cleaned form so traversal
+// is still defeated. Fail closed by construction: the returned path is
+// never "more permissive" than the input.
+func canonicalHostPath(host string) string {
+	if resolved, err := filepath.EvalSymlinks(host); err == nil {
+		return resolved
+	}
+	return filepath.Clean(host)
+}
+
+// mountWithinScope enforces per-system/per-app credential scoping. For a
+// system or customer-app sandbox, a mount that lands inside the host home
+// tree is only allowed if it is the sandbox's own dir (HomeDir) or a path
+// within it. This blocks a manifest from mounting ~/.claude, ~/.codex,
+// another system's dir, or the whole home. Worker and agent-shell
+// sandboxes are intentionally exempt: workers inherit their parent
+// system's already-scoped dir, and the agent shell legitimately owns the
+// whole home. host is expected to be canonicalized already.
+func mountWithinScope(m *SandboxManifest, host string) bool {
+	switch m.Type {
+	case TypeSystem, TypeCustomerApp:
+	default:
+		return true
+	}
+	if !pathWithin(host, hostHomeRoot) {
+		return true // outside the home tree (e.g. /opt/shared) — allowed
+	}
+	own := canonicalHostPath(m.HomeOrDefault())
+	return pathWithin(host, own)
+}
+
+// pathWithin reports whether path is root itself or nested under root.
+// Both are compared after a lexical clean so a trailing slash or a "."
+// segment does not change the answer.
+func pathWithin(path, root string) bool {
+	path = filepath.Clean(path)
+	root = filepath.Clean(root)
+	return path == root || strings.HasPrefix(path, root+"/")
 }
 
 var (

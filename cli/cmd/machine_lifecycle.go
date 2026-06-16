@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"net/url"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -119,7 +120,7 @@ func runMachineTerminate(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	data, err := platformMutate(key, "DELETE", "/api/v1/machines/"+id, nil)
+	data, err := platformMutate(key, "DELETE", "/api/v1/machines/"+url.PathEscape(id), nil)
 	if err != nil {
 		return err
 	}

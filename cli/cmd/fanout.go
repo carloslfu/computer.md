@@ -3,10 +3,8 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -335,6 +333,3 @@ func runFanoutForStatus(machines []string) error {
 		}, exit.OK, nil
 	})
 }
-
-var _ = context.Canceled // import-pin
-var _ = fmt.Sprintf      // import-pin

@@ -258,6 +258,19 @@ func restoreSnapshot(name string) error {
 		fmt.Printf("Existing database moved to %s\n", bak)
 	}
 
+	// The live DB runs in WAL mode (PRAGMA journal_mode=WAL), so it leaves
+	// -wal and -shm sidecars next to vibecraft.db. The snapshot is a clean
+	// single-file VACUUM INTO with no WAL of its own. If we leave the OLD
+	// DB's sidecars in place, the daemon's next open sees a -wal whose header
+	// belongs to the previous database and checkpoints it onto the freshly
+	// restored main file — corrupting (or silently reverting) the restore.
+	// Remove the stale sidecars so the restored DB opens clean.
+	for _, sidecar := range []string{dst + "-wal", dst + "-shm"} {
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing stale WAL sidecar %s: %w", sidecar, err)
+		}
+	}
+
 	if err := copyFile(src, dst); err != nil {
 		return fmt.Errorf("copying snapshot: %w", err)
 	}

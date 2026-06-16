@@ -37,8 +37,15 @@ export function ConversationSidebar({
       date.getDate(),
     );
 
-    if (msgDate.getTime() === today.getTime()) return "Today";
-    if (msgDate.getTime() === today.getTime() - 86400000) return "Yesterday";
+    // Calendar-day diff, not a fixed-ms offset: on a DST-transition day
+    // the previous local midnight is not exactly 86_400_000ms before
+    // today's midnight, which would mislabel "Yesterday". Both dates are
+    // already local-midnight, so round the diff to whole days.
+    const dayDiff = Math.round(
+      (today.getTime() - msgDate.getTime()) / 86400000,
+    );
+    if (dayDiff === 0) return "Today";
+    if (dayDiff === 1) return "Yesterday";
     return date.toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",

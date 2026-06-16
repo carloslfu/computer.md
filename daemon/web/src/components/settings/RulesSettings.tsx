@@ -63,7 +63,9 @@ export function RulesSettings({ readOnly }: { readOnly: boolean }) {
 
   async function deleteRule(id: string) {
     try {
-      const res = await apiFetch(`/api/rules/${id}`, { method: "DELETE" });
+      const res = await apiFetch(`/api/rules/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
       if (!res.ok) throw new Error();
       setRules((prev) => prev.filter((r) => r.id !== id));
     } catch {

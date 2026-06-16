@@ -533,13 +533,17 @@ func formatUptime(seconds int64) string {
 }
 
 // oneLine collapses whitespace and truncates a long string for table display.
+// Truncation is rune-aware: max is a rune budget, and we never cut in the
+// middle of a multibyte UTF-8 sequence (which would emit a replacement
+// character in the table).
 func oneLine(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > max {
+	r := []rune(s)
+	if len(r) > max {
 		if max <= 3 {
-			return s[:max]
+			return string(r[:max])
 		}
-		return s[:max-3] + "..."
+		return string(r[:max-3]) + "..."
 	}
 	return s
 }

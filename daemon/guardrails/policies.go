@@ -67,9 +67,17 @@ var dangerousPatterns = []*regexp.Regexp{
 //   - apt remove / install / source-add (recoverable)
 var blockPatterns = []*regexp.Regexp{
 	// ── Catastrophic process operations ────────────────────────
-	regexp.MustCompile(`:(){ :|:& };:`),         // fork bomb — wedges the machine
-	regexp.MustCompile(`(?i)\bkill\s+-9\s+1\b`), // killing PID 1 — breaks the machine, no recovery
-	regexp.MustCompile(`(?i)\bkillall\s+-9\b`),  // killing every process — same
+	regexp.MustCompile(`:(){ :|:& };:`), // fork bomb — wedges the machine
+	// Killing PID 1 (init) breaks the machine with no recovery. The
+	// literal `-9` form is not the only spelling: `kill -s KILL 1`,
+	// `kill -SIGKILL 1`, `kill -KILL 1`, and even a bare `kill 1` all
+	// signal init. The POSIX `--` end-of-options separator (`kill -- 1`,
+	// `kill -9 -- 1`) is another spelling that must not slip through to a
+	// mere Confirm. Match a `kill` whose target operand is exactly PID 1,
+	// with any signal flag and/or a `--` separator (or none) — but NOT
+	// other PIDs like `kill 1234`.
+	regexp.MustCompile(`(?i)\bkill\s+(?:-[A-Za-z0-9]+\s+|-s\s+\S+\s+|--\s+)*1\b`),
+	regexp.MustCompile(`(?i)\bkillall\s+-9\b`), // killing every process — same
 
 	// ── Disk-level destruction on real block devices ───────────
 	// Loopback (/dev/loop*) and mapper (/dev/mapper/*) deliberately
@@ -80,6 +88,12 @@ var blockPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bmkfs(\.\w+)?\s+[^|;&]*/dev/(sd[a-z][0-9]*|nvme[0-9]+n[0-9]+(p[0-9]+)?|xvd[a-z][0-9]*|vd[a-z][0-9]*)\b`),
 	regexp.MustCompile(`(?i)\b(fdisk|parted|sfdisk|gdisk|cfdisk)\s+[^|;&]*/dev/(sd[a-z][0-9]*|nvme[0-9]+n[0-9]+(p[0-9]+)?|xvd[a-z][0-9]*|vd[a-z][0-9]*)\b`),
 	regexp.MustCompile(`>\s*/dev/(sd[a-z][0-9]*|nvme[0-9]+n[0-9]+(p[0-9]+)?|xvd[a-z][0-9]*|vd[a-z][0-9]*)\b`),
+	// wipefs erases all filesystem signatures; shred overwrites the raw
+	// device. On a real block device both are catastrophic + irreversible,
+	// same as dd/mkfs above. Loopback (/dev/loop*) and mapper (/dev/mapper/*)
+	// are deliberately excluded — those are user-controlled, not the boot disk.
+	regexp.MustCompile(`(?i)\bwipefs\s+[^|;&]*/dev/(sd[a-z][0-9]*|nvme[0-9]+n[0-9]+(p[0-9]+)?|xvd[a-z][0-9]*|vd[a-z][0-9]*)\b`),
+	regexp.MustCompile(`(?i)\bshred\s+[^|;&]*/dev/(sd[a-z][0-9]*|nvme[0-9]+n[0-9]+(p[0-9]+)?|xvd[a-z][0-9]*|vd[a-z][0-9]*)\b`),
 
 	// ── Wholesale system-tree destruction ──────────────────────
 	// Matches `rm -rf /etc` (the whole tree) but NOT `rm -rf /etc/subdir`
@@ -256,12 +270,22 @@ func rmDecision(cmd string) (Decision, bool) {
 	return Decision{}, false
 }
 
+// rmRootGlob matches an rm operand that globs the whole filesystem root —
+// `/*`, `/*.bak`, etc. `rm -rf /*` expands to every top-level entry and
+// destroys the system just like `rm -rf /`, so it must hard-Block, not merely
+// Confirm. A deeper glob like `/etc/*` is intentionally NOT caught here
+// (legitimate cleanup under a subdir stays at Confirm).
+var rmRootGlob = regexp.MustCompile(`^/\*`)
+
 // rmTargetIsCatastrophic reports whether op (an rm operand) is a top-level
 // system/home root whose recursive removal must be hard-blocked. A deeper path
 // under such a root is intentionally NOT catastrophic (legitimate cleanup).
 func rmTargetIsCatastrophic(op string) bool {
 	// Strip surrounding quotes and a single trailing slash (but keep "/").
 	op = strings.Trim(op, `"'`)
+	if rmRootGlob.MatchString(op) {
+		return true
+	}
 	if op != "/" {
 		op = strings.TrimRight(op, "/")
 	}
@@ -285,13 +309,33 @@ func isShellOrEditorAction(actionType string) bool {
 }
 
 var sensitivePathPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`/etc/shadow`),
 	regexp.MustCompile(`/etc/passwd`),
 	regexp.MustCompile(`/etc/sudoers`),
 	regexp.MustCompile(`/etc/ssh/sshd_config`),
-	regexp.MustCompile(`~?/\.ssh/(id_|authorized_keys)`),
+	regexp.MustCompile(`~?/\.ssh/authorized_keys`),
 	regexp.MustCompile(`/etc/vibecraft/(daemon\.token|openai\.key|anthropic\.key|jwt\.secret|vault\.key|encryption\.key|health\.token)`),
 	regexp.MustCompile(`/var/lib/vibecraft/vault\.enc`),
+}
+
+// credentialFilePatterns are sensitive files that hold raw credential
+// material — system password hashes and SSH private keys. A *read* of one of
+// these must hard-Block, never Confirm: a Confirm is eligible for the AI
+// auto-review pass (RiskClassifier), whose prompt explicitly treats
+// "read-only filesystem inspection (cat, ...)" as auto-approvable, so a
+// `cat /etc/shadow` / `cat ~/.ssh/id_rsa` could be silently auto-approved and
+// the file contents returned to the manager UNMASKED (the engine masks tool
+// output only against vault secrets, not arbitrary credential files). Block
+// short-circuits before the classifier and before execution — the strongest
+// possible masking, since nothing is ever read. The non-secret config files
+// above (passwd, sudoers, sshd_config, authorized_keys) stay at Confirm and
+// surface a human approval card as designed.
+var credentialFilePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`/etc/shadow`),
+	regexp.MustCompile(`/etc/gshadow`),
+	// SSH private keys: id_rsa, id_ed25519, id_ecdsa, id_dsa, … (the public
+	// .pub siblings are matched too, but those are not secret and Blocking a
+	// read of an id_*.pub is acceptably conservative).
+	regexp.MustCompile(`~?/\.ssh/id_`),
 }
 
 var blockedPathPatterns = []*regexp.Regexp{
@@ -333,6 +377,19 @@ func (p *FileSystemPolicy) Evaluate(action Action) Decision {
 			return Decision{
 				Action: Block,
 				Reason: "access to system credentials and provisioning data is not allowed",
+				Rule:   "filesystem_block",
+			}
+		}
+	}
+
+	// Credential-bearing files (password hashes, SSH private keys) hard-Block:
+	// a Confirm here would be eligible for the auto-review pass and could be
+	// auto-approved + returned unmasked. See credentialFilePatterns.
+	for _, pattern := range credentialFilePatterns {
+		if pattern.MatchString(cmd) {
+			return Decision{
+				Action: Block,
+				Reason: "access to credential files (password hashes, private keys) is not allowed",
 				Rule:   "filesystem_block",
 			}
 		}
@@ -397,20 +454,42 @@ func (p *NetworkPolicy) Description() string {
 // ProcessPolicy guards process management commands.
 type ProcessPolicy struct{}
 
+// cmdPrefix is one wrapper that can sit in front of the real command
+// without changing what it does: `sudo`, a leading `VAR=value` environment
+// assignment, or a launcher like `nice` / `timeout` / `env` / `nohup` that
+// runs the command that follows. These prefixes are how a daemon-kill slips
+// past a naive head anchor: `nice pkill vibecraft-daemon`,
+// `timeout 5 systemctl stop vibecraft-daemon`, `env FOO=bar pkill vibecraft`,
+// `FOO=bar pkill vibecraft` all invoke the same destructive command with a
+// benign-looking token first. cmdHead consumes zero or more of these so the
+// match lands on the actual command being invoked.
+const cmdPrefix = `(?:` +
+	`sudo\s+` +
+	`|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*\s+` +
+	`|(?:nice|ionice|setsid|nohup|stdbuf|env|timeout|chrt|taskset)\b(?:\s+-{1,2}[^\s;&|]+|\s+\d+(?:\.\d+)?|\s+[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*)*\s+` +
+	`)`
+
 // cmdHead anchors a pattern to the start of a shell "simple command":
 // either the beginning of the command line or after a separator (`;`,
-// `&&`, `||`, `|`), optionally followed by `sudo `. This avoids false
+// `&&`, `||`, `|`), then any leading whitespace and any number of wrapper
+// prefixes (sudo, env assignments, nice/timeout/env/…). This avoids false
 // positives like `grep kill foo` where "kill" is a grep argument rather
-// than the command being invoked.
-const cmdHead = `(?:^|[;&|]\s*)(?:sudo\s+)?`
+// than the command being invoked, while still catching the command when a
+// wrapper or env assignment is stacked in front of it.
+const cmdHead = `(?:^|[;&|]\s*)\s*(?:` + cmdPrefix + `)*`
 
 // killDaemonPatterns covers the realistic ways a shell command could
 // terminate or disrupt the vibecraft-daemon process.
 var killDaemonPatterns = []*regexp.Regexp{
 	// kill / pkill / killall with "vibecraft" anywhere in its arg list
 	regexp.MustCompile(`(?i)` + cmdHead + `(kill|pkill|killall)\s+[^|;&]*vibecraft`),
-	// systemctl actions targeting the vibecraft-* unit
-	regexp.MustCompile(`(?i)` + cmdHead + `systemctl\s+(stop|kill|restart|disable|mask|reload)\s+[^|;&]*vibecraft`),
+	// systemctl actions targeting the vibecraft-* unit. `(?:--\S+\s+)*`
+	// skips global options that legally precede the verb (`--now`,
+	// `--no-block`, `--quiet`), which would otherwise let
+	// `systemctl --now disable vibecraft-daemon` slip past. The verb list
+	// also includes try-restart and reload-or-restart — both disrupt the
+	// daemon just like stop/restart.
+	regexp.MustCompile(`(?i)` + cmdHead + `systemctl\s+(?:--\S+\s+)*(stop|kill|restart|disable|mask|reload|try-restart|reload-or-restart)\s+[^|;&]*vibecraft`),
 	// service command targeting the daemon
 	regexp.MustCompile(`(?i)` + cmdHead + `service\s+vibecraft[\w-]*\s+(stop|restart|kill|reload|force-reload)`),
 }
@@ -418,8 +497,10 @@ var killDaemonPatterns = []*regexp.Regexp{
 var killConfirmPatterns = []*regexp.Regexp{
 	// Generic kill/pkill/killall — must be the command being invoked.
 	regexp.MustCompile(`(?i)` + cmdHead + `(kill|pkill|killall)\s+`),
-	// systemctl stop/restart of any service requires confirmation.
-	regexp.MustCompile(`(?i)` + cmdHead + `systemctl\s+(stop|kill|restart|disable|mask)\s+`),
+	// systemctl stop/restart of any service requires confirmation. Skip
+	// global options before the verb and cover the alternate restart verbs
+	// for the same reasons as the daemon-kill pattern above.
+	regexp.MustCompile(`(?i)` + cmdHead + `systemctl\s+(?:--\S+\s+)*(stop|kill|restart|disable|mask|try-restart|reload-or-restart)\s+`),
 }
 
 // safeRecipeChainPattern matches a chain of "safe" shell operations on
@@ -758,10 +839,49 @@ func (p *CustomRulePolicy) Evaluate(action Action) Decision {
 		return Decision{Action: Allow}
 	}
 
+	// Validate the rule's action against the known enum and fail CLOSED on
+	// anything unrecognized. The stored action string is free text (set via
+	// the /rules API, which only checks it is non-empty), so a typo or a
+	// miscased value — "Block", "deny", "confirmm" — would otherwise be
+	// wrapped verbatim as ActionType("Block"). The engine only treats the
+	// canonical "block"/"confirm" values as restrictive (see engine.go
+	// Evaluate), so any other string silently degraded to Allow — the rule
+	// that was authored to GUARD an action instead permitted it. Normalize
+	// to the enum; reject unknown actions to the safest restrictive verdict
+	// (Block) and surface the misconfiguration in the reason + rule name.
+	resolved, ok := ResolveRuleAction(p.rule.Action)
+	if !ok {
+		return Decision{
+			Action: Block,
+			Reason: "guardrail rule has an unrecognized action and is failing closed",
+			Rule:   p.rule.Name,
+		}
+	}
+
 	return Decision{
-		Action: ActionType(p.rule.Action),
+		Action: resolved,
 		Reason: p.rule.Description,
 		Rule:   p.rule.Name,
+	}
+}
+
+// ResolveRuleAction maps a custom-rule action string to a known ActionType.
+// It is case-insensitive and trims surrounding whitespace so "Block", " block "
+// and "BLOCK" all resolve to Block. ok is false for any value that is not one
+// of the three canonical verdicts ("allow", "confirm", "block"); callers must
+// fail closed (treat an unknown action as Block) rather than letting it fall
+// through to Allow. Shared by CustomRulePolicy.Evaluate (load-time enforcement)
+// and the /rules write handler (validate-before-persist).
+func ResolveRuleAction(raw string) (ActionType, bool) {
+	switch ActionType(strings.ToLower(strings.TrimSpace(raw))) {
+	case Allow:
+		return Allow, true
+	case Confirm:
+		return Confirm, true
+	case Block:
+		return Block, true
+	default:
+		return "", false
 	}
 }
 

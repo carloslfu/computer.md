@@ -237,7 +237,17 @@ func ensureDockerRemoved() {
 	}
 
 	const script = `set -u
-RUNNING=$(su - vibecraft -c 'DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock docker ps -q 2>/dev/null' 2>/dev/null | grep -c . || true)
+# Fail CLOSED: the running-container probe must POSITIVELY confirm zero
+# containers before we destroy anything. A docker-ps that errors (socket
+# unreachable, transient daemon glitch, wrong DOCKER_HOST) must NOT be
+# read as "zero containers" — that would purge live customer container
+# data. So we capture docker-ps stdout AND its exit status separately:
+# only a clean exit with empty output means "safe to remove"; any non-
+# zero exit defers (exit 10) and retries on the next daemon start.
+PS_OUT=$(su - vibecraft -c 'DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock docker ps -q' 2>/dev/null)
+PS_RC=$?
+if [ "$PS_RC" -ne 0 ]; then echo "deferred: running-container check failed (rc=${PS_RC}); not removing"; exit 10; fi
+RUNNING=$(printf '%s' "$PS_OUT" | grep -c . || true)
 if [ "${RUNNING:-0}" -ne 0 ]; then echo "deferred: ${RUNNING} running container(s)"; exit 10; fi
 su - vibecraft -c 'dockerd-rootless-setuptool.sh uninstall -f' >/dev/null 2>&1 || true
 su - vibecraft -c 'rm -rf ~/.docker ~/.local/share/docker ~/.config/docker' >/dev/null 2>&1 || true

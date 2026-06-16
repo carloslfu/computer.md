@@ -19,6 +19,7 @@ import {
   rehydrateMessages,
   upsertActivityMessage,
   type ChatMessage,
+  type ChatMessageAction,
   type CredentialRequestPayload,
   type SetupRequestPayload,
 } from "../lib/rehydrate";
@@ -58,6 +59,54 @@ export function nextConversationAfterLoad(
   if (current) return current;
   if (suppressAutoSelect) return null;
   return loaded[0]?.id ?? null;
+}
+
+// The two live action buttons an unresolved approval card carries. Kept
+// here so a reverted card (server rejected the decision) restores the
+// exact same affordances the user clicked.
+const APPROVAL_ACTIONS: ChatMessageAction[] = [
+  { label: "Approve", action: "approve" },
+  { label: "Deny", action: "cancel" },
+];
+
+// applyApprovalDecision performs the OPTIMISTIC flip on the targeted
+// approval card: it stamps the resolution and removes the action buttons
+// so the card reads "Approved"/"Denied" immediately. This is only ever a
+// provisional UI state — it must be reverted if the server rejects the
+// decision (see revertApprovalDecision). Exported pure so the optimistic
+// step is unit-testable without mounting the component.
+export function applyApprovalDecision(
+  messages: ChatMessage[],
+  messageId: string,
+  resolution: "approved" | "denied",
+): ChatMessage[] {
+  return messages.map((m) =>
+    m.type === "approval" && m.id === messageId
+      ? { ...m, approvalResolution: resolution, actions: undefined }
+      : m,
+  );
+}
+
+// revertApprovalDecision undoes a provisional flip when the respond call
+// did NOT succeed (403, other non-2xx, or a network error). It only
+// reverts a card still carrying the SAME provisional resolution we
+// optimistically set, and never clobbers a terminal state the daemon
+// pushed in the meantime via SSE (decided / expired, or a flip to the
+// opposite decision). Restoring `actions` re-arms the Approve/Deny
+// buttons so the user can answer again — the core safety fix: the UI
+// must not claim a decision the server rejected. Exported pure for tests.
+export function revertApprovalDecision(
+  messages: ChatMessage[],
+  messageId: string,
+  attempted: "approved" | "denied",
+): ChatMessage[] {
+  return messages.map((m) =>
+    m.type === "approval" &&
+    m.id === messageId &&
+    m.approvalResolution === attempted
+      ? { ...m, approvalResolution: undefined, actions: APPROVAL_ACTIONS }
+      : m,
+  );
 }
 
 // isForeignConversationEvent decides whether a content-appending SSE event
@@ -327,51 +376,58 @@ export function ChatLayout({
         case "task:failed": {
           const errMsg = (data.error as string) || "Task failed";
           const failedId = data.task_id as string | undefined;
-          setMessages((prev) => {
-            const updated = failedId
-              ? prev.map((m) => {
-                  if (
-                    m.type === "approval" &&
-                    m.id === failedId &&
-                    !m.approvalResolution
-                  ) {
-                    return {
-                      ...m,
-                      approvalResolution: "decided" as const,
-                      actions: undefined,
-                    };
-                  }
-                  if (
-                    m.type === "credential_request" &&
-                    m.credentialRequest &&
-                    (m.credentialRequest.task_id === failedId ||
-                      m.taskId === failedId) &&
-                    !m.credentialRequest.stored &&
-                    !m.credentialRequest.expired_at
-                  ) {
-                    return {
-                      ...m,
-                      credentialRequest: {
-                        ...m.credentialRequest,
-                        expired_at: new Date().toISOString(),
-                        expired_reason: "task ended",
-                      },
-                    };
-                  }
-                  return m;
-                })
-              : prev;
-            return [
-              ...updated,
-              {
-                id: `sse-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                role: "agent",
-                type: "text",
-                content: errMsg,
-                timestamp: new Date().toISOString(),
-              },
-            ];
-          });
+          // Mutate cards + append the error bubble only for the active
+          // conversation; the global running/agent state below still clears
+          // regardless (lifecycle). Without this guard a task failing in
+          // ANOTHER conversation would inject its error into the chat on
+          // screen — see isForeignConversationEvent.
+          if (!isForeignConversation) {
+            setMessages((prev) => {
+              const updated = failedId
+                ? prev.map((m) => {
+                    if (
+                      m.type === "approval" &&
+                      m.id === failedId &&
+                      !m.approvalResolution
+                    ) {
+                      return {
+                        ...m,
+                        approvalResolution: "decided" as const,
+                        actions: undefined,
+                      };
+                    }
+                    if (
+                      m.type === "credential_request" &&
+                      m.credentialRequest &&
+                      (m.credentialRequest.task_id === failedId ||
+                        m.taskId === failedId) &&
+                      !m.credentialRequest.stored &&
+                      !m.credentialRequest.expired_at
+                    ) {
+                      return {
+                        ...m,
+                        credentialRequest: {
+                          ...m.credentialRequest,
+                          expired_at: new Date().toISOString(),
+                          expired_reason: "task ended",
+                        },
+                      };
+                    }
+                    return m;
+                  })
+                : prev;
+              return [
+                ...updated,
+                {
+                  id: `sse-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                  role: "agent",
+                  type: "text",
+                  content: errMsg,
+                  timestamp: new Date().toISOString(),
+                },
+              ];
+            });
+          }
           setAgentStatus("online");
           setRunningTaskId(null);
           setRunningTaskConversationId(null);
@@ -444,46 +500,54 @@ export function ChatLayout({
         }
         case "task:cancelled": {
           const cancelledId = data.task_id as string | undefined;
-          setMessages((prev) => {
-            const filtered = cancelledId
-              ? prev.filter(
-                  (m) => !(m.type === "approval" && m.id === cancelledId),
-                )
-              : prev;
-            const updated = cancelledId
-              ? filtered.map((m) => {
-                  if (
-                    m.type === "credential_request" &&
-                    m.credentialRequest &&
-                    (m.credentialRequest.task_id === cancelledId ||
-                      m.taskId === cancelledId) &&
-                    !m.credentialRequest.stored &&
-                    !m.credentialRequest.expired_at
-                  ) {
-                    return {
-                      ...m,
-                      credentialRequest: {
-                        ...m.credentialRequest,
-                        expired_at: new Date().toISOString(),
-                        expired_reason: "task ended",
-                      },
-                    };
-                  }
-                  return m;
-                })
-              : filtered;
-            return [
-              ...updated,
-              {
-                id: `stop-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                role: "system",
-                type: "system_notice",
-                content: "Task stopped",
-                taskId: cancelledId,
-                timestamp: new Date().toISOString(),
-              },
-            ];
-          });
+          // Drop the approval card, expire the credential card, and append
+          // the "Task stopped" notice only for the active conversation; the
+          // global running/agent state below still clears regardless
+          // (lifecycle). Without this guard a task cancelled in ANOTHER
+          // conversation would mutate cards and inject a notice into the
+          // chat on screen — see isForeignConversationEvent.
+          if (!isForeignConversation) {
+            setMessages((prev) => {
+              const filtered = cancelledId
+                ? prev.filter(
+                    (m) => !(m.type === "approval" && m.id === cancelledId),
+                  )
+                : prev;
+              const updated = cancelledId
+                ? filtered.map((m) => {
+                    if (
+                      m.type === "credential_request" &&
+                      m.credentialRequest &&
+                      (m.credentialRequest.task_id === cancelledId ||
+                        m.taskId === cancelledId) &&
+                      !m.credentialRequest.stored &&
+                      !m.credentialRequest.expired_at
+                    ) {
+                      return {
+                        ...m,
+                        credentialRequest: {
+                          ...m.credentialRequest,
+                          expired_at: new Date().toISOString(),
+                          expired_reason: "task ended",
+                        },
+                      };
+                    }
+                    return m;
+                  })
+                : filtered;
+              return [
+                ...updated,
+                {
+                  id: `stop-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                  role: "system",
+                  type: "system_notice",
+                  content: "Task stopped",
+                  taskId: cancelledId,
+                  timestamp: new Date().toISOString(),
+                },
+              ];
+            });
+          }
           setAgentStatus("online");
           setRunningTaskId(null);
           setRunningTaskConversationId(null);
@@ -706,6 +770,14 @@ export function ChatLayout({
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
+          // Reset the SSE parser state for this connection. currentEvent /
+          // currentData live at effect scope and are only cleared after a
+          // complete frame; if the previous connection dropped mid-frame
+          // (event:/data: lines seen, terminating blank line not yet read),
+          // the stale partial would otherwise merge with the next
+          // connection's first frame and replay a corrupt event.
+          currentEvent = "";
+          currentData = "";
           sseReadyRef.current = true;
 
           while (!cancelled) {
@@ -920,6 +992,10 @@ export function ChatLayout({
           }
           setMessages((prev) => [...prev, ...heldMessages]);
           setAgentStatus("online");
+          // The daemon already persisted this conversation (user message +
+          // manager reply) even though the task was gated. Refresh the list
+          // so a brand-new gated conversation still appears in the sidebar.
+          fetchConversations();
           return;
         }
         fetchConversations();
@@ -956,21 +1032,46 @@ export function ChatLayout({
   async function handleApproval(messageId: string, action: string) {
     const resolution: "approved" | "denied" =
       action === "approve" ? "approved" : "denied";
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.type === "approval" && m.id === messageId
-          ? { ...m, approvalResolution: resolution, actions: undefined }
-          : m,
-      ),
-    );
+    // Optimistic flip: stamp the decision + drop the buttons so the card
+    // reads "Approved"/"Denied" right away. This is PROVISIONAL — it must
+    // be reverted if the server rejects the decision, otherwise the card
+    // would claim a decision the daemon never recorded (a safety-control
+    // failure: the user believes they approved/denied, but nothing happened).
+    setMessages((prev) => applyApprovalDecision(prev, messageId, resolution));
+
+    // revertWithError re-arms the card's buttons and surfaces the failure
+    // as an agent message so the user knows their decision did NOT land.
+    const revertWithError = (detail: string) => {
+      setMessages((prev) => [
+        ...revertApprovalDecision(prev, messageId, resolution),
+        {
+          id: `err-${Date.now()}`,
+          role: "agent" as const,
+          type: "text" as const,
+          content: detail,
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    };
 
     try {
-      await apiFetch(`/api/task/${messageId}/respond`, {
+      const res = await apiFetch(`/api/task/${messageId}/respond`, {
         method: "POST",
         body: JSON.stringify({ input: action === "approve" ? "yes" : "no" }),
       });
+      // Only reflect the decision once the server confirms it. A 403
+      // (no control access), a stale/expired task, or any other non-2xx
+      // means the decision was rejected — revert the optimistic flip and
+      // tell the user instead of leaving a false "Approved"/"Denied".
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        revertWithError(
+          (data as { error?: string }).error ||
+            "Could not record your decision. Please try again.",
+        );
+      }
     } catch {
-      // Error surfaces via SSE.
+      revertWithError("Connection error. Your decision was not recorded.");
     }
   }
 

@@ -257,7 +257,11 @@ func downloadAndVerify(downloadURL, expectedSHA, destPath string) error {
 	}
 
 	actual := hex.EncodeToString(hasher.Sum(nil))
-	if actual != expectedSHA {
+	// hex.EncodeToString emits lowercase; a manifest may publish the digest
+	// in uppercase. Compare case-insensitively so a correct-but-uppercase
+	// hash isn't rejected as a mismatch (fail-closed stays intact — only
+	// the hex case is normalized, the bytes still have to match).
+	if !strings.EqualFold(actual, strings.TrimSpace(expectedSHA)) {
 		return schema.Newf(schema.CodeValidationError,
 			"SHA-256 mismatch (expected %s, got %s)", expectedSHA, actual).
 			WithHint("refusing to install a binary that doesn't match the manifest")

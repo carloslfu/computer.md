@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -334,15 +333,4 @@ func probeLocalPort(ctx context.Context, port int) string {
 		return "up"
 	}
 	return "down"
-}
-
-// ensureSystemsRoot is a defensive helper used by tests. Production
-// always has /home/vibecraft/systems by the time the dashboard renders
-// (the manager creates it on first system), but unit tests need to
-// point at a temp dir.
-func ensureSystemsRoot(path string) string {
-	if path == "" {
-		return systemsRoot
-	}
-	return filepath.Clean(path)
 }

@@ -83,7 +83,10 @@ func startXvfb() (*xvfbProc, error) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// Reap the process we just killed; a bare Kill() without Wait() leaks
+	// a zombie for the daemon's lifetime, one per failed Pattern-B spawn.
 	cmd.Process.Kill()
+	cmd.Wait()
 	freeDisplay(n)
 	return nil, fmt.Errorf("Xvfb :%d socket never appeared", n)
 }

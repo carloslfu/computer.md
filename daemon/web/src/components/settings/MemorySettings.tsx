@@ -37,7 +37,9 @@ export function MemorySettings({ readOnly }: { readOnly: boolean }) {
 
   async function deleteMemory(id: string) {
     try {
-      const res = await apiFetch(`/api/memory/${id}`, { method: "DELETE" });
+      const res = await apiFetch(`/api/memory/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
       if (!res.ok) throw new Error();
       setMemories((prev) => prev.filter((m) => m.id !== id));
     } catch {

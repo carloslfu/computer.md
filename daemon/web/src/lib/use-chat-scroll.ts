@@ -86,12 +86,33 @@ export function useChatScroll<T extends MinimalMessage>(opts: {
     isProgrammaticRef.current = true;
     if (behavior === "smooth") {
       el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-    } else {
-      // Direct assignment is the fastest path — no smooth animation,
-      // no scrollTo overhead. Right thing during streaming when this
-      // fires on every token.
-      el.scrollTop = el.scrollHeight;
+      // A smooth scroll animates over MANY frames. Clearing the guard
+      // after a single rAF would expose the intermediate (not-yet-at-
+      // bottom) scroll events to the handler, which — with the pin
+      // already re-engaged by jumpToBottom — would read !atBottom and
+      // immediately unpin again. Hold the guard until the animation has
+      // actually landed at the bottom, with a frame-count cap so a
+      // never-settling element can't pin the flag forever.
+      let frames = 0;
+      const MAX_FRAMES = 60; // ~1s at 60fps; smooth scrolls finish well within this.
+      const settle = () => {
+        if (!isProgrammaticRef.current) return; // a newer scroll superseded us
+        frames += 1;
+        const done =
+          el.scrollHeight - el.scrollTop - el.clientHeight <= PIN_THRESHOLD_PX;
+        if (done || frames >= MAX_FRAMES) {
+          isProgrammaticRef.current = false;
+          return;
+        }
+        requestAnimationFrame(settle);
+      };
+      requestAnimationFrame(settle);
+      return;
     }
+    // Direct assignment is the fastest path — no smooth animation,
+    // no scrollTo overhead. Right thing during streaming when this
+    // fires on every token.
+    el.scrollTop = el.scrollHeight;
     // The scroll event from this write will fire next; clear the flag
     // AFTER it. requestAnimationFrame is enough — the synthesized
     // scroll event is dispatched within the same frame as the

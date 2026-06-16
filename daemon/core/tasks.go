@@ -202,10 +202,11 @@ func (s *TaskStore) UpdateStatus(id string, status TaskStatus) error {
 
 // SetResult sets the result text for a completed task.
 func (s *TaskStore) SetResult(id, result string) error {
+	now := time.Now().UTC()
 	_, err := s.db.Conn().Exec(
 		`UPDATE tasks SET result = ?, status = ?, updated_at = ?, completed_at = ?
 		 WHERE id = ? AND status NOT IN (?, ?, ?)`,
-		result, string(TaskCompleted), time.Now().UTC(), time.Now().UTC(), id,
+		result, string(TaskCompleted), now, now, id,
 		string(TaskCompleted), string(TaskFailed), string(TaskCancelled),
 	)
 	return err
@@ -213,10 +214,11 @@ func (s *TaskStore) SetResult(id, result string) error {
 
 // SetError sets the error message for a failed task.
 func (s *TaskStore) SetError(id, errMsg string) error {
+	now := time.Now().UTC()
 	_, err := s.db.Conn().Exec(
 		`UPDATE tasks SET error_message = ?, status = ?, updated_at = ?, completed_at = ?
 		 WHERE id = ? AND status NOT IN (?, ?, ?)`,
-		errMsg, string(TaskFailed), time.Now().UTC(), time.Now().UTC(), id,
+		errMsg, string(TaskFailed), now, now, id,
 		string(TaskCompleted), string(TaskFailed), string(TaskCancelled),
 	)
 	return err

@@ -95,8 +95,24 @@ func forwardNotificationToPlatform(s *Server, kind, title, body, convID, priorit
 	return postNotificationToPlatform(s.cfg, kind, title, body, convID, priority)
 }
 
+// notifyMaxAttempts bounds the forward retries. Some notifications are
+// edge-triggered exactly once per billing period (the 80% / 100% usage
+// warnings in usage/budget.go mark the period as warned *before* the
+// notify call returns), so a single transient failure would otherwise
+// drop the warning permanently for that period. We retry a handful of
+// times with exponential backoff to survive a brief network blip or a
+// platform 5xx/429, rather than losing the notification on the first
+// hiccup.
+const notifyMaxAttempts = 5
+
 // postNotificationToPlatform is the cfg-only path so the engine's
 // platformNotifier (which doesn't own a *Server) can call it directly.
+//
+// It retries on transport errors and retryable platform responses
+// (429 + 5xx) with exponential backoff so a transient failure does not
+// silently drop the notification. Deterministic client errors (other
+// 4xx — e.g. a rejected token) are not retried, since a repeat would
+// fail identically.
 func postNotificationToPlatform(cfg *Config, kind, title, body, convID, priority string) error {
 	if cfg.MachineID == "" || cfg.HealthToken == "" {
 		return fmt.Errorf("missing machine_id or health_token in config")
@@ -115,18 +131,42 @@ func postNotificationToPlatform(cfg *Config, kind, title, body, convID, priority
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	platformBase := cfg.PlatformBaseURL
 	if platformBase == "" {
 		platformBase = "https://www.vibecraft.so"
 	}
 	url := platformBase + "/api/notifications/ingest"
 
+	var lastErr error
+	backoff := 500 * time.Millisecond
+	for attempt := 1; attempt <= notifyMaxAttempts; attempt++ {
+		retryable, err := postNotificationOnce(cfg, url, data)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !retryable || attempt == notifyMaxAttempts {
+			break
+		}
+		log.Printf("notify: forward attempt %d/%d failed: %v (retrying in %s)", attempt, notifyMaxAttempts, err, backoff)
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+	return fmt.Errorf("forward failed after %d attempts: %w", notifyMaxAttempts, lastErr)
+}
+
+// postNotificationOnce performs a single forward attempt. It returns
+// whether the failure (if any) is worth retrying: transport errors and
+// retryable platform responses (429 + 5xx) are retryable; other non-2xx
+// responses are deterministic and are not.
+func postNotificationOnce(cfg *Config, url string, data []byte) (retryable bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("new request: %w", err)
+		// Building the request is deterministic — retrying won't help.
+		return false, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.HealthToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -134,13 +174,15 @@ func postNotificationToPlatform(cfg *Config, kind, title, body, convID, priority
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("post: %w", err)
+		// Transport-level failure (DNS, connection refused, timeout) — retry.
+		return true, fmt.Errorf("post: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("platform returned %d", resp.StatusCode)
+		retry := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		return retry, fmt.Errorf("platform returned %d", resp.StatusCode)
 	}
-	return nil
+	return false, nil
 }
 
 // platformNotifier implements core.Notifier by forwarding to the

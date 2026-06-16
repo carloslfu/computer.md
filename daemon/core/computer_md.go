@@ -36,6 +36,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"syscall"
 )
 
 // ComputerMDPath is the canonical location of the per-machine config
@@ -131,8 +132,21 @@ func WriteComputerMD(content string) error {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	tmp := ComputerMDPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0o664); err != nil {
+	// O_NOFOLLOW: a malicious symlink planted by the vibecraft user at
+	// COMPUTER.md.tmp must not be followed, or root would overwrite an
+	// arbitrary file. O_CREATE|O_TRUNC|O_WRONLY for a normal write.
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|syscall.O_NOFOLLOW, 0o664)
+	if err != nil {
+		return fmt.Errorf("open tmp %s: %w", tmp, err)
+	}
+	if _, err := f.Write([]byte(content)); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write tmp %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close tmp %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, ComputerMDPath); err != nil {
 		_ = os.Remove(tmp)
@@ -176,7 +190,20 @@ func fixComputerMDOwnership() {
 		}
 		return
 	}
-	if err := os.Chmod(ComputerMDPath, 0o664); err != nil {
+	// O_NOFOLLOW: never chmod through a symlink. If the vibecraft user
+	// plants a symlink at COMPUTER.md pointing at a 0600 protected file
+	// (e.g. /etc/vibecraft/*), a plain os.Chmod would follow it and
+	// weaken the target's permissions. Open the path itself (failing if
+	// it's a symlink) and fchmod the fd.
+	f, err := os.OpenFile(ComputerMDPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if !os.IsPermission(err) {
+			fmt.Fprintf(os.Stderr, "warning: open %s for chmod failed: %v\n", ComputerMDPath, err)
+		}
+		return
+	}
+	defer f.Close()
+	if err := f.Chmod(0o664); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: chmod %s failed: %v\n", ComputerMDPath, err)
 	}
 }

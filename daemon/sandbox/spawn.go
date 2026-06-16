@@ -2,7 +2,10 @@
 
 package sandbox
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // SpawnOpts carries the runtime-resolved values the daemon supplies at
 // spawn time (kept separate from the manifest so BwrapArgs stays a pure,
@@ -137,8 +140,21 @@ func BwrapArgs(m *SandboxManifest, opts SpawnOpts) []string {
 	}
 
 	// Manifest bind-mounts (project dirs, ~/.claude views, …). Validate()
-	// has already rejected the forbidden host paths.
+	// rejects forbidden host SOURCES, but it cannot defend the bind
+	// DESTINATION: a mount whose SandboxPath is /etc/vibecraft (or /etc
+	// itself) would be applied AFTER the --tmpfs /etc/vibecraft mask and
+	// the --ro-bind /etc above and SHADOW them — re-exposing the daemon
+	// secret/state locations inside the sandbox. Validate() also string-
+	// matches HostPath, which a symlinked source can slip past (the
+	// resolved source is what bwrap actually binds). So the builder
+	// fails CLOSED here: any mount whose source OR destination resolves
+	// onto a forbidden path is DROPPED, never bound — defense in depth
+	// independent of Validate(). (Symlink resolution of the source is a
+	// filesystem op and must also happen in Validate(); see manifest.go.)
 	for _, mt := range m.Mounts {
+		if isForbiddenHostMount(mt.HostPath) || isForbiddenSandboxDest(mt.SandboxPath) {
+			continue
+		}
 		if mt.ReadOnly {
 			a = append(a, "--ro-bind", mt.HostPath, mt.SandboxPath)
 		} else {
@@ -173,6 +189,32 @@ func BwrapArgs(m *SandboxManifest, opts SpawnOpts) []string {
 	a = append(a, "--as-pid-1", "--", "/usr/bin/tini", "-s", "--")
 	a = append(a, opts.Cmd...)
 	return a
+}
+
+// forbiddenSandboxDests are bind-mount DESTINATIONS that must never be
+// declared by a manifest: binding onto them inside the sandbox would
+// shadow a protection BwrapArgs sets up earlier — the --tmpfs mask over
+// /etc/vibecraft, the --ro-bind /etc base, or the read-only system image
+// (which carries /usr/bin/tini, the sandbox's PID 1). A mount targeting
+// any of these is dropped rather than bound (fail closed).
+var forbiddenSandboxDests = []string{
+	"/etc",
+	"/etc/vibecraft",
+	"/usr",
+	"/bin",
+	"/sbin",
+	"/lib",
+	"/lib64",
+}
+
+func isForbiddenSandboxDest(dest string) bool {
+	clean := strings.TrimRight(dest, "/")
+	for _, p := range forbiddenSandboxDests {
+		if clean == p || strings.HasPrefix(clean, p+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys(m map[string]string) []string {

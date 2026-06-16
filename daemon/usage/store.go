@@ -99,27 +99,100 @@ type ConvoBreakdown struct {
 	OutputTokens   int64   `json:"output_tokens"`
 }
 
-// Aggregate sums usage between start and end (inclusive). Dates are
-// YYYY-MM-DD in UTC; the caller is responsible for picking the right
-// period boundaries (calendar month, Stripe subscription period, etc).
+// Aggregate sums usage between start and end (INCLUSIVE on both ends).
+// Dates are YYYY-MM-DD in UTC; the caller is responsible for picking the
+// right window. This is the display contract used by the SPA Usage panel,
+// where the user expects "the period through its last day" and there is no
+// adjacent period to overlap with.
+//
+// DO NOT use Aggregate for billing-period / budget math. Adjacent Stripe
+// billing periods can share a boundary day (period N's inclusive end ==
+// period N+1's inclusive start, which happens whenever the subscription
+// anchor is not exactly midnight UTC). An inclusive query on both periods
+// would count the boundary day's spend twice. Budget enforcement and the
+// platform-reported period spend must use AggregateHalfOpen instead, which
+// takes the NEXT period's start as an exclusive upper bound so each day
+// belongs to exactly one period.
 //
 // topConvos limits the TopConversations list. Pass 0 to skip the
 // conversation breakdown entirely (cheaper query).
 func (s *Store) Aggregate(start, end string, topConvos int) (Summary, error) {
+	if start == "" || end == "" {
+		return Summary{
+			Period:           Period{Start: start, End: end},
+			ByModel:          []ModelBreakdown{},
+			ByDay:            []DayBreakdown{},
+			TopConversations: []ConvoBreakdown{},
+		}, fmt.Errorf("usage.Aggregate: start and end required (YYYY-MM-DD)")
+	}
+
+	// Inclusive [start, end] == half-open [start, end+1). Convert here so
+	// the SQL layer only ever sees the strict `day < endExclusive` form.
+	endExclusive, err := nextDay(end)
+	if err != nil {
+		return Summary{
+				Period:           Period{Start: start, End: end},
+				ByModel:          []ModelBreakdown{},
+				ByDay:            []DayBreakdown{},
+				TopConversations: []ConvoBreakdown{},
+			},
+			fmt.Errorf("usage.Aggregate: invalid end date %q: %w", end, err)
+	}
+	return s.aggregateRange(start, end, endExclusive, topConvos)
+}
+
+// AggregateHalfOpen sums usage over the HALF-OPEN window
+// [start, endExclusive) — start is included, endExclusive (the first day
+// NOT in the period) is excluded. Both are YYYY-MM-DD UTC.
+//
+// This is the billing/budget contract. The platform hands the daemon the
+// NEXT period's start as the exclusive upper bound (Stripe's exclusive
+// currentPeriodEnd truncated to a UTC day), so when two adjacent periods
+// share a calendar boundary day, that day falls inside exactly ONE period
+// — the one whose start it is — and is never attributed to two periods at
+// once. This is the actual fix for the period-boundary double-count: it is
+// the caller passing a genuinely exclusive end, not an inclusive end
+// rewritten into an equivalent strict comparison.
+//
+// The reported Summary.Period.End is the INCLUSIVE last day of the window
+// (endExclusive - 1 day) so the response shape stays consistent with
+// Aggregate's inclusive Period.
+func (s *Store) AggregateHalfOpen(start, endExclusive string, topConvos int) (Summary, error) {
+	if start == "" || endExclusive == "" {
+		return Summary{
+			Period:           Period{Start: start, End: endExclusive},
+			ByModel:          []ModelBreakdown{},
+			ByDay:            []DayBreakdown{},
+			TopConversations: []ConvoBreakdown{},
+		}, fmt.Errorf("usage.AggregateHalfOpen: start and endExclusive required (YYYY-MM-DD)")
+	}
+	inclusiveEnd, err := prevDay(endExclusive)
+	if err != nil {
+		return Summary{
+				Period:           Period{Start: start, End: endExclusive},
+				ByModel:          []ModelBreakdown{},
+				ByDay:            []DayBreakdown{},
+				TopConversations: []ConvoBreakdown{},
+			},
+			fmt.Errorf("usage.AggregateHalfOpen: invalid endExclusive %q: %w", endExclusive, err)
+	}
+	return s.aggregateRange(start, inclusiveEnd, endExclusive, topConvos)
+}
+
+// aggregateRange is the shared core. start/endExclusive define the
+// half-open SQL window [start, endExclusive); reportEnd is the inclusive
+// last day surfaced in Summary.Period.End.
+func (s *Store) aggregateRange(start, reportEnd, endExclusive string, topConvos int) (Summary, error) {
 	summary := Summary{
-		Period:           Period{Start: start, End: end},
+		Period:           Period{Start: start, End: reportEnd},
 		ByModel:          []ModelBreakdown{},
 		ByDay:            []DayBreakdown{},
 		TopConversations: []ConvoBreakdown{},
 	}
 
-	if start == "" || end == "" {
-		return summary, fmt.Errorf("usage.Aggregate: start and end required (YYYY-MM-DD)")
-	}
-
 	conn := s.db.Conn()
 
-	byModel, unpriced, err := s.aggregateByModel(conn, start, end)
+	byModel, unpriced, err := s.aggregateByModel(conn, start, endExclusive)
 	if err != nil {
 		return summary, fmt.Errorf("aggregate by model: %w", err)
 	}
@@ -131,14 +204,14 @@ func (s *Store) Aggregate(start, end string, topConvos int) (Summary, error) {
 		summary.TotalCostUSD += m.CostUSD
 	}
 
-	byDay, err := s.aggregateByDay(conn, start, end)
+	byDay, err := s.aggregateByDay(conn, start, endExclusive)
 	if err != nil {
 		return summary, fmt.Errorf("aggregate by day: %w", err)
 	}
 	summary.ByDay = byDay
 
 	if topConvos > 0 {
-		convos, err := s.topConversations(conn, start, end, topConvos)
+		convos, err := s.topConversations(conn, start, endExclusive, topConvos)
 		if err != nil {
 			return summary, fmt.Errorf("top conversations: %w", err)
 		}
@@ -148,7 +221,29 @@ func (s *Store) Aggregate(start, end string, topConvos int) (Summary, error) {
 	return summary, nil
 }
 
-func (s *Store) aggregateByModel(conn *sql.DB, start, end string) ([]ModelBreakdown, []string, error) {
+// nextDay returns the YYYY-MM-DD string for the calendar day after the
+// given inclusive YYYY-MM-DD date, in UTC. Used to turn an inclusive
+// end bound into the exclusive upper bound for half-open day queries.
+func nextDay(day string) (string, error) {
+	t, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		return "", err
+	}
+	return t.AddDate(0, 0, 1).Format("2006-01-02"), nil
+}
+
+// prevDay returns the YYYY-MM-DD string for the calendar day before the
+// given YYYY-MM-DD date, in UTC. Used to turn a half-open exclusive end
+// bound back into the inclusive last day for display/reporting.
+func prevDay(day string) (string, error) {
+	t, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		return "", err
+	}
+	return t.AddDate(0, 0, -1).Format("2006-01-02"), nil
+}
+
+func (s *Store) aggregateByModel(conn *sql.DB, start, endExclusive string) ([]ModelBreakdown, []string, error) {
 	rows, err := conn.Query(`
 		SELECT
 			model,
@@ -157,10 +252,10 @@ func (s *Store) aggregateByModel(conn *sql.DB, start, end string) ([]ModelBreakd
 			SUM(cache_read_tokens),
 			SUM(cache_create_tokens)
 		FROM usage_records
-		WHERE day >= ? AND day <= ?
+		WHERE day >= ? AND day < ?
 		GROUP BY model
 		ORDER BY model
-	`, start, end)
+	`, start, endExclusive)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -183,7 +278,7 @@ func (s *Store) aggregateByModel(conn *sql.DB, start, end string) ([]ModelBreakd
 	return results, unpriced, rows.Err()
 }
 
-func (s *Store) aggregateByDay(conn *sql.DB, start, end string) ([]DayBreakdown, error) {
+func (s *Store) aggregateByDay(conn *sql.DB, start, endExclusive string) ([]DayBreakdown, error) {
 	rows, err := conn.Query(`
 		SELECT
 			day,
@@ -193,10 +288,10 @@ func (s *Store) aggregateByDay(conn *sql.DB, start, end string) ([]DayBreakdown,
 			SUM(cache_read_tokens),
 			SUM(cache_create_tokens)
 		FROM usage_records
-		WHERE day >= ? AND day <= ?
+		WHERE day >= ? AND day < ?
 		GROUP BY day, model
 		ORDER BY day ASC
-	`, start, end)
+	`, start, endExclusive)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +324,7 @@ func (s *Store) aggregateByDay(conn *sql.DB, start, end string) ([]DayBreakdown,
 	return results, nil
 }
 
-func (s *Store) topConversations(conn *sql.DB, start, end string, limit int) ([]ConvoBreakdown, error) {
+func (s *Store) topConversations(conn *sql.DB, start, endExclusive string, limit int) ([]ConvoBreakdown, error) {
 	// Join with conversations to get titles. LEFT JOIN so usage from a
 	// since-deleted conversation still shows up (with empty title) — we
 	// never silently drop attributed spend.
@@ -248,10 +343,10 @@ func (s *Store) topConversations(conn *sql.DB, start, end string, limit int) ([]
 			u.model
 		FROM usage_records u
 		LEFT JOIN conversations c ON c.id = u.conversation_id
-		WHERE u.day >= ? AND u.day <= ?
+		WHERE u.day >= ? AND u.day < ?
 		  AND u.conversation_id != ''
 		GROUP BY u.conversation_id, u.model
-	`, start, end)
+	`, start, endExclusive)
 	if err != nil {
 		return nil, err
 	}

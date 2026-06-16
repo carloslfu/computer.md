@@ -91,7 +91,36 @@ func (s *Server) handleSpawnWorker(w http.ResponseWriter, r *http.Request) {
 		if sysEg, _, serr := sandbox.SystemEgress("/home/vibecraft/systems", req.System); serr == nil {
 			egress.AllowFQDNs = append(egress.AllowFQDNs, sysEg.AllowFQDNs...)
 			egress.AllowCIDRs = append(egress.AllowCIDRs, sysEg.AllowCIDRs...)
+		} else {
+			// The system manifest exists but could not be loaded (parse/IO
+			// error). The worker falls back to baseline egress — fail-closed
+			// (narrower than the system's intended allowlist, never broader),
+			// but a silent contract drift: the worker may then fail a network
+			// call to an endpoint the system manifest meant to permit. Audit
+			// the load failure so it is observable instead of silent.
+			s.auditLog.Log(audit.Entry{
+				Action:    "worker_spawn_system_egress_load_failed",
+				Category:  "sandbox",
+				Details:   fmt.Sprintf("name=%s system=%s err=%v (worker continues with baseline egress only)", req.Name, req.System, serr),
+				RiskLevel: "low",
+			})
 		}
+	}
+	// Parent-system scope for the worker sandbox. A worker manifest MUST
+	// declare a non-empty ParentID (sandbox.Validate fails closed
+	// otherwise — that is the per-system scoping invariant), so a
+	// standalone/no-system spawn cannot pass req.System straight through:
+	// it would arrive empty and Create would reject the manifest, failing
+	// EVERY standalone spawn on Linux despite the handler doc above
+	// promising "Unmanifested/standalone workers get just this baseline".
+	// Use a synthetic, syntactically-valid parent for that case. It is
+	// purely the manifest's ParentID label (never resolved to a dir,
+	// socket, or nftables set), and because the SystemEgress augmentation
+	// above is gated on req.System, the standalone worker still gets only
+	// the baseline + explicit egress — exactly as documented.
+	parentSystem := req.System
+	if parentSystem == "" {
+		parentSystem = "standalone"
 	}
 	env := map[string]string{}
 	// Codex (the peer worker) authenticates through `codex login`
@@ -100,7 +129,7 @@ func (s *Server) handleSpawnWorker(w http.ResponseWriter, r *http.Request) {
 	// OPENAI_API_KEY injection. Claude Code follows the same
 	// subscription/session posture; VibeCraft-hosted keys stay out of
 	// worker env.
-	out, err := sandbox.SpawnWorker(r.Context(), req.Name, req.System, egress, req.Cmd, env)
+	out, err := sandbox.SpawnWorker(r.Context(), req.Name, parentSystem, egress, req.Cmd, env)
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"sandboxed": true, "output": out, "error": errStr(err),
 	})

@@ -320,8 +320,6 @@ func (e *Engine) SetNotifier(n Notifier) {
 	e.notifier = n
 }
 
-// SetDiskFreeRatio overrides the default disk-space probe (used in
-// tests). nil resets to DefaultDiskFreeRatio(DiskCheckPath).
 // IsPaused returns whether the engine is currently in the low-disk
 // paused state. Read-only; used by /metrics (Workstream K) to surface
 // fleet-wide pause rate to the platform's health dashboard.
@@ -347,6 +345,8 @@ func (e *Engine) setDiskPaused(v bool) {
 	e.diskPaused = v
 }
 
+// SetDiskFreeRatio overrides the default disk-space probe (used in
+// tests). nil resets to DefaultDiskFreeRatio(DiskCheckPath).
 func (e *Engine) SetDiskFreeRatio(f func() (float64, error)) {
 	e.diskFreeRatio = f
 }
@@ -606,12 +606,26 @@ func (e *Engine) SubmitCredentials(taskID string, resp CredentialResponse) error
 		}
 
 		var created []string // names newly created by this submission
+		// rollbackCreated undoes only the NEW entries this submission wrote.
+		// Used by every early-return below so a submission stays all-or-nothing:
+		// if we bail partway through (a vault write failed, OR the task left
+		// waiting_for_input mid-loop), we never leave orphan secrets behind
+		// that the caller was told "failed".
+		rollbackCreated := func() {
+			for _, name := range created {
+				if delErr := e.vault.Delete(name); delErr != nil {
+					log.Printf("credential_request: rollback delete for %s failed: %v", name, delErr)
+				}
+			}
+		}
 		for _, v := range resp.Values {
 			fresh, err := e.tasks.GetTask(taskID)
 			if err != nil {
+				rollbackCreated()
 				return err
 			}
 			if fresh.Status != TaskWaitingForInput {
+				rollbackCreated()
 				return errTaskNoLongerActive
 			}
 			label := v.Label
@@ -622,11 +636,7 @@ func (e *Engine) SubmitCredentials(taskID string, resp CredentialResponse) error
 				// Roll back the new writes only. Audit the rollback so
 				// an operator debugging a partial-write incident can
 				// see exactly which names were touched.
-				for _, name := range created {
-					if delErr := e.vault.Delete(name); delErr != nil {
-						log.Printf("credential_request: rollback delete for %s failed: %v", name, delErr)
-					}
-				}
+				rollbackCreated()
 				e.audit.Log(audit.Entry{
 					Action:    "credentials_submit_partial_rollback",
 					Category:  "vault",
@@ -1154,7 +1164,33 @@ func (e *Engine) processTask(parentCtx context.Context, task *Task) {
 
 	// Store assistant response.
 	e.tasks.AddMessage(task.ConversationID, "assistant", result)
-	e.tasks.SetResult(task.ID, result)
+	// SetResult is the write that transitions the task to its terminal
+	// "completed" state. If it errors, the task is still in "running" and
+	// would be stranded there forever (it never reaches a terminal state on
+	// any path). Fall back to failing it so the task always terminates and
+	// the dashboard never shows a perpetually-running ghost. We deliberately
+	// do NOT emit task:completed in that case.
+	if err := e.tasks.SetResult(task.ID, result); err != nil {
+		log.Printf("error setting result for task %s: %v", task.ID, err)
+		errMsg := fmt.Sprintf("failed to persist task result: %v", err)
+		if statusErr := e.tasks.SetError(task.ID, errMsg); statusErr != nil {
+			log.Printf("error failing task %s after result-write failure: %v", task.ID, statusErr)
+		}
+		e.broker.Emit("task:failed", map[string]interface{}{
+			"task_id": task.ID,
+			"error":   errMsg,
+		})
+		e.audit.Log(audit.Entry{
+			Action:    "task_failed",
+			Category:  "task",
+			TaskID:    task.ID,
+			Details:   errMsg,
+			RiskLevel: "medium",
+		})
+		e.markOpenInputsExpired(task)
+		e.recordActivity(parentCtx, task.ID)
+		return
+	}
 
 	e.broker.Emit("task:completed", map[string]interface{}{
 		"task_id":         task.ID,
@@ -1267,7 +1303,12 @@ func (e *Engine) emitTaskProgress(task *Task, current, evidence string, incremen
 func (e *Engine) toolProgressText(tc managerclient.ToolCall) (string, string) {
 	switch tc.Name {
 	case "bash":
-		command := e.vaultMask.Mask(clippedOneLine(tc.Input["command"], 180))
+		// Mask BEFORE clipping: clipping can split a secret across the
+		// truncation boundary, and the masker only matches the full literal
+		// value. Masking the raw string first guarantees the secret is
+		// replaced with its [NAME] marker before any fragment could be
+		// clipped into the SSE progress stream.
+		command := clippedOneLine(e.vaultMask.Mask(tc.Input["command"]), 180)
 		lower := strings.ToLower(command)
 		current := "Running a shell command."
 		switch {
@@ -1302,9 +1343,11 @@ func (e *Engine) toolProgressText(tc managerclient.ToolCall) (string, string) {
 			return "Operating the desktop.", "desktop: " + clippedOneLine(action, 60)
 		}
 	case "str_replace_based_edit_tool", "text_editor", "str_replace_editor":
-		return "Editing a file.", "editor: " + e.vaultMask.Mask(clippedOneLine(tc.InputString(), 180))
+		// Mask before clipping — see the bash case above for why.
+		return "Editing a file.", "editor: " + clippedOneLine(e.vaultMask.Mask(tc.InputString()), 180)
 	default:
-		return "Using a tool.", e.vaultMask.Mask(clippedOneLine(tc.InputString(), 180))
+		// Mask before clipping — see the bash case above for why.
+		return "Using a tool.", clippedOneLine(e.vaultMask.Mask(tc.InputString()), 180)
 	}
 }
 

@@ -838,18 +838,14 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 			jsonError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// settled guards against a double-settle on any return path. The
-		// reservation MUST be released exactly once, or it permanently pins
-		// budget. Charge the real cost only on a successful upstream
-		// response (set below); errors settle with cost 0.
-		settled := false
+		// The reservation MUST be released exactly once on every return path,
+		// or it permanently pins budget. A single deferred settle() guarantees
+		// that: errors leave settleCost at 0 (reservation released, no spend),
+		// a successful upstream response sets the real cost below.
 		var settleModel string
 		var settleCost int
 		defer func() {
-			if !settled {
-				bs := s.budget
-				bs.settle(reserved, settleModel, settleCost)
-			}
+			s.budget.settle(reserved, settleModel, settleCost)
 		}()
 
 		// 3. Resolve the upstream path. Our prefix is /api/ai/credits/<provider>;
@@ -878,8 +874,10 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 		}
 		keyVal := strings.TrimSpace(string(key))
 
-		// 5. Build the upstream request. Body is streamed through (no
-		//    full buffer) so large prompts don't blow memory.
+		// 5. Build the upstream request. The request body is read fully into
+		//    memory so the upstream request carries a known length and the
+		//    original r.Body can be closed promptly; AI request bodies are the
+		//    prompt, not bulk uploads, so this is bounded.
 		var bodyForUpstream io.Reader
 		if r.Body != nil {
 			body, err := io.ReadAll(r.Body)
@@ -955,6 +953,13 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 		var inTok, outTok int
 		var model string
 
+		// streamComplete tracks whether the upstream stream drained to a
+		// clean io.EOF. A client cancel or the 10-min total timeout breaks
+		// the loop early (rerr != io.EOF, or a write error), in which case
+		// the usage we parsed is from a partial stream — settle to the real
+		// (often zero) measured usage rather than the worst-case reservation.
+		streamComplete := false
+
 		if isStream {
 			var teeBuf bytes.Buffer
 			buf := make([]byte, 16*1024)
@@ -970,6 +975,7 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 					}
 				}
 				if rerr != nil {
+					streamComplete = errors.Is(rerr, io.EOF)
 					break
 				}
 			}
@@ -988,11 +994,19 @@ func (s *Server) aiProxyHandler(spec providerSpec) http.HandlerFunc {
 		if resp.StatusCode < 400 {
 			settleModel = model
 			settleCost = costCents(model, inTok, outTok)
-			// Defensive: a 200 with no parseable usage (e.g. an upstream
-			// shape we don't recognize) still consumed platform tokens.
-			// Charge the held reservation rather than billing $0, which
-			// would let unparseable streamed traffic bypass the cap.
-			if settleCost <= 0 {
+			// Defensive: a stream that drained to completion but yielded no
+			// parseable usage (an upstream shape we don't recognize) still
+			// consumed platform tokens. Charge the held reservation rather
+			// than billing $0, which would let unparseable streamed traffic
+			// bypass the cap. This applies ONLY to a fully-drained stream —
+			// NOT to:
+			//   - a client cancel / 10-min timeout mid-stream (streamComplete
+			//     is false; the partial stream's real usage, often zero, is
+			//     what we settle), nor
+			//   - a non-billable success like GET /v1/models or any 200 whose
+			//     real token usage is genuinely zero (non-stream path), which
+			//     must settle to 0 and not be charged the $18 worst case.
+			if settleCost <= 0 && isStream && streamComplete {
 				settleCost = reserved
 			}
 			s.auditLog.Log(audit.Entry{

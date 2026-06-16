@@ -494,6 +494,78 @@ func TestSendText_MissingAPIKeyFailsBeforeHTTP(t *testing.T) {
 	}
 }
 
+// TestMetricsHook_FreshInputExcludesCachedReads — the cache-metrics
+// double-count fix. OpenAI reports input_tokens INCLUSIVE of cached
+// reads, but the metrics hook's third argument is the FRESH portion only
+// (input NOT served from cache). The hook must therefore receive
+// InputTokens - CachedTokens, not the raw cache-inclusive InputTokens;
+// otherwise cached tokens land in BOTH the cache_read counter and the
+// fresh counter, inflating the cache-hit-ratio denominator.
+func TestMetricsHook_FreshInputExcludesCachedReads(t *testing.T) {
+	prev := MetricsHook
+	t.Cleanup(func() { MetricsHook = prev })
+
+	var gotCacheRead, gotCacheCreation, gotInputFresh, gotOutput int
+	var calls int
+	MetricsHook = func(cacheRead, cacheCreation, inputFresh, output int) {
+		calls++
+		gotCacheRead = cacheRead
+		gotCacheCreation = cacheCreation
+		gotInputFresh = inputFresh
+		gotOutput = output
+	}
+
+	apiResp := apiResponse{}
+	apiResp.Usage.InputTokens = 1000 // cache-inclusive, as OpenAI reports it
+	apiResp.Usage.OutputTokens = 200
+	apiResp.Usage.InputTokensDetails.CachedTokens = 600
+
+	resp := parseResponse(apiResp)
+
+	if calls != 1 {
+		t.Fatalf("MetricsHook should fire exactly once per response, fired %d", calls)
+	}
+	if gotCacheRead != 600 {
+		t.Errorf("cacheRead arg: got %d want 600", gotCacheRead)
+	}
+	if gotCacheCreation != 0 {
+		t.Errorf("cacheCreation arg: got %d want 0", gotCacheCreation)
+	}
+	// The load-bearing assertion: fresh = total input - cached reads.
+	if gotInputFresh != 400 {
+		t.Errorf("inputFresh arg double-counted cached reads: got %d want 400 (1000 - 600)", gotInputFresh)
+	}
+	if gotOutput != 200 {
+		t.Errorf("output arg: got %d want 200", gotOutput)
+	}
+	// cache_read + fresh must reconstruct total input exactly (no
+	// token counted in two buckets).
+	if gotCacheRead+gotInputFresh != resp.Usage.InputTokens {
+		t.Errorf("cache_read (%d) + fresh (%d) must equal total input (%d)",
+			gotCacheRead, gotInputFresh, resp.Usage.InputTokens)
+	}
+}
+
+// TestMetricsHook_FreshInputNeverNegative — defensive: if a provider
+// ever reports CachedTokens > InputTokens, the fresh argument must clamp
+// to 0 rather than go negative and corrupt the counter.
+func TestMetricsHook_FreshInputNeverNegative(t *testing.T) {
+	prev := MetricsHook
+	t.Cleanup(func() { MetricsHook = prev })
+
+	var gotInputFresh int
+	MetricsHook = func(_, _, inputFresh, _ int) { gotInputFresh = inputFresh }
+
+	apiResp := apiResponse{}
+	apiResp.Usage.InputTokens = 100
+	apiResp.Usage.InputTokensDetails.CachedTokens = 150 // pathological
+
+	parseResponse(apiResp)
+	if gotInputFresh != 0 {
+		t.Fatalf("inputFresh must clamp to 0, got %d", gotInputFresh)
+	}
+}
+
 func decodeRequestBody(t *testing.T, raw string) map[string]interface{} {
 	t.Helper()
 	var body map[string]interface{}

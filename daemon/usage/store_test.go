@@ -248,6 +248,201 @@ func TestStore_UnpricedModelSurfacesInSummary(t *testing.T) {
 	}
 }
 
+// insertOnDay writes a single usage_records row pinned to a specific
+// YYYY-MM-DD day, bypassing Record's time.Now() bucketing so boundary
+// behavior can be tested deterministically.
+func insertOnDay(t *testing.T, store *Store, day, model, convo string, output int64) {
+	t.Helper()
+	_, err := store.db.Conn().Exec(`
+		INSERT INTO usage_records (day, model, conversation_id, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, updated_at)
+		VALUES (?, ?, ?, 0, ?, 0, 0, CURRENT_TIMESTAMP)
+	`, day, model, convo, output)
+	if err != nil {
+		t.Fatalf("insert on %s: %v", day, err)
+	}
+}
+
+// TestStore_AggregateHalfOpenNoBoundaryDoubleCount — the period-boundary
+// money bug. Two adjacent billing periods can share a boundary day (period
+// N's inclusive last day == period N+1's first day) whenever a Stripe
+// subscription anchor is not midnight UTC. AggregateHalfOpen takes the NEXT
+// period's start as an EXCLUSIVE upper bound (exactly what the platform now
+// emits as period_end_exclusive), so the boundary day belongs to period N+1
+// only and is never summed in both periods.
+//
+// This test feeds the daemon the SAME bounds the platform sends — it does NOT
+// decrement the end in test code. With the old inclusive Aggregate (the no-op
+// "fix") the boundary day was double-counted; with AggregateHalfOpen it is
+// counted exactly once across the two adjacent periods.
+func TestStore_AggregateHalfOpenNoBoundaryDoubleCount(t *testing.T) {
+	store := NewStore(openTestDB(t))
+
+	// gpt-5.4-mini output-only cost: 100k tokens * $4.50/M = $0.45 per row.
+	const perDay = 0.45
+	// Three days of usage straddling a shared boundary day (2026-06-30).
+	insertOnDay(t, store, "2026-06-29", "gpt-5.4-mini", "c1", 100_000)
+	insertOnDay(t, store, "2026-06-30", "gpt-5.4-mini", "c1", 100_000) // boundary day
+	insertOnDay(t, store, "2026-07-01", "gpt-5.4-mini", "c1", 100_000)
+
+	// Stripe period N: starts 2026-06-01..., exclusive end instant lands on
+	// 2026-06-30 (anchor not midnight). The platform sends:
+	//   period_start = 2026-06-01
+	//   period_end (inclusive, display) = 2026-06-29
+	//   period_end_exclusive = 2026-06-30   <-- next period's start
+	// The daemon aggregates [period_start, period_end_exclusive).
+	periodN, err := store.AggregateHalfOpen("2026-06-01", "2026-06-30", 0)
+	if err != nil {
+		t.Fatalf("aggregate period N: %v", err)
+	}
+	// Period N owns only 06-29; the boundary day 06-30 belongs to period N+1.
+	approxEqual(t, periodN.TotalCostUSD, perDay, "period N owns days strictly before its exclusive end")
+	if len(periodN.ByDay) != 1 {
+		t.Fatalf("period N: expected 1 day (06-29), got %d: %+v", len(periodN.ByDay), periodN.ByDay)
+	}
+	// The reported inclusive end is endExclusive - 1.
+	if periodN.Period.End != "2026-06-29" {
+		t.Fatalf("period N reported inclusive end = %q, want 2026-06-29", periodN.Period.End)
+	}
+
+	// Stripe period N+1: starts 2026-06-30, exclusive end 2026-07-31. Platform
+	// sends period_start = 2026-06-30, period_end_exclusive = 2026-07-31.
+	periodNext, err := store.AggregateHalfOpen("2026-06-30", "2026-07-31", 0)
+	if err != nil {
+		t.Fatalf("aggregate period N+1: %v", err)
+	}
+	// Period N+1 owns the boundary day 06-30 AND 07-01 → 2 * $0.45.
+	approxEqual(t, periodNext.TotalCostUSD, 2*perDay, "period N+1 owns the shared boundary day plus 07-01")
+	if len(periodNext.ByDay) != 2 {
+		t.Fatalf("period N+1: expected 2 days (06-30, 07-01), got %d: %+v", len(periodNext.ByDay), periodNext.ByDay)
+	}
+
+	// The no-double-count invariant: the two adjacent periods, summed, equal
+	// the full recorded spend with NO day counted twice. Critically, these are
+	// the platform's real shared-boundary bounds — no test-side decrement.
+	combined := periodN.TotalCostUSD + periodNext.TotalCostUSD
+	approxEqual(t, combined, 3*perDay, "adjacent periods stitched at the shared boundary sum to the full recorded spend, no day double-counted")
+}
+
+// TestStore_HalfOpenIsNotANoOpVsInclusive — the money regression guard the
+// adversarial review demanded. It pins the difference between the inclusive
+// Aggregate contract and the half-open billing contract on the SAME
+// shared-boundary bounds, so the fix can never silently regress to a no-op.
+//
+// Scenario: two adjacent Stripe periods that share calendar boundary day
+// 2026-06-30. The platform hands BOTH the inclusive end (06-30) and the
+// exclusive end (next period's start, 06-30) — for a shared boundary these are
+// the same string, which is exactly what makes the bug subtle.
+//
+//   - If billing had (wrongly) used inclusive Aggregate with those bounds —
+//     period N = [06-01, 06-30] and period N+1 = [06-30, 07-31] — the boundary
+//     day 06-30 satisfies day <= end for period N AND day >= start for period
+//     N+1, so it is summed in BOTH periods. That is the double-count the review
+//     flagged, reproduced here against the live SQL.
+//   - AggregateHalfOpen [start, endExclusive) with the same bounds attributes
+//     06-30 to period N+1 only. Each day belongs to exactly one period.
+//
+// The assertion is the gap between the two contracts: inclusive over-counts by
+// exactly one boundary day; half-open does not. If a future edit makes the
+// half-open form equivalent to inclusive (the "no-op" failure mode), the
+// half-open combined total would jump to 4*perDay and this test fails.
+func TestStore_HalfOpenIsNotANoOpVsInclusive(t *testing.T) {
+	store := NewStore(openTestDB(t))
+
+	const perDay = 0.45 // gpt-5.4-mini, 100k output tokens * $4.50/M
+	insertOnDay(t, store, "2026-06-29", "gpt-5.4-mini", "c1", 100_000)
+	insertOnDay(t, store, "2026-06-30", "gpt-5.4-mini", "c1", 100_000) // shared boundary day
+	insertOnDay(t, store, "2026-07-01", "gpt-5.4-mini", "c1", 100_000)
+
+	// The BUGGY contract: inclusive both-ends Aggregate on shared-boundary
+	// bounds. period N inclusive end == period N+1 start == 2026-06-30.
+	inclN, err := store.Aggregate("2026-06-01", "2026-06-30", 0)
+	if err != nil {
+		t.Fatalf("inclusive period N: %v", err)
+	}
+	inclNext, err := store.Aggregate("2026-06-30", "2026-07-31", 0)
+	if err != nil {
+		t.Fatalf("inclusive period N+1: %v", err)
+	}
+	inclusiveCombined := inclN.TotalCostUSD + inclNext.TotalCostUSD
+	// Three days of real spend, but the inclusive contract counts the boundary
+	// day twice → 4 days of attributed spend. This documents the bug.
+	approxEqual(t, inclusiveCombined, 4*perDay,
+		"inclusive Aggregate on shared-boundary bounds double-counts the boundary day (the bug)")
+
+	// The FIXED contract: half-open billing aggregation with the exclusive end
+	// the platform emits as period_end_exclusive (= next period's start).
+	hoN, err := store.AggregateHalfOpen("2026-06-01", "2026-06-30", 0)
+	if err != nil {
+		t.Fatalf("half-open period N: %v", err)
+	}
+	hoNext, err := store.AggregateHalfOpen("2026-06-30", "2026-07-31", 0)
+	if err != nil {
+		t.Fatalf("half-open period N+1: %v", err)
+	}
+	halfOpenCombined := hoN.TotalCostUSD + hoNext.TotalCostUSD
+	// Exactly the three recorded days, no day counted twice or dropped.
+	approxEqual(t, halfOpenCombined, 3*perDay,
+		"half-open AggregateHalfOpen counts the boundary day exactly once across adjacent periods (the fix)")
+
+	// The fix must remove exactly one boundary day of over-count; if the
+	// half-open form ever becomes a no-op equivalent to inclusive, this gap
+	// collapses and the test fails.
+	approxEqual(t, inclusiveCombined-halfOpenCombined, perDay,
+		"half-open eliminates exactly the one boundary-day double-count vs inclusive")
+}
+
+// TestStore_AggregateHalfOpenSingleDay — a one-day half-open window
+// [d, d+1) must include exactly day d.
+func TestStore_AggregateHalfOpenSingleDay(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	insertOnDay(t, store, "2026-06-15", "gpt-5.4-mini", "c1", 100_000) // $0.45
+	insertOnDay(t, store, "2026-06-16", "gpt-5.4-mini", "c1", 100_000) // must be excluded
+
+	sum, err := store.AggregateHalfOpen("2026-06-15", "2026-06-16", 0)
+	if err != nil {
+		t.Fatalf("single-day half-open aggregate: %v", err)
+	}
+	approxEqual(t, sum.TotalCostUSD, 0.45, "half-open [d, d+1) must include day d and exclude d+1")
+	if len(sum.ByDay) != 1 {
+		t.Fatalf("expected exactly 1 day, got %d: %+v", len(sum.ByDay), sum.ByDay)
+	}
+	if sum.Period.End != "2026-06-15" {
+		t.Fatalf("reported inclusive end = %q, want 2026-06-15", sum.Period.End)
+	}
+}
+
+// TestStore_AggregateHalfOpenRequiresBounds — defensive: empty bounds error
+// rather than silently aggregating everything.
+func TestStore_AggregateHalfOpenRequiresBounds(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	if _, err := store.AggregateHalfOpen("", "2026-06-30", 0); err == nil {
+		t.Fatalf("expected error when start is empty")
+	}
+	if _, err := store.AggregateHalfOpen("2026-06-01", "", 0); err == nil {
+		t.Fatalf("expected error when endExclusive is empty")
+	}
+	if _, err := store.AggregateHalfOpen("2026-06-01", "not-a-date", 0); err == nil {
+		t.Fatalf("expected error when endExclusive is malformed")
+	}
+}
+
+// TestStore_AggregateIncludesInclusiveEndDay — the SPA display contract for
+// Aggregate stays INCLUSIVE on the end, so a single-day window [d, d] must
+// include day d.
+func TestStore_AggregateIncludesInclusiveEndDay(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	insertOnDay(t, store, "2026-06-15", "gpt-5.4-mini", "c1", 100_000) // $0.45
+
+	sum, err := store.Aggregate("2026-06-15", "2026-06-15", 0)
+	if err != nil {
+		t.Fatalf("single-day aggregate: %v", err)
+	}
+	approxEqual(t, sum.TotalCostUSD, 0.45, "single inclusive day [d,d] must include day d")
+	if len(sum.ByDay) != 1 {
+		t.Fatalf("expected exactly 1 day, got %d: %+v", len(sum.ByDay), sum.ByDay)
+	}
+}
+
 // TestStore_TopConvosOrderedByCostDesc — ranking is the only thing
 // the UI relies on for the "top 5" list, so pin it explicitly.
 func TestStore_TopConvosOrderedByCostDesc(t *testing.T) {

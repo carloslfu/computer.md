@@ -834,7 +834,12 @@ func (s *Server) withHealthAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if parts[1] != s.cfg.HealthToken {
+		// Constant-time comparison (daemon-persist-auth-2): a plain `!=`
+		// short-circuits on the first differing byte, leaking the length of
+		// the matching prefix through timing and enabling a byte-at-a-time
+		// recovery of the health token. ConstantTimeCompare runs in time
+		// independent of where the mismatch is.
+		if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(s.cfg.HealthToken)) != 1 {
 			jsonError(w, "invalid health token", http.StatusUnauthorized)
 			return
 		}
@@ -1040,7 +1045,10 @@ func (s *Server) withManagementAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if parts[1] != s.cfg.DaemonToken {
+		// Constant-time comparison (daemon-persist-auth-2): see withHealthAuth.
+		// The daemon token is the SQLCipher DB-key root, so a timing oracle
+		// here is especially costly — compare in length-independent time.
+		if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(s.cfg.DaemonToken)) != 1 {
 			jsonError(w, "invalid management token", http.StatusUnauthorized)
 			return
 		}
@@ -2304,6 +2312,21 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, "name, pattern, and action are required", http.StatusBadRequest)
 			return
 		}
+		// Validate the action against the known enum at the write boundary
+		// (daemon-vault-guard-2). Previously the handler only checked the
+		// action was non-empty, so a typo/miscase ("Block", "deny") was
+		// persisted verbatim and — because the engine treats only the
+		// canonical "block"/"confirm" as restrictive — silently failed open
+		// to Allow. Reject it here so the misconfiguration surfaces at
+		// authoring time; CustomRulePolicy.Evaluate also fails closed at
+		// load time as defense in depth. Normalize to the canonical lowercase
+		// form before persisting.
+		resolved, ok := guardrails.ResolveRuleAction(rule.Action)
+		if !ok {
+			jsonError(w, "action must be one of: allow, confirm, block", http.StatusBadRequest)
+			return
+		}
+		rule.Action = string(resolved)
 		if rule.ID == "" {
 			rule.ID = uuid.New().String()
 		}
@@ -2358,6 +2381,13 @@ func (s *Server) handleRuleByID(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+// maxAuditLimit bounds the audit-log page size a client may request via
+// ?limit=. The value flows directly into a SQL LIMIT, so an unbounded
+// limit lets one request pull the entire table into memory and the JSON
+// encoder. 1000 is well above any UI page yet keeps a single response
+// bounded.
+const maxAuditLimit = 1000
+
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	offset := 0
@@ -2366,6 +2396,13 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
+	}
+	// Cap the limit so a client can't force the daemon to load and
+	// serialize an unbounded result set (the value flows straight into a
+	// SQL LIMIT). Mirrors the handleAIUsage `top` cap; audit pages are
+	// naturally hundreds of rows, so 1000 is generous headroom.
+	if limit > maxAuditLimit {
+		limit = maxAuditLimit
 	}
 	if v := r.URL.Query().Get("offset"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
@@ -2993,6 +3030,14 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		allowed := false
+
+		// The Access-Control-Allow-Origin value below is reflected per
+		// request Origin, so the response body+headers vary by Origin.
+		// Vary: Origin keeps a shared cache from serving one allowed
+		// origin's credentialed CORS headers to a request from a
+		// different allowed origin. Set unconditionally — it must be
+		// present whether or not this particular origin matched.
+		w.Header().Set("Vary", "Origin")
 
 		allowedOrigins := []string{
 			"https://vibecraft.so",

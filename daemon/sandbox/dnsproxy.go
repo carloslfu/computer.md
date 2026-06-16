@@ -302,7 +302,6 @@ func buildResponse(req []byte, name string, qtype uint16, ips []net.IP, rcode by
 	out = binary.BigEndian.AppendUint16(out, 0)  // NSCOUNT
 	out = binary.BigEndian.AppendUint16(out, 0)  // ARCOUNT
 	// Question.
-	qstart := len(out)
 	for _, lab := range strings.Split(name, ".") {
 		if lab == "" {
 			continue
@@ -313,7 +312,6 @@ func buildResponse(req []byte, name string, qtype uint16, ips []net.IP, rcode by
 	out = append(out, 0)
 	out = binary.BigEndian.AppendUint16(out, qtype)
 	out = binary.BigEndian.AppendUint16(out, 1) // class IN
-	qnameLen := len(out) - qstart
 	// Answers: a pointer to the question name (0xC00C) keeps it small.
 	for _, ip := range ips {
 		v4 := ip.To4()
@@ -327,7 +325,6 @@ func buildResponse(req []byte, name string, qtype uint16, ips []net.IP, rcode by
 		out = binary.BigEndian.AppendUint16(out, 4)  // RDLENGTH
 		out = append(out, v4...)
 	}
-	_ = qnameLen
 	return out
 }
 

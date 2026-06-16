@@ -226,6 +226,12 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("auth/callback: create sso session: %v", err)
 		// Don't fail the whole handshake; the chat works without SSO.
+		// Accepted: we still set the vc_sso cookie below even though no
+		// matching sso_session row exists. The cookie is harmless without
+		// its row — handleAuthWhoami looks the hash up and simply misses,
+		// so a hosted app sees a clean 401 (anonymous) rather than a stale
+		// identity. Clearing/branching here would only add code to produce
+		// the same observable result.
 	}
 
 	// vc_session: exact-host cookie. NO Domain= attribute → not sent to

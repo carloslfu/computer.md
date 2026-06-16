@@ -226,12 +226,19 @@ func (s *Shell) executeWithEnv(ctx context.Context, command string, extraEnv []s
 	}
 
 	if err != nil {
-		if execCtx.Err() == context.DeadlineExceeded {
-			// Kill the process group on timeout.
+		// Kill the whole process group on either timeout or cancellation
+		// (task stop/interrupt). exec.CommandContext only signals the direct
+		// child (bash); children it spawned share the process group (Setpgid:
+		// true) and would otherwise leak. context.Canceled fires on parent
+		// ctx cancel, context.DeadlineExceeded on our own timeout.
+		if ctxErr := execCtx.Err(); ctxErr != nil {
 			if cmd.Process != nil {
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			}
-			return output, fmt.Errorf("command timed out after %s", s.timeout)
+			if ctxErr == context.DeadlineExceeded {
+				return output, fmt.Errorf("command timed out after %s", s.timeout)
+			}
+			return output, fmt.Errorf("command canceled: %w", ctxErr)
 		}
 
 		// Include exit code in error.
@@ -284,11 +291,35 @@ func (s *Shell) ExecuteInteractive(ctx context.Context, command, input string) (
 		output += stderr.String()
 	}
 
+	// Truncate if too large (UTF-8 safe — mirror Execute() so a file read
+	// through the text-editor helper can't return output split mid-rune,
+	// which would produce invalid UTF-8 in the tool result / API payload).
 	if len(output) > MaxOutputSize {
-		output = output[:MaxOutputSize] + "\n... [output truncated]"
+		truncated := output[:MaxOutputSize]
+		// Walk back to avoid splitting a multi-byte UTF-8 character.
+		for i := len(truncated) - 1; i >= len(truncated)-4 && i >= 0; i-- {
+			if truncated[i] < 0x80 || truncated[i] >= 0xC0 {
+				truncated = truncated[:i+1]
+				break
+			}
+		}
+		output = truncated + "\n... [output truncated]"
 	}
 
 	if err != nil {
+		// Kill the whole process group on timeout or cancellation. Mirrors
+		// Execute(): exec.CommandContext only signals the direct child (bash),
+		// but children it spawned share the process group (Setpgid: true) and
+		// would otherwise leak after a task stop/interrupt.
+		if ctxErr := execCtx.Err(); ctxErr != nil {
+			if cmd.Process != nil {
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			if ctxErr == context.DeadlineExceeded {
+				return output, fmt.Errorf("command timed out after %s", s.timeout)
+			}
+			return output, fmt.Errorf("command canceled: %w", ctxErr)
+		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return output, fmt.Errorf("exit code %d", exitErr.ExitCode())
 		}

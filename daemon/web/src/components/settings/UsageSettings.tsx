@@ -81,6 +81,16 @@ type Plan = {
   cap_reached_reason?: string | null;
   period_start: string;
   period_end: string;
+  // EXCLUSIVE upper bound for spend aggregation — the next period's start
+  // (Stripe's exclusive currentPeriodEnd truncated to a UTC day). Distinct
+  // from period_end (the INCLUSIVE last day, for display). When two adjacent
+  // billing periods share a calendar boundary day, period_end of period N ==
+  // period_start of period N+1; an inclusive aggregation would count that
+  // day in both periods. We send this as ?end_exclusive= so the daemon
+  // aggregates the half-open window [period_start, period_end_exclusive) and
+  // never double-counts the boundary day. Optional: a platform that predates
+  // this field omits it, and we fall back to the inclusive ?end= path.
+  period_end_exclusive?: string;
   period_source: "subscription" | "calendar_month";
 };
 
@@ -311,11 +321,28 @@ export function UsageSettings() {
 
       // Now usage. Use the plan's period when we got one; otherwise
       // let the daemon default to calendar month.
+      //
+      // Send period_end_exclusive (the next period's start) as
+      // ?end_exclusive= so the daemon aggregates the HALF-OPEN window
+      // [period_start, period_end_exclusive). An inclusive ?end= query on a
+      // billing period double-counts the boundary day whenever the
+      // subscription anchor isn't midnight UTC — period N's inclusive end ==
+      // period N+1's start, so that shared day lands in both periods' totals.
+      // We keep ?start= and ?end= for the daemon's inclusive fallback (an
+      // older daemon that doesn't yet read end_exclusive) and because
+      // period_end_exclusive can't be derived from period_end alone.
       try {
-        const qs =
-          p && p.period_start && p.period_end
-            ? `?start=${encodeURIComponent(p.period_start)}&end=${encodeURIComponent(p.period_end)}`
-            : "";
+        let qs = "";
+        if (p && p.period_start && p.period_end) {
+          const params = new URLSearchParams({
+            start: p.period_start,
+            end: p.period_end,
+          });
+          if (p.period_end_exclusive) {
+            params.set("end_exclusive", p.period_end_exclusive);
+          }
+          qs = "?" + params.toString();
+        }
         const res = await apiFetch("/api/usage" + qs);
         if (!res.ok) {
           if (!cancelled) {
@@ -354,7 +381,15 @@ export function UsageSettings() {
   const budget =
     plan?.usage_budget_usd ?? plan?.remaining_usage_usd ?? plan?.ai_budget_usd ?? 0;
   const monthlyCap = plan?.monthly_usage_cap_usd ?? 0;
-  const hasCustomTerms = budget === -1;
+  // Custom / unmetered terms. The platform signals this with the cap
+  // sentinel monthly_usage_cap_usd === -1 (see /api/plan + /api/machine/budget,
+  // where monthlyUsageCapCents === -1 maps to -1). It does NOT put -1 in the
+  // budget fields — usage_budget_usd / remaining_usage_usd / ai_budget_usd are
+  // always effectiveBudgetUsd >= 0 — so the old `budget === -1` check was dead
+  // in production and never matched. Read the field the API actually returns.
+  // The legacy budget === -1 form is kept only as a defensive fallback for
+  // stale payloads that predate the cap sentinel.
+  const hasCustomTerms = monthlyCap === -1 || budget === -1;
   const pctUsed =
     hasUsage && budget > 0
       ? Math.min(100, (summary!.total_cost_usd / budget) * 100)

@@ -120,7 +120,7 @@ func (a ApprovalPayload) IsActionable() bool {
 // the routine-escalation builder; for classifier-recommended denies, use
 // buildSoftDenyApproval which sets red framing and friction.
 func buildApproval(tc managerclient.ToolCall, d guardrails.Decision) ApprovalPayload {
-	cmd := tc.InputString()
+	cmd := approvalCommand(tc)
 	return ApprovalPayload{
 		Tool:     tc.Name,
 		Command:  cmd,
@@ -137,7 +137,7 @@ func buildApproval(tc managerclient.ToolCall, d guardrails.Decision) ApprovalPay
 // for operations on a real block device or system-tree path, delay
 // (3-second wait) for everything else.
 func buildSoftDenyApproval(tc managerclient.ToolCall, d guardrails.Decision, classifierReason string) ApprovalPayload {
-	cmd := tc.InputString()
+	cmd := approvalCommand(tc)
 	reason := classifierReason
 	if reason == "" {
 		reason = d.Reason
@@ -193,9 +193,10 @@ var (
 // when the specifics can't be cheaply inferred — the full command is
 // always visible to the user behind the "Show command" toggle.
 func humanTitle(tool, command, rule string) string {
+	if isEditorTool(tool) {
+		return editorTitle(command)
+	}
 	switch tool {
-	case "text_editor":
-		return "Edit a file"
 	case "computer":
 		return "Interact with the desktop"
 	}
@@ -207,9 +208,9 @@ func humanTitle(tool, command, rule string) string {
 	switch rule {
 	case "dangerous_command_confirm":
 		switch {
-		case strings.HasPrefix(lower, "shutdown"):
+		case strings.HasPrefix(lower, "shutdown"), strings.HasPrefix(lower, "halt"), strings.HasPrefix(lower, "poweroff"):
 			return "Shut down the machine"
-		case strings.HasPrefix(lower, "reboot"), strings.HasPrefix(lower, "halt"), strings.HasPrefix(lower, "poweroff"):
+		case strings.HasPrefix(lower, "reboot"):
 			return "Reboot the machine"
 		case strings.Contains(lower, "ufw disable"):
 			return "Disable the firewall"
@@ -231,7 +232,7 @@ func humanTitle(tool, command, rule string) string {
 			return "Connect over SSH"
 		case strings.HasPrefix(lower, "scp"), strings.HasPrefix(lower, "rsync"):
 			return "Copy files to another machine"
-		case regexp.MustCompile(`\bnc\b.*-l`).MatchString(stripped):
+		case reNetcatListen.MatchString(stripped):
 			return "Open a network listener"
 		}
 		return "Make a network connection"
@@ -275,7 +276,94 @@ func humanTitle(tool, command, rule string) string {
 	return "Run a command"
 }
 
+// isEditorTool reports whether the tool name is one of the editor variants
+// the engine routes to executeTextEditorTool. Mirrors isEditorToolName in
+// engine.go; kept here so the approval-card title logic in this file is
+// self-contained.
+func isEditorTool(name string) bool {
+	switch name {
+	case "str_replace_based_edit_tool", "text_editor", "str_replace_editor":
+		return true
+	default:
+		return false
+	}
+}
+
+// approvalCommand renders the command string shown on the approval card and
+// fed to humanTitle. For the editor tool family it splices the target path in
+// after the verb (editorCommand); for every other tool it is the usual
+// InputString(). Without this, an editor approval card's Command field —
+// and its title — would read just "create" / "view", hiding which file the
+// operator is approving.
+func approvalCommand(tc managerclient.ToolCall) string {
+	if isEditorTool(tc.Name) {
+		return editorCommand(tc)
+	}
+	return tc.InputString()
+}
+
+// editorCommand renders the command string shown on an editor approval card:
+// the verb plus the target path (e.g. "create /home/vibecraft/.ssh/authorized_keys").
+// The editor tool family carries the verb in Input["command"] and the target
+// in Input["path"]; InputString() returns only the verb, which drops the path
+// the operator needs to see before approving. Mirrors guardrailCommand in
+// engine.go for the editor surface.
+func editorCommand(tc managerclient.ToolCall) string {
+	verb := tc.Input["command"]
+	path := tc.Input["path"]
+	switch {
+	case verb != "" && path != "":
+		return verb + " " + path
+	case path != "":
+		return path
+	}
+	return verb
+}
+
+// editorTitle produces the approval-card title for an editor action. It reads
+// the verb (and optional path) out of the "verb path" command string that
+// editorCommand builds. Writes (create / str_replace / insert) are labeled as
+// writes and never as reads — labeling a write "Read a sensitive system file"
+// would make the operator approve a file overwrite while believing it was a
+// read. The target path is appended when present so the operator sees exactly
+// which file is touched.
+func editorTitle(command string) string {
+	fields := strings.Fields(strings.TrimSpace(command))
+	verb := ""
+	path := ""
+	if len(fields) > 0 {
+		verb = fields[0]
+	}
+	if len(fields) > 1 {
+		path = fields[1]
+	}
+	switch verb {
+	case "view":
+		if path != "" {
+			return "Read a file: " + path
+		}
+		return "Read a file"
+	case "create":
+		if path != "" {
+			return "Create a file: " + path
+		}
+		return "Create a file"
+	case "str_replace", "insert":
+		if path != "" {
+			return "Edit a file: " + path
+		}
+		return "Edit a file"
+	}
+	// Unknown or missing verb: still prefer showing the path over a bare
+	// generic so the operator is never approving blind.
+	if path != "" {
+		return "Edit a file: " + path
+	}
+	return "Edit a file"
+}
+
 var (
 	reSystemctlTarget = regexp.MustCompile(`(?i)systemctl\s+(stop|restart|disable|mask|kill)\s+(\S+)`)
 	rePackageRemove   = regexp.MustCompile(`(?i)\b(apt|apt-get|snap|yum|dnf)\s+(remove|purge|autoremove|erase)\s*(\S*)`)
+	reNetcatListen    = regexp.MustCompile(`\bnc\b.*-l`)
 )

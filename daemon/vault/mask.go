@@ -8,6 +8,12 @@ import (
 	"strings"
 )
 
+// minMaskLen is the shortest secret value that will be masked. Values shorter
+// than this are skipped: replacing a 1-2 character substring everywhere it
+// appears would corrupt unrelated output, and such short values are not
+// meaningfully sensitive.
+const minMaskLen = 4
+
 // Masker scrubs secret values from text, replacing them with their
 // secret names in brackets (e.g., "[STRIPE_API_KEY]").
 type Masker struct {
@@ -41,7 +47,11 @@ func (m *Masker) Mask(text string) string {
 
 	var entries []entry
 	for name, value := range values {
-		if value == "" {
+		// Skip empty and very short values. Masking a 1-2 character value
+		// would replace every occurrence of that substring across the entire
+		// output, catastrophically corrupting unrelated text. Short secrets
+		// are not meaningfully sensitive and not worth that risk.
+		if len(value) < minMaskLen {
 			continue
 		}
 		entries = append(entries, entry{name: name, value: value})

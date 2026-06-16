@@ -82,12 +82,20 @@ func TestEditorGuardrail_PathReachesPolicies(t *testing.T) {
 			want: guardrails.Confirm,
 		},
 		{
-			name: "view on ~/.ssh/id_rsa confirms (private key read)",
+			// SSH private keys hard-Block, not Confirm: a Confirm is eligible
+			// for the AI auto-review pass (which treats read-only filesystem
+			// inspection as auto-approvable) and the key could be auto-approved
+			// and returned to the manager unmasked. Block short-circuits before
+			// the classifier and before execution. See guardrails.credentialFilePatterns.
+			// Block still proves the editor path reached the policies — the
+			// point of this test — same as the canonical-editor coverage in
+			// guardrails/policies_test.go.
+			name: "view on ~/.ssh/id_rsa blocks (private key read)",
 			tc: managerclient.ToolCall{
 				Name:  "text_editor",
 				Input: map[string]string{"command": "view", "path": "/home/vibecraft/.ssh/id_rsa"},
 			},
-			want: guardrails.Confirm,
+			want: guardrails.Block,
 		},
 		{
 			name: "view on /etc/ssh/sshd_config confirms",

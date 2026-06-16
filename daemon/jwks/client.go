@@ -208,6 +208,17 @@ func (c *Client) refresh() {
 		newCache[k.Kid] = pub
 	}
 
+	// A 200 with an empty or zero-valid-key JWKS is NOT an authoritative
+	// refresh. Committing it would drop every rotated (non-bootstrap) kid
+	// fleet-wide and silently revoke valid tokens. Treat it like a fetch
+	// failure: leave the existing cache untouched and bail. (Bootstrap
+	// kids are unioned in below, so the count must be taken BEFORE that.)
+	if len(newCache) == 0 {
+		c.logger.Printf("jwks: fetch %s: empty/zero-valid-key JWKS, keeping previous keys", c.url)
+		c.mRefreshFail.Add(1)
+		return
+	}
+
 	// Union ONLY the immutable bootstrap kids back in — never the rest
 	// of the previous live cache. This is what makes revocation real:
 	// a kid the freshly-fetched JWKS no longer lists is absent from

@@ -20,13 +20,14 @@ import (
 // the tests exercise exactly what runs in production: HTTP request +
 // Bearer auth + JSON parse + cache.
 type fakeBudget struct {
-	server   *httptest.Server
-	mu       sync.Mutex
-	budget   float64
-	mode     string
-	start    string
-	end      string
-	status   int    // 0 or 200 → serve the budget; anything else → that status code
+	server       *httptest.Server
+	mu           sync.Mutex
+	budget       float64
+	mode         string
+	start        string
+	end          string
+	endExclusive string // period_end_exclusive; emitted only when non-empty
+	status       int    // 0 or 200 → serve the budget; anything else → that status code
 	gotAuth  string // the Authorization header the daemon actually sent
 	gotPath  string // the request path the daemon actually hit
 	gotQuery string
@@ -48,7 +49,7 @@ func newFakeBudget(t *testing.T) *fakeBudget {
 			w.WriteHeader(fb.status)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		payload := map[string]interface{}{
 			"ai_budget_usd":         fb.budget,
 			"usage_budget_usd":      fb.budget,
 			"monthly_usage_cap_usd": 250.0,
@@ -57,7 +58,14 @@ func newFakeBudget(t *testing.T) *fakeBudget {
 			"period_end":            fb.end,
 			"period_source":         "subscription",
 			"manager_key_mode":      fb.mode,
-		})
+		}
+		// Only emit period_end_exclusive when the test sets it, so the
+		// default-fake path also covers an OLDER platform that omits the
+		// field (the daemon must fall back to nextDay(period_end)).
+		if fb.endExclusive != "" {
+			payload["period_end_exclusive"] = fb.endExclusive
+		}
+		_ = json.NewEncoder(w).Encode(payload)
 	}))
 	t.Cleanup(fb.server.Close)
 	return fb
@@ -72,6 +80,18 @@ func (fb *fakeBudget) set(budget float64) {
 func (fb *fakeBudget) setStatus(code int) {
 	fb.mu.Lock()
 	fb.status = code
+	fb.mu.Unlock()
+}
+
+// setPeriod sets the inclusive start, inclusive display end, and the
+// exclusive aggregation upper bound (the next period's start) the fake
+// platform reports. Pass endExclusive == "" to emulate an older platform
+// that doesn't send period_end_exclusive.
+func (fb *fakeBudget) setPeriod(start, end, endExclusive string) {
+	fb.mu.Lock()
+	fb.start = start
+	fb.end = end
+	fb.endExclusive = endExclusive
 	fb.mu.Unlock()
 }
 
@@ -399,6 +419,85 @@ func TestBudget_StateResetDateFromFetchedPeriod(t *testing.T) {
 	if st.ResetsOn != "2026-08-15" {
 		t.Errorf("ResetsOn should be the fetched period end; got %q", st.ResetsOn)
 	}
+}
+
+// TestBudget_StateUsesHalfOpenPeriodEndExclusive — the money-critical
+// regression test for the period-boundary double-count. When a Stripe
+// subscription's anchor is NOT midnight UTC, period N's exclusive end instant
+// lands mid-day on some date D, and period N+1 starts at that same instant.
+// Truncated to UTC days that means:
+//
+//	period N:   period_start=2026-06-01, period_end=2026-06-30 (== D),
+//	            period_end_exclusive=2026-06-30 (== D, the next period's start)
+//	period N+1: period_start=2026-06-30 (== D)
+//
+// So period N's INCLUSIVE display end (2026-06-30) and period N+1's start are
+// the SAME calendar day — the shared boundary day. The OLD inclusive
+// aggregation summed [period_start, period_end] INCLUSIVE, counting D's spend
+// in BOTH periods. State() must instead aggregate the HALF-OPEN window
+// [period_start, period_end_exclusive) so D belongs to period N+1 only.
+//
+// The test sets period_end == period_end_exclusive (the real shared-boundary
+// shape), so it genuinely distinguishes the half-open fix from the old
+// inclusive query: only the half-open path excludes D from period N.
+func TestBudget_StateUsesHalfOpenPeriodEndExclusive(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	fb := newFakeBudget(t)
+	fb.set(100)
+	// Shared boundary day 2026-06-30: it is period N's inclusive end AND the
+	// exclusive aggregation bound (== period N+1's start).
+	fb.setPeriod("2026-06-01", "2026-06-30", "2026-06-30")
+	bt := trackerFor(store, fb)
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// $0.45 strictly inside period N (06-29), $0.45 ON the shared boundary day
+	// (06-30 — belongs to period N+1). 100k output * $4.50/M = $0.45/day.
+	insertOnDay(t, store, "2026-06-29", "gpt-5.4-mini", "c1", 100_000)
+	insertOnDay(t, store, "2026-06-30", "gpt-5.4-mini", "c1", 100_000)
+
+	st, err := bt.State()
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	// Period N's enforced spend must be $0.45 only — the boundary day excluded.
+	// The OLD inclusive query would report $0.90 (boundary day double-counted).
+	approxEqual(t, st.SpentUSD, 0.45, "period N enforced spend excludes the shared boundary day (half-open end)")
+	// The display end stays the inclusive boundary day.
+	if st.ResetsOn != "2026-06-30" {
+		t.Errorf("ResetsOn (display) should be the inclusive period end; got %q", st.ResetsOn)
+	}
+	if st.Paused {
+		t.Errorf("with $0.45 spent against a $100 budget the period must not be paused")
+	}
+}
+
+// TestBudget_StateFallsBackToNextDayWhenPlatformOmitsExclusiveEnd — an OLDER
+// platform that doesn't send period_end_exclusive must still aggregate the
+// full inclusive period (no day silently dropped). The daemon falls back to
+// nextDay(period_end). Here the period has no shared boundary day, so the full
+// inclusive [start, end] window's spend is enforced.
+func TestBudget_StateFallsBackToNextDayWhenPlatformOmitsExclusiveEnd(t *testing.T) {
+	store := NewStore(openTestDB(t))
+	fb := newFakeBudget(t)
+	fb.set(100)
+	fb.setPeriod("2026-06-01", "2026-06-30", "") // no period_end_exclusive
+	bt := trackerFor(store, fb)
+	if err := bt.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	insertOnDay(t, store, "2026-06-29", "gpt-5.4-mini", "c1", 100_000)
+	insertOnDay(t, store, "2026-06-30", "gpt-5.4-mini", "c1", 100_000) // inclusive last day
+
+	st, err := bt.State()
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	// Both days fall inside the inclusive period — the fallback must not drop
+	// the inclusive last day.
+	approxEqual(t, st.SpentUSD, 0.90, "fallback covers the full inclusive period including its last day")
 }
 
 // ── Threshold warnings ──────────────────────────────────────────────

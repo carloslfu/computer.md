@@ -45,7 +45,7 @@ func startTelemetry(ctx context.Context, platformBaseURL, version string) {
 }
 
 func telemetryLoop(ctx context.Context, endpoint, version string) {
-	// Stagger first ping by 1-2 minutes after start to avoid bunching.
+	// Delay the first ping by 60s after start so it doesn't race daemon boot.
 	timer := time.NewTimer(60 * time.Second)
 	defer timer.Stop()
 

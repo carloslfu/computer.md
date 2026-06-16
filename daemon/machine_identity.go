@@ -3,7 +3,6 @@
 package main
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -37,7 +36,9 @@ func (s *Server) handleManagementMachineName(w http.ResponseWriter, r *http.Requ
 	var req struct {
 		Name string `json:"name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// readJSON (vs a bare Decode) bounds the body to 1MB and rejects
+	// trailing garbage, matching every other handler in this package.
+	if err := readJSON(r, &req); err != nil {
 		jsonError(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}

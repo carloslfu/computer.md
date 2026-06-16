@@ -3,10 +3,11 @@
 "use client";
 
 // Tiny pub/sub for task lifecycle SSE events. Used to bridge the
-// dashboard's single live SSE consumer (ChatLayout owns the stream
-// because it needs Bearer auth, which EventSource doesn't support)
-// with components like HistorySettings that want to react to task
-// lifecycle without opening a duplicate stream.
+// dashboard's single live SSE consumer (ChatLayout owns the stream — it
+// reads /api/stream with a manual fetch reader rather than EventSource,
+// so it can set credentials and reconnect with backoff) with components
+// like HistorySettings that want to react to task lifecycle without
+// opening a duplicate stream.
 //
 // Flow:
 //   1. ChatLayout receives an SSE event of interest.

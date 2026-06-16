@@ -571,7 +571,16 @@ func checkClientVersion(c *client.Client) error {
 }
 
 // maskKey returns a masked version of the API key for display.
+//
+// Callers normally pass a validated key (>= 20 chars), but maskKey also
+// renders keys read straight from the on-disk config in `auth whoami` /
+// `machine list`, which are not re-validated. A hand-edited or truncated
+// config entry could be shorter than the slice bounds below, so guard the
+// short cases instead of risking an index panic on display.
 func maskKey(key string) string {
+	if len(key) <= 4 {
+		return "..."
+	}
 	if len(key) <= 12 {
 		return key[:4] + "..."
 	}

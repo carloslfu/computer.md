@@ -10,8 +10,6 @@ import {
   type WhoAmI,
 } from "./auth/types";
 
-// Lazy-imported so the foundation bundle stays small. D-2 onwards
-// fills these in.
 import { ChatRoute } from "./routes/ChatRoute";
 import { SettingsRoute } from "./routes/SettingsRoute";
 

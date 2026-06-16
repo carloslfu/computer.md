@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -177,6 +178,12 @@ func LoadConfig() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading daemon token: %w", err)
 	}
+	if cfg.DaemonToken == "" {
+		// An empty token fails open: a request bearing an empty bearer token
+		// constant-time-compares equal to "" and silently passes auth. Refuse
+		// to start rather than run with auth disabled.
+		return nil, fmt.Errorf("daemon token is empty")
+	}
 
 	cfg.OpenAIKey, cfg.ManagerKeyMode, cfg.ManagerModel, cfg.ManagerUnavailableReason, err = loadManagerSettings(readFileString, os.Getenv)
 	if err != nil {
@@ -225,6 +232,12 @@ func LoadConfig() (*Config, error) {
 	cfg.HealthToken, err = readFileString("/etc/vibecraft/health.token")
 	if err != nil {
 		return nil, fmt.Errorf("reading health token: %w", err)
+	}
+	if cfg.HealthToken == "" {
+		// An empty token fails open: a request bearing an empty bearer token
+		// constant-time-compares equal to "" and silently passes the health
+		// auth check. Refuse to start rather than run with auth disabled.
+		return nil, fmt.Errorf("health token is empty")
 	}
 
 	// Local token gates the loopback data-plane endpoints (Phase 0b).
@@ -487,29 +500,77 @@ func validManagerReasoningEffort(v string) bool {
 }
 
 // ensureRandomHexFile generates a file with n random bytes hex-encoded
-// (2*n hex chars) if the file does not already exist. Written with mode 0600.
+// (2*n hex chars) if the file does not already hold at least that many bytes.
+// A 0-byte / truncated file is regenerated rather than trusted, so a partial
+// first-boot write can't leave an empty token in place. Written atomically
+// (temp + rename) with mode 0600.
 func ensureRandomHexFile(path string, n int) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil // file already exists
+	if fileHasAtLeast(path, 2*n) {
+		return nil // file already exists with sufficient content
 	}
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return fmt.Errorf("generating random bytes: %w", err)
 	}
-	return os.WriteFile(path, []byte(hex.EncodeToString(b)), 0600)
+	return writeFileAtomic(path, []byte(hex.EncodeToString(b)), 0600)
 }
 
-// ensureRandomBytesFile generates a file with n raw random bytes
-// if the file does not already exist. Written with mode 0600.
+// ensureRandomBytesFile generates a file with n raw random bytes if the file
+// does not already hold at least n bytes. A 0-byte / truncated file is
+// regenerated rather than trusted. Written atomically (temp + rename) with
+// mode 0600.
 func ensureRandomBytesFile(path string, n int) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil // file already exists
+	if fileHasAtLeast(path, n) {
+		return nil // file already exists with sufficient content
 	}
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return fmt.Errorf("generating random bytes: %w", err)
 	}
-	return os.WriteFile(path, b, 0600)
+	return writeFileAtomic(path, b, 0600)
+}
+
+// fileHasAtLeast reports whether path exists as a regular file holding at
+// least min bytes. A missing, empty, or short file returns false so callers
+// regenerate it instead of trusting a partial write.
+func fileHasAtLeast(path string, min int) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular() && info.Size() >= int64(min)
+}
+
+// writeFileAtomic writes data to path via a temp file in the same directory
+// followed by a rename, so a reader never observes a partially written file
+// and an interrupted write can't leave a truncated token behind.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("syncing temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("renaming temp file: %w", err)
+	}
+	return nil
 }
 
 func parseRSAPublicKey(pemStr string) (*rsa.PublicKey, error) {

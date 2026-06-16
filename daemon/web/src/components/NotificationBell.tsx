@@ -80,15 +80,29 @@ export function NotificationBell() {
         fetch(`${PLATFORM_BASE}/api/notifications/${it.id}/read`, {
           method: "POST",
           credentials: "include",
-        }).catch(() => null),
+        })
+          .then((res) => (res.ok ? it.id : null))
+          .catch(() => null),
       ),
-    ).then(() => {
-      setItems((prev) =>
-        prev.map((it) =>
-          it.readAt ? it : { ...it, readAt: new Date().toISOString() },
-        ),
-      );
-      setUnread(0);
+    ).then((results) => {
+      // Only stamp readAt on the specific ids the server actually
+      // accepted. A 30s poll may have refreshed `items` with newly
+      // arrived unread notifications between capture and resolution;
+      // those were never marked server-side, so leaving them unread
+      // here keeps the local state consistent with the server (the
+      // next poll is authoritative either way).
+      const markedIds = new Set(results.filter((id): id is string => !!id));
+      if (markedIds.size === 0) return;
+      const stampedAt = new Date().toISOString();
+      setItems((prev) => {
+        const next = prev.map((it) =>
+          !it.readAt && markedIds.has(it.id)
+            ? { ...it, readAt: stampedAt }
+            : it,
+        );
+        setUnread(next.filter((it) => !it.readAt).length);
+        return next;
+      });
     });
   }, [open, items]);
 

@@ -158,6 +158,14 @@ export function chipLabel(name: string, maxLength = 28): string {
     return name.slice(0, maxLength - 1) + "…";
   }
   const ext = name.slice(dot);
-  const stem = name.slice(0, maxLength - ext.length - 1);
+  // If the extension itself is too long to leave room for any stem, the
+  // ellipsis+ext form would exceed maxLength (a negative stem length makes
+  // name.slice(0, negative) return almost the whole string). Fall back to a
+  // plain head truncation so the label still respects maxLength.
+  const stemLen = maxLength - ext.length - 1;
+  if (stemLen <= 0) {
+    return name.slice(0, maxLength - 1) + "…";
+  }
+  const stem = name.slice(0, stemLen);
   return stem + "…" + ext;
 }

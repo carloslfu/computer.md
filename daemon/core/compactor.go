@@ -66,12 +66,12 @@ func ShouldCompact(usage managerclient.Usage) bool {
 }
 
 // Compact replaces messages between the initial (pre-loop) prefix and
-//
-// taskID + conversationID flow through so the broker event + usage
-// attribution can identify which chat the compaction belonged to.
 // the recent tail with a single synthetic user message containing a
 // structured summary. The initial messages and the last KeepRecentPairs*2
 // messages pass through untouched.
+//
+// taskID + conversationID flow through so the broker event + usage
+// attribution can identify which chat the compaction belonged to.
 //
 // On any error the original messages are returned unchanged — failed
 // compaction degrades to "next call may be expensive" rather than

@@ -10,8 +10,9 @@ import { platformGrantURL } from "../auth/types";
 //   3. Silent-refresh observation (background X-Vc-Refresh hint) +
 //      block-and-retry on 401 with a single redirect fallback.
 //
-// Code review enforces this: no `fetch(` outside this file. The lint
-// rule check at .eslintrc bans it.
+// Lint enforces this: the no-restricted-syntax rule in eslint.config.js
+// bans raw `fetch(` everywhere except this file (and a few annotated
+// exceptions), so the wrapper can't be silently bypassed.
 
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 

@@ -5,7 +5,9 @@ package manager
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -575,6 +577,12 @@ func (c *Client) send(ctx context.Context, reqBody apiRequest) (*Response, error
 		return nil, fmt.Errorf("marshaling request: %w", err)
 	}
 
+	// One stable Idempotency-Key per logical request, reused across all
+	// retries. 429/5xx/network retries must not double-bill upstream: with a
+	// stable key OpenAI dedupes a retried POST against the original instead of
+	// charging it again.
+	idempotencyKey := newIdempotencyKey()
+
 	var respBody []byte
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL, bytes.NewReader(body))
@@ -583,6 +591,7 @@ func (c *Client) send(ctx context.Context, reqBody apiRequest) (*Response, error
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Idempotency-Key", idempotencyKey)
 
 		reqStart := time.Now()
 		resp, err := c.httpClient.Do(req)
@@ -640,6 +649,19 @@ func (c *Client) send(ctx context.Context, reqBody apiRequest) (*Response, error
 	return parseResponseWithRaw(apiResp, rawResp.Output), nil
 }
 
+// newIdempotencyKey returns a unique, unguessable key for one logical manager
+// request. It is generated once per send() and reused on every retry so the
+// upstream API dedupes retries of the same request. On the unlikely event of a
+// crypto/rand failure it falls back to a timestamp-based key, which still gives
+// each logical request its own key.
+func newIdempotencyKey() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("vc-mgr-%d", time.Now().UnixNano())
+	}
+	return "vc-mgr-" + hex.EncodeToString(b)
+}
+
 func waitBeforeRetry(ctx context.Context, attempt int, retryAfter string) error {
 	backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
 	if retryAfter != "" {
@@ -671,7 +693,14 @@ func parseResponseWithRaw(apiResp apiResponse, rawOutput []json.RawMessage) *Res
 		RawContent: rawOutputContent(apiResp.Output, rawOutput),
 	}
 	if MetricsHook != nil {
-		MetricsHook(u.CacheReadInputTokens, u.CacheCreationInputTokens, u.InputTokens, u.OutputTokens)
+		// OpenAI reports InputTokens INCLUSIVE of cached reads; the fresh
+		// (non-cached) portion is InputTokens - CacheReadInputTokens, clamped
+		// to 0 so cached tokens are never double-counted in both buckets.
+		inputFresh := u.InputTokens - u.CacheReadInputTokens
+		if inputFresh < 0 {
+			inputFresh = 0
+		}
+		MetricsHook(u.CacheReadInputTokens, u.CacheCreationInputTokens, inputFresh, u.OutputTokens)
 	}
 
 	for _, item := range apiResp.Output {

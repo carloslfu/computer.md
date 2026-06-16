@@ -112,6 +112,31 @@ func TestSpawnWorkerEgressBaselineCoversBothCLIBackends(t *testing.T) {
 	}
 }
 
+// When the named system's egress policy cannot be loaded (a manifest
+// parse/IO error, as opposed to discovery mode which returns a nil
+// error), the worker still spawns but falls back to baseline egress —
+// fail-closed, never broader than intended. That fallback used to be
+// silent: the SystemEgress error was dropped on the floor, so an
+// operator debugging "why can't my system's worker reach its API?"
+// had nothing in the audit log to point at the real cause. Pin that the
+// failure branch now audits, so a refactor can't reintroduce the
+// silent swallow.
+func TestSpawnWorkerAuditsSystemEgressLoadFailure(t *testing.T) {
+	src, err := os.ReadFile("spawn_worker.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	for _, want := range []string{
+		"worker_spawn_system_egress_load_failed", // the audit action name
+		"} else {",                               // the failure branch exists (serr != nil)
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("spawn_worker.go: SystemEgress load failure must be audited, missing %q — a worker silently dropping to baseline egress is an unobservable contract drift", want)
+		}
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

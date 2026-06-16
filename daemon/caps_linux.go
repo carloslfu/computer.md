@@ -101,10 +101,10 @@ func capRetained() []string {
 }
 
 // dropResidualCaps drops the bounding set and shrinks the process's
-// permitted/effective/inheritable sets to exactly the three retained
-// caps. Must run while the process still holds CAP_SETPCAP (true for a
-// root-launched daemon): the bounding-set drops need it, and the final
-// capset removes it.
+// permitted/effective/inheritable sets to exactly the retained caps
+// (the eight in capRetained()). Must run while the process still holds
+// CAP_SETPCAP (true for a root-launched daemon): the bounding-set drops
+// need it, and the final capset removes it.
 func dropResidualCaps() error {
 	keep := map[int]bool{
 		capChown: true, capDACOverride: true, capFowner: true,
@@ -129,10 +129,10 @@ func dropResidualCaps() error {
 	// 2. Clear the ambient set (best-effort; not all kernels have it).
 	syscall.Syscall6(syscall.SYS_PRCTL, prCapAmbient, prCapAmbientClearAll, 0, 0, 0, 0)
 
-	// 3. capset: permitted/effective = the three caps, inheritable = none
-	// (children get nothing by inheritance). Done LAST — it removes
-	// CAP_SETPCAP from permitted, after which step 1 would no longer be
-	// allowed.
+	// 3. capset: permitted/effective = the retained caps (keepWord0),
+	// inheritable = none (children get nothing by inheritance). Done LAST —
+	// it removes CAP_SETPCAP from permitted, after which step 1 would no
+	// longer be allowed.
 	hdr := capUserHeader{version: linuxCapabilityVersion3, pid: 0} // 0 = self
 	data := [2]capUserData{
 		{effective: keepWord0, permitted: keepWord0, inheritable: 0},

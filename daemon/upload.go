@@ -522,6 +522,14 @@ func sanitizeFilename(name string) string {
 			stem = stem[:keep]
 		}
 		cleaned = stem + ext
+		// A pathologically long extension (no stem to trim against) can
+		// leave cleaned above the cap — and above the filesystem's
+		// per-name limit, which would fail the create with ENAMETOOLONG.
+		// Hard-bound the final result so the stored name is always within
+		// maxBase regardless of where the length came from.
+		if len(cleaned) > maxBase {
+			cleaned = cleaned[:maxBase]
+		}
 	}
 	return cleaned
 }

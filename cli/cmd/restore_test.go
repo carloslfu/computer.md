@@ -332,3 +332,54 @@ func TestRestoreSnapshot_TwoRestoresKeepBothSafetyBackups(t *testing.T) {
 		t.Fatalf("both pre-restore states must survive; got backups with contents %v", contents)
 	}
 }
+
+// TestRestoreSnapshot_RemovesStaleWALSidecars is the regression for the
+// WAL-corruption hazard: the live DB runs in WAL mode and leaves -wal/-shm
+// sidecars. A snapshot is a clean single-file VACUUM INTO, so the OLD DB's
+// sidecars MUST be removed during restore — otherwise the daemon's next
+// open checkpoints a stale WAL onto the freshly restored main file and
+// corrupts (or reverts) it.
+func TestRestoreSnapshot_RemovesStaleWALSidecars(t *testing.T) {
+	backups := t.TempDir()
+	data := t.TempDir()
+	t.Setenv("VIBECRAFT_BACKUPS_DIR", backups)
+	t.Setenv("VIBECRAFT_DATA_DIR", data)
+
+	snap := filepath.Join(backups, "snap.db")
+	if err := os.WriteFile(snap, []byte("snapshot-content"), 0600); err != nil {
+		t.Fatalf("seeding snapshot: %v", err)
+	}
+
+	dst := filepath.Join(data, "vibecraft.db")
+	if err := os.WriteFile(dst, []byte("live-state"), 0600); err != nil {
+		t.Fatalf("priming live db: %v", err)
+	}
+	// Stale WAL/SHM sidecars from the previous live DB.
+	wal := dst + "-wal"
+	shm := dst + "-shm"
+	if err := os.WriteFile(wal, []byte("stale-wal"), 0600); err != nil {
+		t.Fatalf("priming wal: %v", err)
+	}
+	if err := os.WriteFile(shm, []byte("stale-shm"), 0600); err != nil {
+		t.Fatalf("priming shm: %v", err)
+	}
+
+	if err := restoreSnapshot("snap.db"); err != nil {
+		t.Fatalf("restoreSnapshot: %v", err)
+	}
+
+	if _, err := os.Stat(wal); !os.IsNotExist(err) {
+		t.Fatalf("stale -wal sidecar still present after restore (err=%v); the daemon would checkpoint it onto the restored DB", err)
+	}
+	if _, err := os.Stat(shm); !os.IsNotExist(err) {
+		t.Fatalf("stale -shm sidecar still present after restore (err=%v)", err)
+	}
+	// The main file is the restored snapshot.
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("reading restored db: %v", err)
+	}
+	if string(got) != "snapshot-content" {
+		t.Fatalf("restored db = %q, want the snapshot content", string(got))
+	}
+}

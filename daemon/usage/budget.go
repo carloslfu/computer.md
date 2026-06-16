@@ -50,9 +50,20 @@ type Budget struct {
 	RemainingUsageUSD  *float64 `json:"remaining_usage_usd,omitempty"`
 	CapReachedReason   *string  `json:"cap_reached_reason,omitempty"`
 
-	PeriodStart  string `json:"period_start"`
-	PeriodEnd    string `json:"period_end"`
-	PeriodSource string `json:"period_source"`
+	PeriodStart string `json:"period_start"`
+	PeriodEnd   string `json:"period_end"`
+	// PeriodEndExclusive is the EXCLUSIVE upper bound for budget
+	// aggregation — the NEXT period's start (Stripe's exclusive
+	// currentPeriodEnd truncated to a UTC day). It is distinct from
+	// PeriodEnd, which is the INCLUSIVE last day for display. When two
+	// adjacent billing periods share a calendar boundary day, PeriodEnd of
+	// period N == PeriodStart of period N+1, so aggregating either period
+	// inclusively double-counts that day. Aggregating period N over the
+	// half-open window [PeriodStart, PeriodEndExclusive) attributes the
+	// boundary day to period N+1 only (whose start it is). Empty when the
+	// platform predates this field; callers fall back to nextDay(PeriodEnd).
+	PeriodEndExclusive string `json:"period_end_exclusive,omitempty"`
+	PeriodSource       string `json:"period_source"`
 
 	// Track D5: non-AI plan config the daemon caches off the same poll.
 	// Resolved per-machine (machines.planName) so an add-on machine
@@ -63,6 +74,30 @@ type Budget struct {
 	Region        string `json:"region"`
 
 	ManagerKeyMode string `json:"manager_key_mode,omitempty"`
+}
+
+// budgetEndExclusive resolves the EXCLUSIVE upper bound (the first day NOT
+// in the period) to aggregate spend against, given the platform's reported
+// inclusive periodEnd and the optional period_end_exclusive field.
+//
+// Prefer the platform-provided exclusive end when present — it is the next
+// period's start, so a shared boundary day is attributed to exactly one
+// period. Fall back to nextDay(periodEnd) for an older platform that only
+// sends the inclusive end (and for the calendar-month fallback, where
+// periods never share a boundary, making the two equivalent). On a parse
+// failure return periodEnd unchanged so the caller still has a usable
+// bound rather than an empty string.
+func budgetEndExclusive(periodEnd, periodEndExclusive string) string {
+	if periodEndExclusive != "" {
+		return periodEndExclusive
+	}
+	if periodEnd == "" {
+		return ""
+	}
+	if ex, err := nextDay(periodEnd); err == nil {
+		return ex
+	}
+	return periodEnd
 }
 
 // EffectiveBudgetUSD returns the currently enforceable VibeCraft-metered usage
@@ -207,7 +242,7 @@ func (bt *BudgetTracker) SetProxySpend(fn func() int) {
 // proxy budget lock must be able to call this without re-entering the proxy
 // ledger. On read errors we return 0, matching the tracker's fail-open stance.
 func (bt *BudgetTracker) LocalUsageRecordSpendCents() int {
-	_, _, periodStart, periodEnd := bt.snapshot()
+	_, _, periodStart, _, periodEndExclusive := bt.snapshot()
 	bt.mu.RLock()
 	managerMode := bt.managerMode
 	bt.mu.RUnlock()
@@ -215,7 +250,7 @@ func (bt *BudgetTracker) LocalUsageRecordSpendCents() int {
 		return 0
 	}
 
-	summary, err := bt.store.Aggregate(periodStart, periodEnd, 0)
+	summary, err := bt.store.AggregateHalfOpen(periodStart, periodEndExclusive, 0)
 	if err != nil {
 		return 0
 	}
@@ -341,14 +376,20 @@ func (bt *BudgetTracker) Refresh(ctx context.Context) error {
 	// Resolve the period to report against. Prefer the last-known
 	// period; fall back to the calendar month so we always have a value.
 	bt.mu.RLock()
-	periodStart, periodEnd := "", ""
+	periodStart, periodEnd, periodEndExclusive := "", "", ""
 	if bt.current != nil {
 		periodStart, periodEnd = bt.current.PeriodStart, bt.current.PeriodEnd
+		periodEndExclusive = bt.current.PeriodEndExclusive
 	}
 	bt.mu.RUnlock()
 	if periodStart == "" || periodEnd == "" {
 		periodStart, periodEnd = CurrentMonthBounds()
+		periodEndExclusive = ""
 	}
+	// Aggregate spend over the HALF-OPEN window so the boundary day a
+	// rollover shares with the next period is reported to exactly one
+	// period — the same window budget enforcement uses.
+	periodEndExclusive = budgetEndExclusive(periodEnd, periodEndExclusive)
 
 	// Compute current-period spend in cents. Best-effort — on error we
 	// still call the endpoint, just without the spent_cents param.
@@ -359,7 +400,7 @@ func (bt *BudgetTracker) Refresh(ctx context.Context) error {
 	spentCents := -1
 	if managerMode != "platform" {
 		spentCents = 0
-	} else if summary, err := bt.store.Aggregate(periodStart, periodEnd, 0); err == nil {
+	} else if summary, err := bt.store.AggregateHalfOpen(periodStart, periodEndExclusive, 0); err == nil {
 		// Round to the nearest cent.
 		spentCents = int(summary.TotalCostUSD*100 + 0.5)
 		if spentCents < 0 {
@@ -481,7 +522,7 @@ func (bt *BudgetTracker) StartRefreshLoop(ctx context.Context) {
 // is no manual override path. If a budget genuinely needs correcting,
 // the fix belongs on the plan (the platform), and the daemon picks it
 // up on the next Refresh.
-func (bt *BudgetTracker) snapshot() (budget float64, haveBudget bool, periodStart, periodEnd string) {
+func (bt *BudgetTracker) snapshot() (budget float64, haveBudget bool, periodStart, periodEnd, periodEndExclusive string) {
 	bt.mu.RLock()
 	defer bt.mu.RUnlock()
 
@@ -489,14 +530,19 @@ func (bt *BudgetTracker) snapshot() (budget float64, haveBudget bool, periodStar
 		// No successful fetch yet — fail-open. Period falls back to the
 		// calendar month so any caller that still wants a window has one.
 		periodStart, periodEnd = CurrentMonthBounds()
-		return 0, false, periodStart, periodEnd
+		return 0, false, periodStart, periodEnd, budgetEndExclusive(periodEnd, "")
 	}
 
 	periodStart, periodEnd = bt.current.PeriodStart, bt.current.PeriodEnd
+	periodEndExclusive = bt.current.PeriodEndExclusive
 	if periodStart == "" || periodEnd == "" {
+		// Fell back to the calendar month — the platform-provided
+		// exclusive end no longer matches this window, so derive it.
 		periodStart, periodEnd = CurrentMonthBounds()
+		periodEndExclusive = ""
 	}
-	return bt.current.EffectiveBudgetUSD(), true, periodStart, periodEnd
+	periodEndExclusive = budgetEndExclusive(periodEnd, periodEndExclusive)
+	return bt.current.EffectiveBudgetUSD(), true, periodStart, periodEnd, periodEndExclusive
 }
 
 // Snapshot returns the last successfully-fetched budget config. nil
@@ -530,15 +576,18 @@ func (bt *BudgetTracker) Reserve(model, conversationID string) (func(), error) {
 	}
 
 	periodStart, periodEnd := current.PeriodStart, current.PeriodEnd
+	periodEndExclusive := current.PeriodEndExclusive
 	if periodStart == "" || periodEnd == "" {
 		periodStart, periodEnd = CurrentMonthBounds()
+		periodEndExclusive = ""
 	}
+	periodEndExclusive = budgetEndExclusive(periodEnd, periodEndExclusive)
 	budgetCents := int(current.EffectiveBudgetUSD()*100 + 0.5)
 	if budgetCents < 0 {
 		budgetCents = 0
 	}
 
-	summary, err := bt.store.Aggregate(periodStart, periodEnd, 0)
+	summary, err := bt.store.AggregateHalfOpen(periodStart, periodEndExclusive, 0)
 	if err != nil {
 		// Match State's fail-open posture for transient local read errors.
 		return func() {}, nil
@@ -586,7 +635,7 @@ func (bt *BudgetTracker) Reserve(model, conversationID string) (func(), error) {
 // State computes the current enforcement verdict. Recompute per
 // decision — spend moves every turn.
 func (bt *BudgetTracker) State() (BudgetState, error) {
-	budget, haveBudget, periodStart, periodEnd := bt.snapshot()
+	budget, haveBudget, periodStart, periodEnd, periodEndExclusive := bt.snapshot()
 	bt.mu.RLock()
 	managerMode := bt.managerMode
 	proxySpent := bt.proxySpentFunc
@@ -597,6 +646,8 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 		BudgetUSD:      budget,
 		UsageBudgetUSD: budget,
 		PeriodStart:    periodStart,
+		// ResetsOn is the INCLUSIVE last day (display), distinct from the
+		// exclusive bound used for spend aggregation below.
 		ResetsOn:       periodEnd,
 		ManagerKeyMode: managerMode,
 	}
@@ -608,7 +659,7 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 	bt.mu.RUnlock()
 
 	if managerMode != "platform" {
-		if summary, err := bt.store.Aggregate(periodStart, periodEnd, 0); err == nil {
+		if summary, err := bt.store.AggregateHalfOpen(periodStart, periodEndExclusive, 0); err == nil {
 			st.SpentUSD = summary.TotalCostUSD
 		}
 		return st, nil
@@ -624,7 +675,7 @@ func (bt *BudgetTracker) State() (BudgetState, error) {
 		st.UsageBudgetUSD = 0
 	}
 
-	summary, err := bt.store.Aggregate(periodStart, periodEnd, 0)
+	summary, err := bt.store.AggregateHalfOpen(periodStart, periodEndExclusive, 0)
 	if err != nil {
 		// Can't read spend → fail-open. Better to let a task through
 		// than to wrongly block on a transient DB hiccup.

@@ -1424,8 +1424,12 @@ func (s *Server) hostedAppLogs(ctx context.Context, name string, n int) (hostedA
 		res.Detail = fmt.Sprintf("journalctl: %v\n%s", err, out)
 		return res, http.StatusOK
 	}
-	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
-		res.Lines = append(res.Lines, line)
+	// Empty journal (a freshly-installed unit that hasn't logged yet)
+	// trims to "" — strings.Split would yield a single blank line. Keep
+	// Lines an empty slice in that case rather than reporting one fake
+	// blank entry.
+	if trimmed := strings.TrimRight(out, "\n"); trimmed != "" {
+		res.Lines = append(res.Lines, strings.Split(trimmed, "\n")...)
 	}
 	return res, http.StatusOK
 }

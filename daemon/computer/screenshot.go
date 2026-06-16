@@ -195,7 +195,9 @@ func (s *ScreenshotService) smartCrop(img image.Image) image.Image {
 }
 
 // ListScreenshots returns all screenshot file paths in the screenshot directory,
-// sorted by modification time (newest first).
+// newest first. os.ReadDir returns entries sorted by filename; iterating in
+// reverse yields newest-first because screenshot names are timestamp-prefixed
+// (screenshot_YYYYMMDD_HHMMSS.png), so lexical order matches chronological order.
 func (s *ScreenshotService) ListScreenshots(limit int) ([]string, error) {
 	entries, err := os.ReadDir(s.screenshotDir)
 	if err != nil {

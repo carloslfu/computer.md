@@ -65,7 +65,12 @@ func NewEngine(db *persistence.DB) *Engine {
 	// Load custom rules from DB.
 	customRules, err := e.loadCustomRules()
 	if err != nil {
-		log.Printf("warning: failed to load custom guardrail rules: %v", err)
+		// Fail closed: a DB read failure must not silently drop custom
+		// guardrail rules. Installing a deny-all policy ensures every action
+		// is blocked until rules can be loaded, rather than proceeding with a
+		// weakened policy set.
+		log.Printf("error: failed to load custom guardrail rules, failing closed (deny all): %v", err)
+		e.policies = append([]Policy{&failClosedPolicy{err: err}}, e.policies...)
 	} else {
 		for _, rule := range customRules {
 			e.policies = append(e.policies, &CustomRulePolicy{rule: rule})
@@ -73,6 +78,25 @@ func NewEngine(db *persistence.DB) *Engine {
 	}
 
 	return e
+}
+
+// failClosedPolicy blocks every action. It is installed when custom guardrail
+// rules cannot be loaded from the database so that a read failure defaults to
+// deny rather than silently weakening guardrails.
+type failClosedPolicy struct {
+	err error
+}
+
+func (p *failClosedPolicy) Evaluate(action Action) Decision {
+	return Decision{
+		Action: Block,
+		Reason: fmt.Sprintf("guardrail rules could not be loaded; failing closed: %v", p.err),
+		Rule:   "fail-closed",
+	}
+}
+
+func (p *failClosedPolicy) Description() string {
+	return "Fail-closed: guardrail rules could not be loaded; all actions blocked until rules load successfully."
 }
 
 // Evaluate checks an action against all policies. The most restrictive
