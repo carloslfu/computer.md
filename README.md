@@ -243,7 +243,8 @@ custody and rotation.
 ## Related
 
 - **db.md** is the open standard for databases in plain files, the
-  natural storage layer for records, sources, and wiki pages in a
+  natural storage layer for sources and records (atomic data plus
+  curator synthesis, tagged by a `meta-type` field) in a
   computer.md computer. An independent standard, usable on its own. See
   its [SPEC.md](https://github.com/carloslfu/db.md/blob/main/SPEC.md) and
   [repo](https://github.com/carloslfu/db.md).

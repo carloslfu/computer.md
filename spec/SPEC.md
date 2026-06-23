@@ -272,8 +272,9 @@ generate it via `computer-md init --role <name>`:
 ## Relationship to db.md
 
 A computer.md computer typically ships a [db.md](https://github.com/carloslfu/db.md)
-store at `~/db/` — a database in plain files for records, sources, and
-wiki pages the agent curates. `COMPUTER.md` describes the *computer*;
+store at `~/db/` — a database in plain files: sources (evidence) and
+records (atomic data plus curator synthesis, separated by a `meta-type`
+field) the agent curates. `COMPUTER.md` describes the *computer*;
 the db.md store holds the *data and knowledge*. They compose; neither
 requires the other.
 
